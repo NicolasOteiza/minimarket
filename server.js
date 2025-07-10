@@ -1,7 +1,7 @@
 const express = require('express');
 const mysql = require('mysql2');
 const cors = require('cors');
-const port = 3001;
+const port = 3000;
 
 // Crear la aplicación Express
 const app = express();
@@ -45,8 +45,8 @@ pool.getConnection((err, connection) => {
 });
 
 // Iniciar el servidor
-app.listen(3001, () => {
-  console.log('Server is running on port 3001');
+app.listen(3000, () => {
+  console.log('Server is running on port 3000');
 });
 
 // Rutas del backend
@@ -289,9 +289,9 @@ app.post('/connect', (req, res) => {
 });
 
 // Devuelve la cantidad de dispositivos conectados
-app.get('/devices', (req, res) => {
+/*app.get('/devices', (req, res) => {
   res.json({ total: connectedDevices });
-});
+});*/
 
 // Simula la desconexión de un dispositivo
 app.post('/disconnect', (req, res) => {
@@ -299,7 +299,7 @@ app.post('/disconnect', (req, res) => {
   res.json({ message: 'Dispositivo desconectado', total: connectedDevices });
 });
 
-app.listen(3001, () => console.log('Servidor corriendo en http://localhost:3001'));
+
 
 
 

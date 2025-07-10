@@ -16,8 +16,7 @@ let myWindow;
 
 function open_w(popUpReference) {
   myWindow = window.open(
-    ["/minimarket/popup/"+popUpReference+".php"],
-    [popUpReference],
+    ["/sistemaventas/popup/"+popUpReference+".php"],
     [configuracion_ventana]
   ); 
 }
