@@ -1,0 +1,67 @@
+CREATE DATABASE minimarket;
+
+USE minimarket;
+
+-- Tabla de productos
+CREATE TABLE productos (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    nombre VARCHAR(255) NOT NULL,
+    precio_compra DECIMAL(10, 2) NOT NULL,
+    precio_venta DECIMAL(10, 2) NOT NULL,
+    stock INT DEFAULT 0,
+    alert_stock BOOLEAN DEFAULT FALSE
+);
+
+-- Tabla de usuarios
+CREATE TABLE usuarios (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    nombre VARCHAR(255) NOT NULL,
+    correo VARCHAR(255) UNIQUE NOT NULL,
+    contrasena VARCHAR(255) NOT NULL,
+    rol ENUM('admin', 'vendedor') NOT NULL
+);
+
+-- Tabla de clientes
+CREATE TABLE clientes (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    nombre VARCHAR(255) NOT NULL,
+    limite_credito DECIMAL(10, 2) DEFAULT 0
+);
+
+-- Tabla de ventas
+CREATE TABLE ventas (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    cliente_id INT,
+    fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    total DECIMAL(10, 2) NOT NULL,
+    FOREIGN KEY (cliente_id) REFERENCES clientes(id)
+);
+
+-- Tabla de detalles de ventas
+CREATE TABLE detalle_venta (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    venta_id INT,
+    producto_id INT,
+    cantidad INT,
+    precio DECIMAL(10, 2),
+    FOREIGN KEY (venta_id) REFERENCES ventas(id),
+    FOREIGN KEY (producto_id) REFERENCES productos(id)
+);
+
+-- Tabla de informacion almacen
+CREATE TABLE info (
+    nombre VARCHAR(255) NOT NULL,
+    telefono INT,
+    tipo_local VARCHAR(255),
+    mail VARCHAR(255),
+    inventario BOOLEAN ,
+    credito BOOLEAN ,
+    producto_comun BOOLEAN ,
+    margen_ganancia BOOLEAN ,
+    monto_ganancia INT,
+    redondeo BOOLEAN ,
+    monto_redondeo INT,
+    mensaje BOOLEAN ,
+    data_mensaje VARCHAR(255),
+    time_mensaje INT
+);

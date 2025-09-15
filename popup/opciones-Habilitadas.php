@@ -6,6 +6,8 @@
     <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>OPCIONES HABILITADAS</title>
+
+    <link rel="stylesheet" href="../css/root.css">
     <link rel="stylesheet" href="../css/popUpStyle.css">
 
     <script src="../js/functions.js"></script>
@@ -39,7 +41,7 @@
                     </td>
                 </tr>
                 <tr>
-                    <td  class="td-ext" style="padding-top: 15px;">
+                    <td class="td-ext" style="padding-top: 15px;">
                         <label>
                             <input class="checkbox" type="checkbox" name="utiliza_inv">
                             <b>Deseo ofrecer crédito a mis clientes.</b>
@@ -79,7 +81,7 @@
                         <label>
                             <input class="checkbox" type="checkbox" name="utiliza_inv">
                             <b>Calcular automaticamente el precio de venta con el margen
-                            de ganancia del</b>
+                                de ganancia del</b>
                         </label>
                     </td>
                 </tr>
@@ -89,7 +91,7 @@
                             <input style="width: 40px; margin-left:50px; margin-right:10px; text-align: center;" type="number" name="margen-ganancia" id="id-margen-ganancia" value="30">
                             Activa esta opcion para dar de alta clientes y poder ofrecer
                             ventas a credito, recibir abonos y liquidar su adeudo.
-                            
+
                         </label>
                     </td>
                 </tr>
@@ -125,19 +127,19 @@
                 <tr>
                     <td class="td-ext">
                         <label style="margin-left:50px;">
-                            Mostrar aviso:   
-                            <input type="text" 
-                            name="mensaje-contingencia" 
-                            id="id-mensaje-contingencia"
-                            style="width: 300px;">
+                            Mostrar aviso:
+                            <input type="text"
+                                name="mensaje-contingencia"
+                                id="id-mensaje-contingencia"
+                                style="width: 300px;">
                         </label>
                         <label>
                             cada:
-                            <input type="number" 
-                            name="tiempo-mensaje-contingencia" 
-                            id="id-tiempo-mensaje-contingencia"
-                            style="width:40px"
-                            value="5">
+                            <input type="number"
+                                name="tiempo-mensaje-contingencia"
+                                id="id-tiempo-mensaje-contingencia"
+                                style="width:40px"
+                                value="5">
                             ventas cobradas.
                         </label>
                     </td>

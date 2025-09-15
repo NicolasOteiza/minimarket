@@ -1,68 +1,235 @@
-/*inicio login Estilos generales */ 
+/* =============================================================
+   styleslogin.css — Unificado con variables globales (2025‑07‑14)
+   Se reemplazaron todos los colores hard‑codeados por variables
+   definidas en :root y sobreescritas en body.dark cuando aplica.
+   ============================================================= */
+
+/* ===============  BASE  =============== */
+* {
+    box-sizing: border-box;
+}
+
+@font-face {
+    font-family: 'GetVoIP Grotesque';
+    src: url('../fonts/GetVoIP\ Grotesque.ttf') format('truetype'),
+        url('../fonts/GetVoIP\ Grotesque\ Italic.ttf') format('truetype');
+    font-weight: normal;
+    font-style: normal;
+}
 
 body {
-    font-family: Arial, sans-serif;
+    font-family: 'GetVoIPGrotesque', sans-serif;
     margin: 0;
-    padding: 0;
-    display: contents;
+    background-color: var(--clr-bg-light);
+    color: var(--clr-text-light);
+    display: flex;
     justify-content: center;
     align-items: center;
     height: 100vh;
-    background-color: #f4f4f4;
+    transition: background-color 0.3s ease, color 0.3s ease;
     position: relative;
-
 }
 
-/* Contenedor de inicio de sesión */
+/* ===============  CONTENEDOR LOGIN  =============== */
 .login-container {
-    background: #fff;
-    padding: 2em;
-    border-radius: 8px;
-    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+    background: var(--clr-bg-light);
+    padding: 2rem;
+    border-radius: 10px;
+    box-shadow: 0 0 15px rgba(0, 0, 0, 0.5);
+    width: 100%;
+    max-width: 350px;
     text-align: center;
-    width: 300px;
-    position: absolute;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
+    transition: background-color 0.3s ease;
+    color: var(--clr-bg-dark);
+}
+
+img {
+    width: 350px;
+}
+
+.welcome-container {
+    background: var(--clr-bg-light);
+    padding: 2rem;
+    border-radius: 10px;
+    box-shadow: 0 0 15px rgba(0, 0, 0, 0.5);
+    width: 100%;
+    max-width: 850px;
+    height: 700px;
+    transition: background-color 0.3s ease;
+    color: var(--clr-bg-dark);
+    overflow-y: scroll;
+}
+
+.left {
+    text-align: left;
+    justify-content: left;
+}
+
+.center {
+    text-align: center;
+    justify-content: center;
+}
+
+.large input {
+    width: 100%;
+}
+
+.media input {
+    width: 50%;
+}
+
+.small input {
+    width: 20%;
 }
 
 .login-container h1 {
-    margin-bottom: 1em;
-    font-size: 1.5em;
+    margin-bottom: 1rem;
+    color: var(--clr-text-light);
 }
 
+.welcome-container h1 {
+    margin-bottom: 1rem;
+    color: var(--clr-text-light);
+}
+
+/* =================  FORMULARIO  ================= */
 .login-container input {
-    width: 90%;
-    padding: 0.8em;
-    margin: 0.5em 0;
-    border: 1px solid #ccc;
-    border-radius: 4px;
+    width: 100%;
+    padding: 0.75rem;
+    display: flex;
+    margin: 0.5rem 0;
+    border: 1px solid var(--clr-secondary-light);
+    border-radius: 5px;
+    background: var(--clr-bg-light);
+    color: var(--clr-text-light);
+    transition: background 0.3s ease, border 0.3s ease;
+}
+
+.welcome-container input {
+
+    padding: 0.75rem;
+    margin: 0.5rem 0;
+    border: 1px solid var(--clr-secondary-light);
+    border-radius: 5px;
+    background: var(--clr-bg-light);
+    color: var(--clr-text-light);
+    transition: background 0.3s ease, border 0.3s ease;
+}
+
+.welcome-container select {
+    width: 100%;
+    padding: 0.75rem;
+    margin: 0.5rem 0;
+    border: 1px solid var(--clr-secondary-light);
+    border-radius: 5px;
+    background: var(--clr-bg-light);
+    color: var(--clr-text-light);
+    transition: background 0.3s ease, border 0.3s ease;
 }
 
 .login-container button {
     width: 100%;
-    padding: 0.8em;
-    background-color: #007BFF;
-    color: white;
-    border: #007BFF;
-    border-radius: 4px;
+    padding: 0.75rem;
+    margin-top: 0.5rem;
+    background-color: var(--clr-primary-light);
+    color: var(--clr-text-light);
+    border: none;
+    border-radius: 5px;
+    font-size: 1.25rem;
     cursor: pointer;
-    font-size: 1em;
+    transition: background-color 0.2s ease;
+}
+
+.welcome-container button {
+    width: 60%;
+    padding: 0.75rem;
+    margin-top: 0.5rem;
+    background-color: var(--clr-primary-light);
+    color: var(--clr-text-light);
+    border: none;
+    border-radius: 5px;
+    font-size: 1.25rem;
+    cursor: pointer;
+    transition: background-color 0.2s ease;
 }
 
 .login-container button:hover {
-    background-color: #0056b3;
+    background-color: var(--clr-primary-dark);
+    color: var(--clr-text-dark);
 }
 
-.hidden {
-    display: none;
+.welcome-container button:hover {
+    background-color: var(--clr-primary-dark);
+    color: var(--clr-text-dark);
 }
 
+/* =================  MENSAJES  ================= */
 #login-error {
-    color: red;
+    color: var(--clr-error);
     font-size: 0.9em;
     margin-top: 1em;
 }
 
-/*fin Login style*/
+.hidden {
+    display: none !important;
+}
+
+/* =================  BOTÓN TEMA  ================= */
+.theme-toggle {
+    position: absolute;
+    top: 20px;
+    right: 20px;
+    background: transparent;
+    border: none;
+    font-size: 1.5rem;
+    color: var(--clr-primary);
+    cursor: pointer;
+}
+
+/* ------------------------------------------------
+   MODO OSCURO — Sobrescribe variables y usa las mismas reglas
+------------------------------------------------ */
+body.dark {
+    background-color: var(--clr-bg-dark);
+    color: var(--clr-text-dark);
+
+}
+
+body.dark .login-container {
+    background-color: var(--clr-secondary-dark);
+    color: var(--clr-text-dark);
+    box-shadow: 0 0 15px rgba(255, 255, 255, 0.766);
+}
+
+body.dark .login-container h1 {
+    margin-bottom: 1rem;
+    color: var(--clr-text-dark);
+}
+
+body.dark .login-container input {
+    background-color: var(--clr-bg-dark);
+    color: var(--clr-text-dark);
+    border: 1px solid var(--clr-secondary-dark);
+}
+
+body.dark .login-container button {
+    background-color: var(--clr-primary-dark);
+    color: var(--clr-text-dark);
+}
+
+body.dark .login-container button:hover {
+    background-color: var(--clr-primary-light);
+    color: var(--clr-text-light);
+}
+
+body.dark .theme-toggle {
+    color: var(--clr-primary-dark);
+}
+
+/* =================  RESPONSIVO  ================= */
+@media (max-width: 400px) {
+    .login-container {
+        padding: 1.5rem;
+        width: 90%;
+    }
+}

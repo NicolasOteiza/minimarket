@@ -1,53 +1,3 @@
-const express = require('express');
-const mysql = require('mysql2');
-const cors = require('cors');
-const port = 3000;
-
-// Crear la aplicación Express
-const app = express();
-app.use(express.json());
-app.use(cors());
-
-// Configurar la conexión a MySQL
-const db = mysql.createConnection({
-  host: 'localhost',
-  user: 'root',
-  password: '', // Deja esto vacío si no configuraste una contraseña en XAMPP
-  database: 'minimarket',
-});
-
-// Conectar a la base de datos
-db.connect((err) => {
-  if (err) {
-    console.error('Error connecting to the database:', err);
-  } else {
-    console.log('Connected to the MySQL database.');
-  }
-});
-
-// Crea un pool de conexiones
-const pool = mysql.createPool({
-  host: 'localhost',      // Dirección del servidor de base de datos
-  user: 'root',           // Usuario de MySQL (generalmente 'root')
-  password: '',           // Contraseña (si no tienes, déjalo vacío)
-  database: 'minimarket', // Nombre de tu base de datos
-  port: 3306,             // Puerto de conexión (por defecto es 3306)
-});
-
-// Verifica que la conexión a la base de datos sea exitosa
-pool.getConnection((err, connection) => {
-  if (err) {
-    console.error('Error de conexión a la base de datos:', err);
-  } else {
-    console.log('Conexión exitosa a la base de datos');
-    connection.release();  // Libera la conexión después de la verificación
-  }
-});
-
-// Iniciar el servidor
-app.listen(3000, () => {
-  console.log('Server is running on port 3000');
-});
 
 // Rutas del backend
 
@@ -69,11 +19,11 @@ app.get('/api/productos/code/:code', (req, res) => {
   db.query('SELECT * FROM producto WHERE codigo_barras = ?', [code], (err, results) => {
     if (err) {
       console.error(err);
-      return res.status(500).json({ error: 'Database error' });
+      return res.status(500).json({ error: 'Base de datos error' });
     }
 
     if (results.length === 0) {
-      return res.status(404).json({ error: 'Product not found' });
+      return res.status(404).json({ error: 'Producto no encontrado' });
     }
 
     res.json(results[0]);
@@ -87,11 +37,11 @@ app.get('/api/productos/name/:name', (req, res) => {
   db.query('SELECT * FROM productos WHERE name = ?', [name], (err, results) => {
     if (err) {
       console.error(err);
-      return res.status(500).json({ error: 'Database error' });
+      return res.status(500).json({ error: 'Base de datos error' });
     }
 
     if (results.length === 0) {
-      return res.status(404).json({ error: 'Product not found' });
+      return res.status(404).json({ error: 'Producto no encontrado' });
     }
 
     res.json(results[0]);
@@ -242,7 +192,7 @@ app.put('/api/productos/:code', (req, res) => {
     (err) => {
       if (err) {
         console.error(err);
-        return res.status(500).json({ error: 'Database error' });
+        return res.status(500).json({ error: 'Base de datos error' });
       }
       res.json({ message: 'Product updated successfully' });
     }
@@ -268,7 +218,7 @@ app.delete('/api/productos/:code', (req, res) => {
   db.query('DELETE FROM producto WHERE id = ?', [code], (err) => {
     if (err) {
       console.error(err);
-      return res.status(500).json({ error: 'Database error' });
+      return res.status(500).json({ error: 'Base de datos error' });
     }
     res.json({ message: 'Product deleted successfully' });
   });
@@ -278,25 +228,53 @@ app.delete('/api/productos/:code', (req, res) => {
 
 app.use((err, req, res, next) => {
   console.error(err.stack);
-  res.status(500).send('Something went wrong!');
+  res.status(500).send('Algo salió mal!');
 });
 
 
 // Simula un nuevo dispositivo conectándose
-app.post('/connect', (req, res) => {
-  connectedDevices++;
-  res.json({ message: 'Nuevo dispositivo conectado', total: connectedDevices });
+app.post('/connect', async (req, res) => {
+  const  caja = req.body;                // número recibido
+  console.log('Servidor agrega:', caja.caja);
+  try {
+    await pool.promise().query(
+      'INSERT INTO conectados (id,caja) VALUES (?,?)',
+      [caja.caja,caja.caja]                                // id es AUTO_INCREMENT
+    );
+    res.json({ message: 'Nueva caja registrada', total: caja });
+  } catch (error) {
+    console.error('Error al insertar caja:', error);
+    res.status(500).json({ message: 'Error interno del servidor' });
+  }
 });
 
+
 // Devuelve la cantidad de dispositivos conectados
-/*app.get('/devices', (req, res) => {
-  res.json({ total: connectedDevices });
-});*/
+app.get('/devices', async (req, res) => {
+  try {
+    const [rows] = await pool.promise().query(
+      'SELECT COUNT(caja) AS connected FROM conectados'
+    );
+    console.log('Servidor responde:', rows[0].connected);
+    res.json({ connected: rows[0].connected }); // { connected: 5 }
+  } catch (error) {
+    console.error('Error al contar cajas:', error);
+    res.status(500).json({ message: 'Error interno del servidor' });
+  }
+});
+
 
 // Simula la desconexión de un dispositivo
-app.post('/disconnect', (req, res) => {
-  if (connectedDevices > 0) connectedDevices--;
-  res.json({ message: 'Dispositivo desconectado', total: connectedDevices });
+app.delete('/disconnect', async (req, res) => {
+  try {
+    await pool.promise().query(
+      'DELETE FROM conectados ORDER BY id DESC LIMIT 1'
+    );
+    res.json({ message: 'Dispositivo eliminado exitosamente' });
+  } catch (err) {
+    console.error('Error al eliminar caja:', err);
+    res.status(500).json({ error: 'Base de datos error' });
+  }
 });
 
 

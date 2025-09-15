@@ -1,8 +1,15 @@
 /* inicio de home 
 Estilos generales */
+@font-face {
+    font-family: 'GetVoIP Grotesque';
+    src: url('../fonts/GetVoIP\ Grotesque.ttf') format('truetype'),
+        url('../fonts/GetVoIP\ Grotesque\ Italic.ttf') format('truetype');
+    font-weight: normal;
+    font-style: normal;
+}
 
 body {
-    font-family: Arial, sans-serif;
+    font-family: 'GetVoIPGrotesque', sans-serif;
     margin: 0;
     padding: 0;
     background-color: #f4f4f9;
