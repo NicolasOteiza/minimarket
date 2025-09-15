@@ -95,7 +95,7 @@
      background: var(--clr-secondary-light);
      font-weight: 600;
      border-bottom: 2px solid var(--clr-bg-light);
-     color: var(--clr-primary-light);
+     color: var(--clr-text-dark);
  }
 
  /* ---------- CONTENEDOR GENERAL DE CONTENIDO ---------- */
@@ -408,7 +408,7 @@
 
  .carrito {
 
-     height: 35vw;
+     height: 23vw;
      overflow: scroll;
      border: 1px solid var(--clr-secondary-light);
      border-color: var(--clr-secondary-light);
