@@ -1,44 +1,30 @@
-/* ----------  VARIABLES GLOBALES  ---------- */
+/* ---------- VARIABLES GLOBALES ---------- */
 :root {
-    /* Paleta modo claro */
-    --clr-bg-light: #F4F4F5;
-    /* Fondo general claro (gris neutro muy suave) */
-    --clr-text-light: #1F2937;
-    /* Texto principal claro (gris oscuro elegante) */
-    --clr-text-sec-light: #6B7280;
-    /* Texto secundario claro (gris medio, discreto) */
-    --clr-primary-light: #3B82F6;
-    /* Botón primario y enlaces (azul sobrio, no brillante) */
-    --clr-secondary-light: #64748B;
-    /* Detalles neutros (gris azulado elegante) */
-    --clr-header-light: #E5E7EB;
-    /* Cabeceras o secciones destacadas claras (gris suave) */
+    /* Paleta corporativa SIA - modo claro */
+    --clr-bg-light: #F3F7FC;
+    --clr-text-light: #10233F;
+    --clr-text-sec-light: #4C6183;
+    --clr-primary-light: #0057B8;
+    --clr-secondary-light: #0F2F5F;
+    --clr-header-light: #D8E7FA;
 
-    /* Paleta modo oscuro */
-    --clr-bg-dark: #18181B;
-    /* Fondo general oscuro (gris casi negro, no puro) */
-    --clr-text-dark: #F3F4F6;
-    /* Texto principal oscuro (gris muy claro) */
-    --clr-text-sec-dark: #9CA3AF;
-    /* Texto secundario oscuro (gris medio suave) */
-    --clr-primary-dark: #60A5FA;
-    /* Botón primario hover / variante oscura (azul calmado) */
-    --clr-secondary-dark: #4B5563;
-    /* Detalles / backgrounds neutros oscuros (gris carbón) */
-    --clr-header-dark: #1F2937;
-    /* Cabeceras o secciones destacadas oscuras (gris profundo) */
+    /* Paleta corporativa SIA - modo oscuro */
+    --clr-bg-dark: #0B1424;
+    --clr-text-dark: #E8F0FF;
+    --clr-text-sec-dark: #A4B8D8;
+    --clr-primary-dark: #3A8DFF;
+    --clr-secondary-dark: #1B355A;
+    --clr-header-dark: #112440;
 
-    /* ========================== */
-    /* NO MODIFICAR - ESTADOS     */
-    /* ========================== */
+    /* Estados */
     --clr-error: #DC2626;
-    /* mensajes de error */
     --clr-success: #16A34A;
-    /* mensajes de éxito */
     --clr-pending: #EAB308;
-    /* mensajes de advertencia */
 
     /* Degradados */
-    --clr-degrade: linear-gradient(90deg, #DC2626 0%, #EAB308 100%);
-    --clr-degrade-banner: linear-gradient(90deg, #3B82F6 0%, #16A34A 100%);
+    --clr-degrade: linear-gradient(90deg, #0057B8 0%, #00A3E0 100%);
+    --clr-degrade-banner: linear-gradient(90deg, #0F2F5F 0%, #0057B8 52%, #00A3E0 100%);
+
+    /* Alias de compatibilidad */
+    --clr-primary: var(--clr-primary-light);
 }

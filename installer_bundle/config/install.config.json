@@ -1,0 +1,14 @@
+{
+  "appZipRelativePath": "payload/minimarket-app.zip",
+  "installRoot": "C:/xampp/htdocs/minimarket",
+  "dbName": "minimarket",
+  "dbUser": "root",
+  "dbPassword": "",
+  "nodeServiceName": "MinimarketNode",
+  "nodePort": 3001,
+  "startNodeServiceAutomatically": true,
+  "startXamppServicesAutomatically": true,
+  "nodeExePath": "C:/Program Files/nodejs/node.exe",
+  "xamppRoot": "C:/xampp"
+}
+

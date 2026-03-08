@@ -1,46 +1,282 @@
 // -------------configuraciones que se cargar al momento de cargar 
 // -------------los elementos de la vista
+function hasLocalBusinessInfo() {
+  const requiredKeys = ['nombre_local', 'telefono_local', 'mail_local', 'tipo_local'];
+  return requiredKeys.every((key) => String(localStorage.getItem(key) || '').trim() !== '');
+}
+
+function hasLocalCajaAssigned() {
+  return /^\d+$/.test(String(localStorage.getItem('n_caja') || '').trim());
+}
+
+function normalizeServerBoxesList(cajas) {
+  if (Array.isArray(cajas)) return cajas;
+  return [];
+}
+
+function buildRawDeviceFingerprint() {
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+  const nav = window.navigator || {};
+  const scr = window.screen || {};
+  const parts = [
+    'minimarket-device-v1',
+    nav.userAgent || '',
+    nav.platform || '',
+    nav.vendor || '',
+    nav.language || '',
+    Array.isArray(nav.languages) ? nav.languages.join(',') : '',
+    String(nav.hardwareConcurrency || ''),
+    String(nav.deviceMemory || ''),
+    String(nav.maxTouchPoints || ''),
+    `${scr.width || ''}x${scr.height || ''}`,
+    String(scr.colorDepth || ''),
+    String(window.devicePixelRatio || ''),
+    tz,
+  ];
+  return parts.join('|');
+}
+
+function fallbackHash(text) {
+  let hash = 2166136261;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `fnv_${(hash >>> 0).toString(16).padStart(8, '0')}`;
+}
+
+async function sha256Hex(text) {
+  if (window.crypto?.subtle && typeof TextEncoder !== 'undefined') {
+    const data = new TextEncoder().encode(text);
+    const digest = await window.crypto.subtle.digest('SHA-256', data);
+    return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
+  }
+  return fallbackHash(text);
+}
+
+async function getDeviceFingerprint() {
+  const raw = buildRawDeviceFingerprint();
+  const hash = await sha256Hex(raw);
+  if (hash) {
+    localStorage.setItem('device_fp', hash);
+  }
+  return hash;
+}
+
+async function resolveCajaFromDeviceBinding(fingerprint) {
+  if (!fingerprint) return false;
+  try {
+    const response = await fetch(API_URL + `api/device-caja/resolve?fingerprint=${encodeURIComponent(fingerprint)}`);
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data?.found || !/^\d+$/.test(String(data.numero_caja || ''))) {
+      return false;
+    }
+    localStorage.setItem('n_caja', String(data.numero_caja));
+    if (String(data.nombre_caja || '').trim()) {
+      localStorage.setItem('nombre_caja', String(data.nombre_caja).trim());
+    } else if (!String(localStorage.getItem('nombre_caja') || '').trim()) {
+      localStorage.setItem('nombre_caja', `Caja ${data.numero_caja}`);
+    }
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function bindCajaToDeviceFingerprint(fingerprint, numeroCaja, nombreCaja) {
+  if (!fingerprint || !/^\d+$/.test(String(numeroCaja || ''))) return;
+  try {
+    await fetch(API_URL + 'api/device-caja/bind', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fingerprint,
+        numero_caja: Number(numeroCaja),
+        nombre_caja: String(nombreCaja || `Caja ${numeroCaja}`),
+      }),
+    });
+  } catch (_) {}
+}
+
+async function syncLocalBootstrapToServer() {
+  const fingerprint = await getDeviceFingerprint();
+  const hadLocalCaja = /^\d+$/.test(String(localStorage.getItem('n_caja') || '').trim());
+  if (!hadLocalCaja) {
+    await resolveCajaFromDeviceBinding(fingerprint);
+  }
+
+  const numeroCaja = String(localStorage.getItem('n_caja') || '').trim();
+  const nombreCaja = String(localStorage.getItem('nombre_caja') || '').trim();
+
+  try {
+    const serverInfo = await getInfo();
+    const serverHasInfo = Array.isArray(serverInfo) && serverInfo.length > 0;
+    if (!serverHasInfo && hasLocalBusinessInfo()) {
+      await addInfo();
+    }
+  } catch (_) {}
+
+  if (!/^\d+$/.test(numeroCaja)) {
+    return;
+  }
+
+  try {
+    const cajas = normalizeServerBoxesList(await getCajas());
+    const cajaExistsOnServer = cajas.some((item) => String(item?.n_caja || '').trim() === numeroCaja);
+    if (!cajaExistsOnServer) {
+      if (!nombreCaja) {
+        localStorage.setItem('nombre_caja', `Caja ${numeroCaja}`);
+      }
+      await addCajaConnected();
+    }
+  } catch (_) {}
+
+  await bindCajaToDeviceFingerprint(
+    fingerprint,
+    numeroCaja,
+    String(localStorage.getItem('nombre_caja') || '').trim() || `Caja ${numeroCaja}`
+  );
+}
+
+function applyLoginBranding() {
+  const logoEl = document.getElementById('login-company-logo');
+  const nameEl = document.getElementById('login-company-name');
+  const subtitleEl = document.getElementById('login-company-subtitle');
+  if (!logoEl) return;
+
+  // Branding del creador: fijo para la pantalla de login.
+  logoEl.src = './img/sia-logo.png';
+  logoEl.onerror = () => {
+    if (!logoEl.src.includes('cajero-automatico.png')) {
+      logoEl.src = './img/cajero-automatico.png';
+    }
+  };
+
+  if (nameEl) {
+    nameEl.textContent = 'SIA';
+  }
+  if (subtitleEl) {
+    subtitleEl.textContent = 'Soluciones Informaticas Avanzadas · Creador del sistema';
+  }
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
-
-  const numero_caja = localStorage.getItem('n_caja');
+  applyLoginBranding();
   const username = localStorage.getItem('user');
-  const password = localStorage.getItem('password');
+  const estadoLogin = localStorage.getItem('estado_login');
 
-  /*console.log("usuario localStorage");
-  console.log(username);
-  console.log("clave localStorage");
-  console.log(password);
-*/
-  if (username || password) {
+  if (username) {
       const inputName = document.getElementById('username');
-      const inputPassword = document.getElementById('password');
       inputName.value = username;
+    }
+  if (estadoLogin === '1') {
       document.getElementById('msj_activo').classList.remove('hidden');
     }
 
-  const info = await getInfo();
+  await syncLocalBootstrapToServer();
+  const numero_caja = String(localStorage.getItem('n_caja') || '').trim();
 
-  //console.log(info.length);
- if (info.length == 0) {
-  document.getElementById('welcome-msj').classList.remove('hidden');
-  document.getElementById('load').classList.add('hidden');
-  return;
- }
-  if(info[0].nombre){
-    document.getElementById('load').classList.add('hidden');
-    document.getElementById('welcome-msj').classList.remove('hidden');
-    document.getElementById('config-form').classList.add('hidden');
-  }
-  if (numero_caja){
+  // Prioridad: si esta caja ya fue asignada en almacenamiento local,
+  // ir directo al login sin pedir "Agregar Caja Nueva" otra vez.
+  if (/^\d+$/.test(numero_caja)) {
     document.getElementById('config-form').classList.add('hidden');
     document.getElementById('welcome-msj').classList.add('hidden');
     document.getElementById('load').classList.add('hidden');
-      document.getElementById('login').classList.remove('hidden');
-
+    document.getElementById('login').classList.remove('hidden');
+    await refreshShiftLockMessage();
+    return;
   }
-  
+
+  const localBusinessReady = hasLocalBusinessInfo();
+  let serverInfo = [];
+  try {
+    serverInfo = await getInfo();
+  } catch (_) {
+    serverInfo = [];
+  }
+  const serverBusinessReady = Array.isArray(serverInfo) && serverInfo.length > 0 && Boolean(serverInfo[0]?.nombre);
+
+  // Si el negocio existe en servidor, sincronizar cache local y NO volver a pedir datos del negocio.
+  if (serverBusinessReady && serverInfo[0]) {
+    const row = serverInfo[0];
+    if (String(row.nombre || '').trim()) localStorage.setItem('nombre_local', String(row.nombre).trim());
+    if (String(row.telefono || '').trim()) localStorage.setItem('telefono_local', String(row.telefono).trim());
+    if (String(row.mail || '').trim()) localStorage.setItem('mail_local', String(row.mail).trim());
+    if (String(row.tipo_local || '').trim()) localStorage.setItem('tipo_local', String(row.tipo_local).trim());
+  }
+
+  const businessReady = serverBusinessReady || localBusinessReady;
+
+  if (!businessReady) {
+    document.getElementById('welcome-msj').classList.remove('hidden');
+    document.getElementById('load').classList.add('hidden');
+    return;
+  }
+
+  // Negocio listo: en equipo nuevo pedir SOLO caja (no datos del negocio).
+  document.getElementById('load').classList.add('hidden');
+  document.getElementById('welcome-msj').classList.add('hidden');
+  document.getElementById('config-form').classList.add('hidden');
+  document.getElementById('add-caja').classList.remove('hidden');
+
+  // Si por alguna razon reaparece una caja local entre refrescos, entrar directo.
+  if (hasLocalCajaAssigned()) {
+    document.getElementById('welcome-msj').classList.add('hidden');
+    document.getElementById('add-caja').classList.add('hidden');
+    document.getElementById('login').classList.remove('hidden');
+    await refreshShiftLockMessage();
+  }
 
 });
+
+async function refreshShiftLockMessage() {
+  const msg = document.getElementById('msj_activo');
+  if (!msg) return;
+  const caja = String(localStorage.getItem('n_caja') || '').trim();
+  const token = String(sessionStorage.getItem('token') || localStorage.getItem('token') || '').trim();
+  if (!caja) {
+    msg.classList.add('hidden');
+    return;
+  }
+  if (!token) {
+    const ownerCaja = String(localStorage.getItem('turno_owner_caja') || '').trim();
+    const ownerUser = String(localStorage.getItem('turno_owner_user') || '').trim();
+    if (ownerCaja === caja && ownerUser) {
+      msg.textContent = `Caja ${caja} tiene un turno abierto. Solo el cajero del turno abierto puede ingresar hasta cerrar caja.`;
+      msg.classList.remove('hidden');
+    } else if (localStorage.getItem('estado_login') === '1') {
+      msg.textContent = 'Hay una sesion activa. Ingresa la contraseña para continuar o cerrar el turno anterior.';
+      msg.classList.remove('hidden');
+    } else {
+      msg.classList.add('hidden');
+    }
+    return;
+  }
+  try {
+    const response = await fetch(API_URL + `api/turno/abierto-caja?caja=${encodeURIComponent(caja)}`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data?.abierto) {
+      if (localStorage.getItem('estado_login') === '1') {
+        msg.textContent = 'Hay una sesion activa. Ingresa la contraseña para continuar o cerrar el turno anterior.';
+        msg.classList.remove('hidden');
+      } else {
+        msg.classList.add('hidden');
+      }
+      return;
+    }
+    msg.textContent = `Caja ${caja} tiene turno abierto por ${data.cajero_nombre || 'otro cajero'}. Solo ese usuario puede ingresar hasta cerrar caja.`;
+    msg.classList.remove('hidden');
+  } catch (_) {
+    if (localStorage.getItem('estado_login') === '1') {
+      msg.textContent = 'Hay una sesion activa. Ingresa la contraseña para continuar o cerrar el turno anterior.';
+      msg.classList.remove('hidden');
+    }
+  }
+}
 
 // -------------boton de vista de bienvenida configurar sistema
 document.getElementById('config-form').addEventListener('submit', async (e) => {
@@ -103,7 +339,7 @@ document.getElementById('option-form').addEventListener('submit', async (e) => {
     if(!credito.checked){
       credito = false;
     }else{
-      invecreditontario = true;
+      credito = true;
     }
     if(!producto_comun.checked){
       producto_comun = false;
@@ -180,12 +416,13 @@ document.getElementById('caja-form').addEventListener('submit', async (e) => {
     const n_caja = document.getElementById('n_caja').value;
     const nombre_caja = document.getElementById('nombre_caja').value;
     const cajas = await getCajas();
+    const cajasList = Array.isArray(cajas) ? cajas : [];
 
     /*console.log("respusta del backend");
     console.log(cajas);*/
 
-    if (cajas!=0) {
-      cajas.forEach(element => {
+    if (cajasList.length > 0) {
+      cajasList.forEach(element => {
         /*console.log(`el numero de caja existente es: `);
         console.log(element.n_caja);
         console.log(`el numero de caja que desea ingresar es: `);
@@ -220,6 +457,7 @@ document.getElementById('caja-form').addEventListener('submit', async (e) => {
     */
     document.getElementById('add-caja').classList.add('hidden');
     document.getElementById('login').classList.remove('hidden');   
+    await refreshShiftLockMessage();
     
 });
 
@@ -230,4 +468,3 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
 
 });
 
-console.log("login cargado exitosamente...");

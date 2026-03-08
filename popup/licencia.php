@@ -23,9 +23,9 @@
 
 
 
-            <button onClick="close_w()" class="btn"> Cerrar</button>
+            
         </div>
-        <h2 id="info">f</h2>
+        <h2 id="info"></h2>
 
 
     </div>

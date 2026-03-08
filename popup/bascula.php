@@ -15,7 +15,7 @@
         <div class="content">
             
         
-            <button  onClick="close_w()" class="btn" > Cerrar</button>
+            
         </div>
     </div>
 

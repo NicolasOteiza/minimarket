@@ -63,10 +63,27 @@ body.dark {
     font-size: 1.5rem;
 }
 
+.header-brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+}
+
+.header-logo {
+    width: 44px;
+    height: 44px;
+    object-fit: contain;
+    border-radius: 6px;
+    border: 1px solid rgba(0, 0, 0, 0.18);
+    background: #ffffff;
+}
+
 .header button {
     background: var(--clr-header-light);
     color: var(--clr-text-light);
     border: none;
+    border-radius: 8px;
 }
 
 .menu-controls {
@@ -110,6 +127,7 @@ body.dark {
 
 .nav-menu button:hover {
     background-color: var(--clr-primary-light);
+    color: var(--clr-text-dark);
 }
 
 /* COLLAPSIBLE (mobile) */

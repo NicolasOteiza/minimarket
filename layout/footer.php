@@ -1,7 +1,7 @@
-<script src="./js/scripts.js"></script>
-<script src="./js/functions.js"></script>
-<script src="./js/logout.js"></script>
-<script src="./js/popup.js"></script>
+<script src="./js/scripts.js?v=20260223a"></script>
+<script src="./js/functions.js?v=20260223a"></script>
+<script src="./js/logout.js?v=20260223a"></script>
+<script src="./js/popup.js?v=20260220c"></script>
 <script>
     // --- Menú colapsable ---
     const menuBtn = document.getElementById('menu-toggle');
@@ -15,3 +15,19 @@
 </body>
 
 </html>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

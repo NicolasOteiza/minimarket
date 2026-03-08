@@ -13,7 +13,7 @@
     <h1>RESPALDO AUTOMATICO</h1>
         
 
-    <button  onClick="close_w()" class="btn" > Cerrar</button>
+    
     
 </body>
 

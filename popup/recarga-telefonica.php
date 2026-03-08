@@ -13,7 +13,7 @@
     <h1>RECARGAS TELEFONICAS</h1>
         
 
-    <button  onClick="close_w()" class="btn" > Cerrar</button>
+    
     
 </body>
 

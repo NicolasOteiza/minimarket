@@ -1,27 +1,33 @@
-<!-- ============  VENTA – Ticket 1  ============ -->
+﻿<!-- ============  VENTA - TicketÂ 1  ============ -->
 
 <div class="panel"><!-- hereda caja blanca con sombra -->
-    <h1 class="panel-title">VENTA – Ticket <p id="nticket">1</p>
-    </h1>
-
-    <!-- FILA: código + botón -->
-    <div class="form-row">
-        <label for="barcode" class="form-label">Código de producto</label>
-        <input type="text" id="barcode" class="form-input" onkeydown="if (event.key === 'Enter'){ addToCart(); }" placeholder=" Escanea o ingresa el código">
-        <button id="searchCode" class="btn" onclick="addToCart()">Agregar al carrito</button>
+    <div class="sales-session-strip">
+        <div class="sales-session-item"><strong>Caja:</strong> <span id="sales-status-caja">-</span></div>
+        <div class="sales-session-item"><strong>Cajero:</strong> <span id="sales-status-cajero">-</span></div>
+        <div class="sales-session-item"><strong>Turno:</strong> <span id="sales-status-turno">Sin iniciar</span></div>
     </div>
 
+    <h1 class="panel-title">VENTA - Ticket <span id="nticket">1</span></h1>
+
+    <!-- FILA: Código + botón -->
+    <div class="form-row sales-scan-row">
+        <label for="barcode" class="form-label">Código de producto</label>
+        <input type="text" id="barcode" list="sales-barcode-suggestions" class="form-input"  autocomplete="off" oninput="if (typeof handleBarcodeInputSanitize === 'function') { handleBarcodeInputSanitize(this); } if (typeof updateSalesBarcodeSuggestions === 'function') { updateSalesBarcodeSuggestions(this.value); }" onchange="if (typeof handleSalesBarcodeSelectionChange === 'function') { handleSalesBarcodeSelectionChange(this.value); }" onkeydown="if (typeof handleBarcodeKeydown === 'function') { handleBarcodeKeydown(event, this); }" placeholder="Escanea o ingresa el código">
+        <datalist id="sales-barcode-suggestions"></datalist>
+        <button id="searchCode" class="btn sales-scan-btn" onclick="addToCart()">ENTER - Agregar producto</button>
+        <button id="sales-camera-scan-btn" class="btn sales-scan-btn sales-mobile-camera-btn" type="button" onclick="openSalesCameraScanPopup()">Escanear cámara</button>
+    </div>
     <!-- TABLA DE CARRITO -->
     <div style="width: 100%; ">
         <div style=" padding:0px 0px 0px 0px;">
-            <table>
+            <table class="ventas-quick-actions">
                 <tr>
-                    <td class="tot-label"><button class="btn btn2">Producto Común</button></td>
-                    <td class="tot-label"><button class="btn btn2">Buscar</button></td>
-                    <td class="tot-label"><button class="btn btn2">Ingreso</button></td>
-                    <td class="tot-label"><button class="btn btn2">Salida</button></td>
-                    <td class="tot-label"><button class="btn btn2">Eliminar</button></td>
-                    <td class="tot-label"><button class="btn btn2">Consulta Precio</button></td>
+                    <td class="quick-cell"><button id="sales-common-product-btn" data-permission-key="ventas_producto_comun" data-permission-mode="hide" class="btn btn2 quick-action-btn" type="button" onclick="openCommonProductPopup()">CTRL+P Art. común</button></td>
+                    <td class="quick-cell"><button id="sales-search-product-btn" data-permission-key="ventas_buscar_producto" data-permission-mode="hide" class="btn btn2 quick-action-btn" type="button" onclick="openSearchProductPopup()">F10 Buscar</button></td>
+                    <td class="quick-cell"><button id="sales-cash-entry-btn" data-permission-key="ventas_entrada_efectivo" data-permission-mode="disable" class="btn btn2 quick-action-btn" type="button" onclick="openCashEntryPopup()">F7 Entradas</button></td>
+                    <td class="quick-cell"><button id="sales-cash-exit-btn" data-permission-key="ventas_salida_efectivo" data-permission-mode="disable" class="btn btn2 quick-action-btn" type="button" onclick="openCashExitPopup()">F8 Salidas</button></td>
+                    <td class="quick-cell"><button id="sales-remove-item-btn" data-permission-key="ventas_eliminar_articulo" data-permission-mode="disable" class="btn btn2 quick-action-btn" type="button" onclick="removeSelectedCartItem()">DEL Borrar</button></td>
+                    <td class="quick-cell"><button id="sales-price-check-btn" class="btn btn2 quick-action-btn" type="button" onclick="openPriceCheckPopup()">F9 Verificador</button></td>
                 </tr>
             </table>
         </div>
@@ -30,11 +36,12 @@
                 <table class="venta-table">
                     <thead>
                         <tr>
-                            <th>Code</th>
+                            <th>Código</th>
                             <th>Descripción</th>
-                            <th>Precio Unitario</th>
-                            <th>Cantidad</th>
-                            <th>Subtotal</th>
+                            <th>Precio Venta</th>
+                            <th>Cant.</th>
+                            <th>Importe</th>
+                            <th>Existencia</th>
                         </tr>
                     </thead>
                     <tbody id="cart-table-body"><!-- filas dinámicas --></tbody>
@@ -46,16 +53,18 @@
                         <td colspan="7" class="tot-label">
                             <strong>Total:</strong>
                         </td>
-                        <td style="width:60px;">
-                            <ul style="list-style: none;">
-                                <li id="total-amount"><b>$0</b></li>
-                                <li>
-                                    <button style="height: 80px; font-size: 30px;" class="btn btn2" onclick="mostrarPopUp('miPopUp')"><b>Finalizar venta</b></button>
-                                </li>
-                            </ul>
+                        <td style="width:300px; min-width:300px;">
+                            <div class="sales-action-stack">
+                                <div id="total-amount"><b>$0</b></div>
+                            </div>
                         </td>
                     </tr>
                 </table>
+                <div class="sales-bottom-actions">
+                    <button id="open-finalize-popup-btn" data-permission-key="ventas_cobrar_ticket" data-permission-mode="disable" class="btn btn2 finalize-main-btn" onclick="mostrarPopUp('miPopUp')" disabled><b>F12 - Cobrar</b></button>
+                    <button id="sales-reprint-last-btn" data-permission-key="ventas_cobrar_ticket" data-permission-mode="disable" class="btn btn2 finalize-main-btn" type="button" onclick="reprintLastSaleTicketOrInvoice()">Reimprimir &uacute;ltimo</button>
+                    <button id="sales-session-history-btn" data-permission-key="ventas_historial" data-permission-mode="disable" class="btn btn2 finalize-main-btn" type="button" onclick="openSalesSessionHistoryPopup()">Ventas sesi&oacute;n</button>
+                </div>
             </div>
         </div>
     </div>
@@ -84,24 +93,40 @@
                     <!--seleccion de metodo de pago-->
                     <div class="popup-metodos">
                         <div class="tabss">
-                            <div class="tab active" data-tab="efectivo">
-                                <div class="tab-img"><img src="../../img/efectivo.png"></div>
+                            <div class="tab active" data-tab="efectivo" data-payment-method="efectivo">
+                                <div class="tab-img"><img src="./img/efectivo.png"></div>
                                 <div class="tab-texto"><span>Efectivo</span></div>
                             </div>
-                            <div class="tab" data-tab="tarjeta">
-                                <div class="tab-img"><img src="../../img/tarjeta-credito.png"></div>
+                            <div class="tab" data-tab="tarjeta" data-payment-method="tarjeta">
+                                <div class="tab-img"><img src="./img/tarjeta-credito.png"></div>
                                 <div class="tab-texto"><span>Tarjeta</span></div>
                             </div>
-                            <div class="tab" data-tab="mixto">
-                                <div class="tab-img"><img src="../../img/mixto.png"></div>
+                            <div class="tab" data-tab="mixto" data-payment-method="mixto">
+                                <div class="tab-img"><img src="./img/mixto.png"></div>
                                 <div class="tab-texto"><span>Mixto</span></div>
+                            </div>
+                            <div class="tab" data-tab="dolares" data-payment-method="dolares">
+                                <div class="tab-img"><img src="./img/dolar.png"></div>
+                                <div class="tab-texto"><span>Dólares</span></div>
+                            </div>
+                            <div class="tab" data-tab="transferencia" data-payment-method="transferencia">
+                                <div class="tab-img"><img src="./img/transferencia.png"></div>
+                                <div class="tab-texto"><span>Transferencia</span></div>
+                            </div>
+                            <div class="tab" data-tab="cheque" data-payment-method="cheque">
+                                <div class="tab-img"><img src="./img/cheque.png"></div>
+                                <div class="tab-texto"><span>Cheque</span></div>
+                            </div>
+                            <div class="tab" data-tab="vale" data-payment-method="vale">
+                                <div class="tab-img"><img src="./img/vale.png"></div>
+                                <div class="tab-texto"><span>Vale</span></div>
                             </div>
                         </div>
                     </div>
                     <!--detalle del metodo de pago-->
                     <div class="div-tab">
                         <!--efectivo metodo de pago-->
-                        <div id="efectivo" class="tab-metodo-pago-content active">
+                        <div id="efectivo" class="tab-metodo-pago-content active" data-payment-method="efectivo">
                             <div class="parent">
                                 <div class="div1">Pagó con:</div>
                                 <div class="div2"><input id="efectivoEfectivo" type="text" min="0" placeholder="0"></div>
@@ -112,16 +137,16 @@
                             <p>Su cambio: <input type="text"></p>-->
                         </div>
                         <!--tarjeta metodo de pago-->
-                        <div id="tarjeta" class="tab-metodo-pago-content">
+                        <div id="tarjeta" class="tab-metodo-pago-content" data-payment-method="tarjeta">
 
                             <div class="parent">
                                 <div class="div1">Referencia:</div>
-                                <div class="div2"><input type="text"></div>
+                                <div class="div2"><input id="referenciaTarjeta" type="text" placeholder=""></div>
                             </div>
                             <!-- <p>Referencia: <input type="text"></p>-->
                         </div>
                         <!--mixto metodo de pago-->
-                        <div id="mixto" class="tab-metodo-pago-content">
+                        <div id="mixto" class="tab-metodo-pago-content" data-payment-method="mixto">
                             <div class="parent">
                                 <div class="div3">Tarjeta:</div>
                                 <div class="div4"><input id="tarjetaMixto" type="text" min="0" placeholder="0"></div>
@@ -131,17 +156,263 @@
                                 <div class="div6"><input id="cambioMixto" type="text" readonly></div>
                             </div>
                         </div>
+                        <div id="dolares" class="tab-metodo-pago-content" data-payment-method="dolares">
+                            <div class="parent">
+                                <div class="div1">Referencia:</div>
+                                <div class="div2"><input id="referenciaDolares" type="text" placeholder=""></div>
+                            </div>
+                        </div>
+                        <div id="transferencia" class="tab-metodo-pago-content" data-payment-method="transferencia">
+                            <div class="parent">
+                                <div class="div1">Referencia:</div>
+                                <div class="div2"><input id="referenciaTransferencia" type="text" placeholder=""></div>
+                            </div>
+                        </div>
+                        <div id="cheque" class="tab-metodo-pago-content" data-payment-method="cheque">
+                            <div class="parent">
+                                <div class="div1">Número de cheque:</div>
+                                <div class="div2"><input id="referenciaCheque" type="text" placeholder=""></div>
+                            </div>
+                        </div>
+                        <div id="vale" class="tab-metodo-pago-content" data-payment-method="vale">
+                            <div class="parent">
+                                <div class="div1">Folio/Referencia:</div>
+                                <div class="div2"><input id="referenciaVale" type="text" placeholder=""></div>
+                            </div>
+                        </div>
                     </div>
                 </div>
                 <!--frame finalizar venta-->
                 <div class="popup-finalizar">
-                    <button class="btn2" onclick="finalizeSale()">finalizar venta</button>
-                    <button class="btn2">finalizar venta</button>
-                    <button class="btn2">finalizar venta</button>
+                    <p id="payment-warning" class="payment-warning hidden"></p>
+                    <button id="finalize-sale-btn" data-permission-key="ventas_cobrar_ticket" data-permission-mode="disable" class="btn2" onclick="finalizeSale(true)">Finalizar + comprobante</button>
+                    <button id="finalize-no-receipt-btn" data-permission-key="ventas_cobrar_ticket" data-permission-mode="disable" class="btn2" type="button" onclick="finalizeSale(false)">Finalizar sin comprobante</button>
+                    <button id="cancel-sale-popup-btn" class="btn2" type="button" onclick="cerrarPopUp('miPopUp')">Cancelar</button>
                 </div>
             </div>
         </div>
     </div>
 
+    <div id="commonProductPopUp" class="hidden" style="position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:9999; align-items:center; justify-content:center;">
+        <div class="contenidoPopUp" style="width:min(500px,90vw); max-width:500px; height:250px; margin:0; display:flex; flex-direction:column;">
+            <div class="popup-titulo">
+                <p class="popup-titulo-texto">Producto Común</p>
+                <button class="popup-cerrar" type="button" onclick="closeCommonProductPopup()">
+                    <p>X</p>
+                </button>
+            </div>
+            <div class="popup-body" style="padding:10px 14px; display:grid; grid-template-columns:1fr 1fr; gap:10px 12px; align-items:end; flex:1;">
+                <div class="form-row" style="display:flex; flex-direction:column; gap:6px; margin:0; grid-column:1 / 3; align-items:center;">
+                    <label for="common-product-name">Nombre</label>
+                    <input id="common-product-name" type="text" class="form-input" maxlength="60" placeholder="Ej: producto rapido" style="height:34px; width:80%;">
+                </div>
+                <div class="form-row" style="display:flex; flex-direction:column; gap:6px; margin:0; align-items:center;">
+                    <label for="common-product-price">Precio unitario</label>
+                    <input id="common-product-price" type="number" min="1" step="1" class="form-input" placeholder="0" style="height:34px; width:40%;">
+                </div>
+                <div class="form-row" style="display:flex; flex-direction:column; gap:6px; margin:0; align-items:center;">
+                    <label for="common-product-qty">Cantidad</label>
+                    <input id="common-product-qty" type="number" min="1" step="1" class="form-input" value="1" style="height:34px; width:40%;">
+                </div>
+                <div style="display:flex; justify-content:center; gap:8px; grid-column:1 / 3; padding-top:4px;">
+                    <button class="btn2" type="button" onclick="closeCommonProductPopup()" style="height:30px; padding:4px 10px; min-width:92px; font-size:12px;">Cancelar</button>
+                    <button class="btn2" type="button" onclick="addCommonProductToCart()" style="height:30px; padding:4px 10px; min-width:92px; font-size:12px;">Agregar</button>
+                </div>
+            </div>
+        </div>
+    </div>
 
+    <div id="searchProductPopUp" class="hidden" style="position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:9999; align-items:center; justify-content:center;">
+        <div class="contenidoPopUp" style="width:min(780px,95vw); max-width:780px; margin:0; display:flex; flex-direction:column;">
+            <div class="popup-titulo">
+                <p class="popup-titulo-texto">Buscar producto</p>
+                <button class="popup-cerrar" type="button" onclick="closeSearchProductPopup()">
+                    <p>X</p>
+                </button>
+            </div>
+            <div class="popup-body" style="padding:12px; display:flex; gap:12px; align-items:stretch;">
+                <div style="flex:1; min-width:0;">
+                    <div class="form-row" style="display:flex; flex-direction:column; gap:6px; margin-bottom:10px;">
+                        <label for="search-product-input">Nombre</label>
+                        <input id="search-product-input" type="text" class="form-input" placeholder="Escribe para buscar..." oninput="searchProductsSuggestions(this.value)" style="width:100%; box-sizing:border-box;">
+                    </div>
+                    <div style="max-height:260px; overflow:auto; border:1px solid #d1d5db; border-radius:8px;">
+                        <table class="venta-table" style="margin:0;">
+                            <thead>
+                                <tr>
+                                    <th style="width:52%;">Producto</th>
+                                    <th style="width:20%;">Precio</th>
+                                    <th style="width:18%;">Stock</th>
+                                    <th style="width:10%;">Sel.</th>
+                                </tr>
+                            </thead>
+                            <tbody id="search-product-results-body">
+                                <tr><td colspan="4" style="text-align:center;">Escribe para buscar productos.</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                <div style="width:190px; border-left:1px solid #e5e7eb; padding:0 12px; display:flex; flex-direction:column; justify-content:flex-start; gap:8px;">
+                    <button class="btn2" type="button" onclick="addSelectedSearchedProductToCart()" style="height:30px; padding:4px 10px; font-size:12px; width:100%; min-width:0;">Agregar</button>
+                    <button class="btn2" type="button" onclick="closeSearchProductPopup()" style="height:30px; padding:4px 10px; font-size:12px; width:100%; min-width:0;">Cerrar</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="cashEntryPopUp" class="hidden" style="position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:9999; align-items:center; justify-content:center;">
+        <div class="contenidoPopUp" style="width:min(380px,92vw); max-width:380px; height:min(250px,70vh); max-height:250px; margin:0; display:flex; flex-direction:column;">
+            <div class="popup-titulo">
+                <p class="popup-titulo-texto">Ingreso de dinero</p>
+                <button class="popup-cerrar" type="button" onclick="closeCashEntryPopup()">
+                    <p>X</p>
+                </button>
+            </div>
+            <div class="popup-body" style="padding:8px 12px; display:flex; flex-direction:column; justify-content:space-between; align-items:center; flex:1;">
+                <div class="form-row" style="display:flex; flex-direction:column; gap:4px; margin:0; align-items:center; width:100%;">
+                    <label for="cash-entry-amount">Monto de ingreso</label>
+                    <input id="cash-entry-amount" type="text" inputmode="numeric" autocomplete="off" class="form-input" placeholder="0" style="width:80%; height:30px;" oninput="if (typeof handleBarcodeInputSanitize === 'function') { handleBarcodeInputSanitize(this); }">
+                </div>
+                <div class="form-row" style="display:flex; flex-direction:column; gap:4px; margin:0; align-items:center; width:100%;">
+                    <label for="cash-entry-kind">Tipo de ingreso</label>
+                    <select id="cash-entry-kind" class="form-input" style="width:80%; height:32px;" onchange="updateCashEntryDescriptionVisibility()">
+                        <option value="sencillo">Sencillo</option>
+                        <option value="otro">Otro</option>
+                    </select>
+                </div>
+                <div id="cash-entry-description-wrapper" class="form-row hidden" style="display:flex; flex-direction:column; gap:4px; margin:0; align-items:center; width:100%;">
+                    <label for="cash-entry-description">Descripcion</label>
+                    <input id="cash-entry-description" type="text" maxlength="255" class="form-input" placeholder="Ej: ingreso adicional" style="width:80%; height:30px;">
+                </div>
+                <div style="display:flex; justify-content:center; gap:8px; width:100%;">
+                    <button class="btn2" type="button" onclick="saveCashEntry()" style="height:28px; padding:4px 10px; min-width:80px; font-size:12px; width:80%;">Guardar</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div id="cashExitPopUp" class="hidden" style="position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:9999; align-items:center; justify-content:center;">
+        <div class="contenidoPopUp" style="width:min(380px,92vw); max-width:380px; height:min(220px,65vh); max-height:220px; margin:0; display:flex; flex-direction:column;">
+            <div class="popup-titulo">
+                <p class="popup-titulo-texto">Salida de dinero</p>
+                <button class="popup-cerrar" type="button" onclick="closeCashExitPopup()">
+                    <p>X</p>
+                </button>
+            </div>
+            <div class="popup-body" style="padding:8px 12px; display:flex; flex-direction:column; justify-content:space-between; align-items:center; flex:1;">
+                <div class="form-row" style="display:flex; flex-direction:column; gap:4px; margin:0; align-items:center; width:100%;">
+                    <label for="cash-exit-amount">Monto de salida</label>
+                    <input id="cash-exit-amount" type="text" inputmode="numeric" autocomplete="off" class="form-input" placeholder="0" style="width:80%; height:30px;" oninput="if (typeof handleBarcodeInputSanitize === 'function') { handleBarcodeInputSanitize(this); }">
+                </div>
+                <div class="form-row" style="display:flex; flex-direction:column; gap:4px; margin:0; align-items:center; width:100%;">
+                    <label for="cash-exit-description">Descripcion</label>
+                    <input id="cash-exit-description" type="text" maxlength="255" class="form-input" placeholder="Motivo de salida" style="width:80%; height:30px;">
+                </div>
+                <div style="display:flex; justify-content:center; gap:8px; width:100%;">
+                    <button class="btn2" type="button" onclick="saveCashExit()" style="height:28px; padding:4px 10px; min-width:80px; font-size:12px; width:80%;">Guardar</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div id="priceCheckPopUp" class="hidden" style="position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:9999; align-items:center; justify-content:center;">
+        <div class="contenidoPopUp" style="width:min(400px,92vw); max-width:400px; height:min(220px,65vh); max-height:220px; margin:0; display:flex; flex-direction:column;">
+            <div class="popup-titulo">
+                <p class="popup-titulo-texto">Consulta de precio</p>
+                <button class="popup-cerrar" type="button" onclick="closePriceCheckPopup()">
+                    <p>X</p>
+                </button>
+            </div>
+            <div class="popup-body" style="padding:8px 12px; display:flex; flex-direction:column; justify-content:space-between; align-items:center; flex:1;">
+                <div class="form-row" style="display:flex; flex-direction:column; gap:4px; margin:0; align-items:center; width:100%;">
+                    <label for="price-check-code">Codigo de producto</label>
+                    <input id="price-check-code" type="text" autocomplete="off" class="form-input" placeholder="Ej: 7501234567890" style="width:80%; height:30px;" onkeydown="if (event.key === 'Enter'){ lookupProductPrice(); }">
+                </div>
+                <div style="width:90%; text-align:center;">
+                    <div id="price-check-name" style="font-size:13px; min-height:18px;"></div>
+                    <div id="price-check-value" style="font-size:30px; font-weight:700; line-height:1.1;">$0</div>
+                </div>
+                <div style="display:flex; justify-content:center; gap:8px; width:100%;">
+                    <button class="btn2" type="button" onclick="lookupProductPrice()" style="height:28px; padding:4px 10px; min-width:80px; font-size:12px; width:80%;">Consultar</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div id="salesHistoryPopUp" class="hidden" style="position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:9999; align-items:center; justify-content:center;">
+        <div class="contenidoPopUp" style="width:min(980px,96vw); max-width:980px; margin:0; display:flex; flex-direction:column;">
+            <div class="popup-titulo">
+                <p class="popup-titulo-texto">Ventas de la sesi&oacute;n</p>
+                <button class="popup-cerrar" type="button" onclick="closeSalesSessionHistoryPopup()">
+                    <p>X</p>
+                </button>
+            </div>
+            <div class="popup-body" style="padding:10px 12px; display:flex; flex-direction:column; gap:8px;">
+                <div id="sales-history-summary" class="product-status-box">Cargando ventas...</div>
+                <div style="max-height:min(62vh,520px); overflow:auto; border:1px solid #d1d5db; border-radius:8px;">
+                    <table class="venta-table" style="margin:0;">
+                        <thead>
+                            <tr>
+                                <th>Fecha</th>
+                                <th>Venta</th>
+                                <th>Caja</th>
+                                <th>Cajero</th>
+                                <th>M&eacute;todo</th>
+                                <th>Total</th>
+                            </tr>
+                        </thead>
+                        <tbody id="sales-history-body">
+                            <tr><td colspan="6" style="text-align:center;">Sin datos.</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div style="display:flex; justify-content:flex-end;">
+                    <button class="btn2" type="button" onclick="closeSalesSessionHistoryPopup()" style="height:32px; min-width:120px;">Cerrar</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div id="salesCameraScanPopUp" class="hidden" style="position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:9999; align-items:center; justify-content:center;">
+        <div class="contenidoPopUp" style="width:min(560px,95vw); max-width:560px; margin:0; display:flex; flex-direction:column;">
+            <div class="popup-titulo">
+                <p class="popup-titulo-texto">Escanear código con cámara</p>
+                <button class="popup-cerrar" type="button" onclick="closeSalesCameraScanPopup()">
+                    <p>X</p>
+                </button>
+            </div>
+            <div class="popup-body" style="padding:10px; display:flex; flex-direction:column; gap:8px;">
+                <video id="sales-camera-video" autoplay playsinline muted style="width:100%; max-height:56vh; background:#0b1220; border:1px solid #334155; border-radius:8px;"></video>
+                <div id="sales-camera-status" class="product-status-box">Apunta al código de barras para escanear.</div>
+                <div style="display:flex; justify-content:flex-end; gap:8px;">
+                    <button class="btn2" type="button" onclick="closeSalesCameraScanPopup()" style="height:32px; min-width:120px;">Cerrar</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div id="salesCameraPermissionPopUp" class="hidden" style="position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:10000; align-items:center; justify-content:center;">
+        <div class="contenidoPopUp" style="width:min(560px,95vw); max-width:560px; margin:0; display:flex; flex-direction:column;">
+            <div class="popup-titulo">
+                <p class="popup-titulo-texto">Permiso de cámara</p>
+                <button class="popup-cerrar" type="button" onclick="closeSalesCameraPermissionPopup()">
+                    <p>X</p>
+                </button>
+            </div>
+            <div class="popup-body" style="padding:10px; display:flex; flex-direction:column; gap:10px;">
+                <div id="sales-camera-permission-reason" class="product-status-box">
+                    Se requiere permiso de cámara para escanear códigos.
+                </div>
+                <div id="sales-camera-permission-help" style="font-size:13px; line-height:1.45; color:#334155; background:#f8fafc; border:1px solid #dbe5f1; border-radius:8px; padding:8px 10px;">
+                    Revisa permisos del sitio en tu navegador.
+                </div>
+                <div style="display:flex; justify-content:flex-end; gap:8px; flex-wrap:wrap;">
+                    <button class="btn2" type="button" onclick="requestSalesCameraPermissionFromPopup()" style="height:32px; min-width:150px;">Solicitar permiso</button>
+                    <button class="btn2" type="button" onclick="openSalesCameraScanPopup()" style="height:32px; min-width:150px;">Reintentar escáner</button>
+                    <button class="btn2" type="button" onclick="closeSalesCameraPermissionPopup()" style="height:32px; min-width:110px;">Cerrar</button>
+                </div>
+            </div>
+        </div>
+    </div>
 </div>
+<div class="sales-bottom-hint">Punto de venta: teclee o escanee el código del producto.</div>
+</div>
+
+
+
+

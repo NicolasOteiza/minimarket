@@ -229,7 +229,13 @@
 
     <!------------inicio del login-->
     <div id="login" class="login-container hidden">
-        <h1>Login</h1>
+        <div class="login-brand">
+            <img id="login-company-logo" src="./img/sia-logo.png" alt="Logo creador del sistema">
+            <div class="login-brand-text">
+                <h1 id="login-company-name">SIA</h1>
+                <p id="login-company-subtitle">Creador del sistema</p>
+            </div>
+        </div>
 
         <form id="login-form">
             <input type="text" id="username" placeholder="Username" required />
@@ -241,8 +247,8 @@
     </div>
     <!--fin login-->
 
-    <script src="./js/login.js"></script>
-    <script src="./js/scripts.js"></script>
+    <script src="./js/login.js?v=20260220b"></script>
+    <script src="./js/scripts.js?v=20260220aq"></script>
 
 </body>
 
