@@ -1,0 +1,21 @@
+Registro rapido - 2026-03-25
+
+Busqueda ejecutada:
+  rg -n "192\\.168\\.1\\.91|DB_HOST=.*192\\.168\\.1\\.91" C:\xampp\htdocs\minimarket
+
+Resultado:
+  - No hay referencias hardcodeadas activas a 192.168.1.91 dentro de js/.
+  - La conexion API en frontend se resuelve por host actual o por localStorage["api_url"].
+  - La configuracion DB vive en:
+      1) C:\xampp\htdocs\minimarket\server\.env
+      2) C:\xampp\htdocs\minimarket\minimarket_cliente\server\.env
+
+Estado actual aplicado en este PC:
+  DB_HOST=127.0.0.1
+  DB_USER=root
+  DB_PASSWORD=
+
+Cuando se use red del negocio (servidor real):
+  DB_HOST=192.168.1.91
+  DB_USER=minimarket_app
+  DB_PASSWORD="MiniM4rket#2026"

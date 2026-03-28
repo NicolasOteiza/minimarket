@@ -17,14 +17,15 @@ OutputDir=..\dist
 OutputBaseFilename=MinimarketInstaller
 Compression=lzma
 SolidCompression=yes
-ArchitecturesInstallIn64BitMode=x64
+ArchitecturesInstallIn64BitMode=x64compatible
+PrivilegesRequired=admin
+PrivilegesRequiredOverridesAllowed=dialog
 
 [Files]
-Source: "..\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+Source: "..\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion; Excludes: "dist\*"
 
 [Icons]
 Name: "{autoprograms}\Minimarket Installer"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\run-install.ps1"""; WorkingDir: "{app}"
 
 [Run]
-Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\run-install.ps1"""; Flags: runhidden
-
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\run-install.ps1"""; Flags: waituntilterminated

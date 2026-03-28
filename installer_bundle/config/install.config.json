@@ -9,6 +9,10 @@
   "startNodeServiceAutomatically": true,
   "startXamppServicesAutomatically": true,
   "nodeExePath": "C:/Program Files/nodejs/node.exe",
-  "xamppRoot": "C:/xampp"
+  "xamppRoot": "C:/xampp",
+  "localNodeInstallerPath": "installers/node-lts.msi",
+  "localXamppInstallerPath": "installers/xampp-installer.exe",
+  "localNodeInstallerArgs": "/qn /norestart",
+  "localXamppInstallerArgs": "/S",
+  "logDir": "logs"
 }
-

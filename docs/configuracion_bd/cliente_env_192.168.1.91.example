@@ -1,0 +1,32 @@
+NODE_ENV=development
+PORT=3001
+
+# Base de datos central (servidor)
+DB_HOST=192.168.1.91
+DB_PORT=3306
+DB_NAME=minimarket
+DB_USER=minimarket_app
+DB_PASSWORD="MiniM4rket#2026"
+DB_POOL_LIMIT=5
+
+# Seguridad local de este cliente
+JWT_SECRET=minimarket_cliente_local_CAMBIAR_2026
+JWT_EXPIRES_IN=24h
+JWT_REFRESH_EXPIRES_IN=7d
+
+# CORS
+CORS_ORIGIN=*
+
+# Impresion local (bridge)
+LOCAL_PRINT_BRIDGE_PORT=7357
+
+# Opcional correo (si no se usa, dejar vacio)
+SMTP_HOST=
+SMTP_PORT=587
+SMTP_SECURE=0
+SMTP_USER=
+SMTP_PASS=
+SMTP_FROM=
+
+# DTE
+DTE_CERT_SECRET=minimarket_cliente_dte_secret_CAMBIAR_2026

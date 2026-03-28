@@ -19,6 +19,11 @@
     const protocol = isLocalHost ? 'http:' : window.location.protocol;
     return `${protocol}//${window.location.hostname}:3001/`;
 })();
+const FRONTEND_BUILD_VERSION = '20260328c';
+try {
+    window.__MINIMARKET_BUILD = FRONTEND_BUILD_VERSION;
+} catch (_) {
+}
 
 let frontendErrorReportingBootstrapped = false;
 let frontendLastErrorReportAt = 0;
@@ -196,6 +201,11 @@ function setupFrontendErrorReporting() {
         const resolver = activeResolver;
         activeResolver = null;
         overlay.classList.remove('show');
+        setTimeout(() => {
+            if (typeof focusBarcodeInputForNextScan === 'function') {
+                focusBarcodeInputForNextScan();
+            }
+        }, 0);
         resolver(value);
     }
 
@@ -388,9 +398,12 @@ function setupFrontendErrorReporting() {
 let isFinalizingSale = false;
 let shiftStarted = false;
 let shiftValidationRetryTimer = null;
+let ensureShiftStartedInFlight = null;
 let searchProductsDebounceTimer = null;
 let searchProductsLastResults = [];
 let searchSelectedProductId = null;
+let bulkProductPopupContext = null;
+let bulkProductLastEditedField = null;
 let salesBarcodeSuggestDebounceTimer = null;
 let salesBarcodeSuggestCodes = new Set();
 const SALES_CAMERA_PERMISSION_KEY = 'sales_camera_permission_prompt_v1';
@@ -416,32 +429,74 @@ let cutCloseContext = {
     esperadoTarjeta: 0,
     resumenLoaded: false,
     sessionResumenLoaded: false,
+    turnStatusLabel: '',
+    currentDate: new Date().toISOString().slice(0, 10),
+    sessionReportSnapshot: null,
+    historicalCutId: null,
+};
+let cutHistoryContext = {
+    mode: 'cashier',
+    rows: [],
+};
+let cutRebuildContext = {
+    cuts: [],
+    sales: [],
+    selectedSaleIds: new Set(),
+    selectedCutIds: new Set(),
+    keeperCutId: null,
+    persistedCutId: null,
+    persistedSignature: '',
+    filtersLoaded: false,
+};
+const CUT_CALCULATOR_HISTORY_KEY = 'cut_calculator_history_v1';
+const CUT_CALCULATOR_HISTORY_LIMIT = 5;
+let cutCalculatorState = {
+    expression: '',
+    justEvaluated: false,
+    history: [],
+    manualPositioned: false,
+    dragPointerId: null,
+    dragOffsetX: 0,
+    dragOffsetY: 0,
+    errorTimer: null,
 };
 const TICKET_COUNTER_API_MODE_KEY = 'ticket_counter_api_mode';
 const SHIFT_OWNER_USER_KEY = 'turno_owner_user';
 const SHIFT_OWNER_CAJA_KEY = 'turno_owner_caja';
 const REFRESH_TOKEN_STORAGE_KEY = 'refresh_token';
+const SESSION_KEEPALIVE_INTERVAL_MS = 5 * 60 * 1000;
 let refreshInFlightPromise = null;
 let fetchAuthInterceptorInitialized = false;
+let sessionKeepAliveInitialized = false;
 
 function getSessionToken() {
-    const sessionToken = sessionStorage.getItem('token');
-    if (sessionToken) return sessionToken;
-    const localToken = localStorage.getItem('token');
+    const localToken = String(localStorage.getItem('token') || '').trim();
+    const sessionToken = String(sessionStorage.getItem('token') || '').trim();
     if (localToken) {
-        sessionStorage.setItem('token', localToken);
+        if (localToken !== sessionToken) {
+            sessionStorage.setItem('token', localToken);
+        }
         return localToken;
+    }
+    if (sessionToken) {
+        localStorage.setItem('token', sessionToken);
+        return sessionToken;
     }
     return null;
 }
 
 function getRefreshToken() {
-    const sessionRefresh = sessionStorage.getItem(REFRESH_TOKEN_STORAGE_KEY);
-    if (sessionRefresh) return sessionRefresh;
-    const localRefresh = localStorage.getItem(REFRESH_TOKEN_STORAGE_KEY);
+    const localRefresh = String(localStorage.getItem(REFRESH_TOKEN_STORAGE_KEY) || '').trim();
+    const sessionRefresh = String(sessionStorage.getItem(REFRESH_TOKEN_STORAGE_KEY) || '').trim();
     if (localRefresh) {
-        sessionStorage.setItem(REFRESH_TOKEN_STORAGE_KEY, localRefresh);
+        if (localRefresh !== sessionRefresh) {
+            sessionStorage.setItem(REFRESH_TOKEN_STORAGE_KEY, localRefresh);
+        }
         return localRefresh;
+    }
+    if (sessionRefresh) {
+        localStorage.setItem(REFRESH_TOKEN_STORAGE_KEY, sessionRefresh);
+        return sessionRefresh;
     }
     return null;
 }
@@ -477,20 +532,43 @@ function clearSessionTokens() {
     localStorage.removeItem(REFRESH_TOKEN_STORAGE_KEY);
 }
 
+async function requestAccessTokenRefreshWith(refreshToken) {
+    const safeToken = String(refreshToken || '').trim();
+    if (!safeToken) return null;
+    try {
+        const response = await fetch(API_URL + 'api/auth/refresh', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ refresh_token: safeToken }),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data?.token || !data?.refresh_token) {
+            return null;
+        }
+        return data;
+    } catch (_) {
+        return null;
+    }
+}
+
 async function refreshAccessTokenIfNeeded() {
     if (refreshInFlightPromise) {
         return refreshInFlightPromise;
     }
     refreshInFlightPromise = (async () => {
-        const refreshToken = getRefreshToken();
+        let refreshToken = getRefreshToken();
         if (!refreshToken) return null;
-        const response = await fetch(API_URL + 'api/auth/refresh', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ refresh_token: refreshToken }),
-        });
-        const data = await response.json().catch(() => ({}));
-        if (!response.ok || !data?.token || !data?.refresh_token) {
+
+        let data = await requestAccessTokenRefreshWith(refreshToken);
+        if (!data) {
+            const latestStoredRefresh = String(localStorage.getItem(REFRESH_TOKEN_STORAGE_KEY) || '').trim();
+            if (latestStoredRefresh && latestStoredRefresh !== refreshToken) {
+                sessionStorage.setItem(REFRESH_TOKEN_STORAGE_KEY, latestStoredRefresh);
+                refreshToken = latestStoredRefresh;
+                data = await requestAccessTokenRefreshWith(refreshToken);
+            }
+        }
+        if (!data?.token || !data?.refresh_token) {
             return null;
         }
         setSessionTokens(data.token, data.refresh_token);
@@ -511,6 +589,26 @@ function isApiUrlRequest(url) {
     } catch (_) {
         return false;
     }
+}
+
+function setupSessionTokenStorageSync() {
+    if (window.__sessionTokenStorageSyncInit) return;
+    window.__sessionTokenStorageSyncInit = true;
+    window.addEventListener('storage', (event) => {
+        if (event.key !== 'token' && event.key !== REFRESH_TOKEN_STORAGE_KEY) return;
+        const access = String(localStorage.getItem('token') || '').trim();
+        const refresh = String(localStorage.getItem(REFRESH_TOKEN_STORAGE_KEY) || '').trim();
+        if (access) {
+            sessionStorage.setItem('token', access);
+        } else {
+            sessionStorage.removeItem('token');
+        }
+        if (refresh) {
+            sessionStorage.setItem(REFRESH_TOKEN_STORAGE_KEY, refresh);
+        } else {
+            sessionStorage.removeItem(REFRESH_TOKEN_STORAGE_KEY);
+        }
+    });
 }
 
 function setupAuthFetchInterceptor() {
@@ -544,6 +642,29 @@ function setupAuthFetchInterceptor() {
     };
 }
 
+async function runSessionKeepAliveTick() {
+    const hasUserSession = Boolean(String(localStorage.getItem('id_user') || '').trim());
+    if (!hasUserSession) return;
+    const token = getSessionToken();
+    const refreshToken = getRefreshToken();
+    if (!token || !refreshToken) return;
+    await refreshAccessTokenIfNeeded();
+}
+
+function setupSessionKeepAlive() {
+    if (sessionKeepAliveInitialized) return;
+    sessionKeepAliveInitialized = true;
+    window.setInterval(() => {
+        runSessionKeepAliveTick().catch(() => {});
+    }, SESSION_KEEPALIVE_INTERVAL_MS);
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') {
+            runSessionKeepAliveTick().catch(() => {});
+        }
+    });
+}
+
+setupSessionTokenStorageSync();
 setupAuthFetchInterceptor();
 
 function buildTicketCounterStorageKey() {
@@ -658,6 +779,7 @@ function ensureLocalShiftSalesFlagInitialized() {
 function clearLocalShiftContext() {
     localStorage.removeItem('turno_monto_inicial');
     clearCartState();
+    clearPendingTicketsStateForCurrentShift();
     clearTicketCounterForCurrentShift();
     clearPendingTicketCounterSync();
     localStorage.removeItem('turno_id_actual');
@@ -754,6 +876,16 @@ function persistCartState() {
     }
 }
 
+function normalizeCartStateItems(items) {
+    return (Array.isArray(items) ? items : []).map((item) => ({
+        ...item,
+        quantity: Number(item.quantity || 0),
+        precio_venta: Number(item.precio_venta || 0),
+        line_subtotal: Number(item.line_subtotal || 0),
+        is_common: Boolean(item.is_common),
+    })).filter((item) => (item.id_producto || item.is_common) && item.quantity > 0);
+}
+
 function restoreCartState() {
     const key = buildCartStorageKey();
     if (!key) return;
@@ -762,12 +894,7 @@ function restoreCartState() {
         if (!raw) return;
         const parsed = JSON.parse(raw);
         if (!Array.isArray(parsed)) return;
-        cart = parsed.map((item) => ({
-            ...item,
-            quantity: Number(item.quantity || 0),
-            precio_venta: Number(item.precio_venta || 0),
-            is_common: Boolean(item.is_common),
-        })).filter((item) => (item.id_producto || item.is_common) && item.quantity > 0);
+        cart = normalizeCartStateItems(parsed);
     } catch (error) {
         console.error('No se pudo restaurar carrito:', error);
     }
@@ -777,6 +904,286 @@ function clearCartState() {
     const key = buildCartStorageKey();
     if (!key) return;
     localStorage.removeItem(key);
+}
+
+function buildPendingTicketsStorageKey() {
+    const caja = localStorage.getItem('n_caja') || localStorage.getItem('caja');
+    const cajero = localStorage.getItem('id_user');
+    const turnoId = localStorage.getItem('turno_id_actual') || 'sin_turno';
+    if (!caja || !cajero) return null;
+    return `pending_tickets_${caja}_${cajero}_${turnoId}`;
+}
+
+function readPendingTicketsState() {
+    const key = buildPendingTicketsStorageKey();
+    if (!key) return [];
+    try {
+        const raw = localStorage.getItem(key);
+        if (!raw) return [];
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) return [];
+        return parsed.map((row) => ({
+            id: String(row?.id || ''),
+            numero_ticket: Number(row?.numero_ticket || 0),
+            created_at: String(row?.created_at || ''),
+            cart: normalizeCartStateItems(row?.cart),
+        })).filter((row) => row.id && row.numero_ticket > 0 && Array.isArray(row.cart) && row.cart.length > 0);
+    } catch (_) {
+        return [];
+    }
+}
+
+function writePendingTicketsState(list) {
+    const key = buildPendingTicketsStorageKey();
+    if (!key) return;
+    const normalized = (Array.isArray(list) ? list : []).map((row) => ({
+        id: String(row?.id || ''),
+        numero_ticket: Number(row?.numero_ticket || 0),
+        created_at: String(row?.created_at || ''),
+        cart: normalizeCartStateItems(row?.cart),
+    })).filter((row) => row.id && row.numero_ticket > 0 && row.cart.length > 0);
+    localStorage.setItem(key, JSON.stringify(normalized));
+    renderPendingTicketsInlineStrip();
+}
+
+function clearPendingTicketsStateForCurrentShift() {
+    const key = buildPendingTicketsStorageKey();
+    if (!key) return;
+    localStorage.removeItem(key);
+    renderPendingTicketsInlineStrip();
+}
+
+function getDisplayedTicketNumber() {
+    const ticketEl = document.getElementById('nticket');
+    const parsed = Number(ticketEl?.textContent || 0);
+    if (Number.isFinite(parsed) && parsed > 0) return Math.floor(parsed);
+    return getStoredTicketCounter() || 1;
+}
+
+function setDisplayedTicketNumber(ticketNumber) {
+    const ticketEl = document.getElementById('nticket');
+    const parsed = Number(ticketNumber);
+    const normalized = Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 1;
+    if (ticketEl) ticketEl.textContent = String(normalized);
+    return normalized;
+}
+
+function calculateTicketTotalFromCartSnapshot(items) {
+    return (Array.isArray(items) ? items : []).reduce((sum, item) => {
+        return sum + getCartItemSubtotalAmount(item);
+    }, 0);
+}
+
+function formatPendingTicketDate(value) {
+    const dt = new Date(String(value || ''));
+    if (!Number.isFinite(dt.getTime())) return '-';
+    return dt.toLocaleString('es-CL');
+}
+
+function createPendingTicketId() {
+    return `pt_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
+}
+
+function getNextAvailableSalesTicketNumber(pendingTickets = []) {
+    const maxPending = (Array.isArray(pendingTickets) ? pendingTickets : []).reduce((acc, row) => {
+        const value = Number(row?.numero_ticket || 0);
+        if (!Number.isFinite(value) || value <= 0) return acc;
+        return Math.max(acc, Math.floor(value));
+    }, 0);
+    const currentTicket = getDisplayedTicketNumber();
+    const storedTicket = Number(getStoredTicketCounter() || 0);
+    return Math.max(1, currentTicket, storedTicket, maxPending) + 1;
+}
+
+function renderPendingTicketsInlineStrip() {
+    const strip = document.querySelector('#sales .sales-pending-inline-strip');
+    const track = document.getElementById('sales-pending-ticket-strip');
+    if (!track) return;
+
+    const pendingTickets = readPendingTicketsState();
+    const ordered = pendingTickets
+        .slice()
+        .sort((a, b) => Number(a.numero_ticket || 0) - Number(b.numero_ticket || 0));
+
+    track.innerHTML = '';
+    if (!ordered.length) {
+        if (strip) strip.classList.add('hidden');
+        return;
+    }
+    if (strip) strip.classList.remove('hidden');
+
+    ordered.forEach((row) => {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'sales-pending-tab';
+        btn.textContent = `Ticket N° ${Number(row.numero_ticket || 0)}`;
+        btn.title = `Ticket ${Number(row.numero_ticket || 0)} | ${formatPendingTicketDate(row.created_at)}`;
+        btn.addEventListener('click', () => {
+            resumePendingTicketById(row.id);
+        });
+        track.appendChild(btn);
+    });
+}
+
+function renderPendingTicketsPopupList() {
+    const body = document.getElementById('pending-tickets-body');
+    if (!body) return;
+    const pendingTickets = readPendingTicketsState();
+    renderPendingTicketsInlineStrip();
+    body.innerHTML = '';
+
+    if (!pendingTickets.length) {
+        const row = document.createElement('tr');
+        const cell = document.createElement('td');
+        cell.colSpan = 5;
+        cell.style.textAlign = 'center';
+        cell.textContent = 'No hay tickets pendientes.';
+        row.appendChild(cell);
+        body.appendChild(row);
+        return;
+    }
+
+    pendingTickets
+        .slice()
+        .sort((a, b) => Number(a.numero_ticket || 0) - Number(b.numero_ticket || 0))
+        .forEach((row) => {
+            const tr = document.createElement('tr');
+
+            const ticketCell = document.createElement('td');
+            ticketCell.textContent = String(Number(row.numero_ticket || 0));
+            tr.appendChild(ticketCell);
+
+            const productsCell = document.createElement('td');
+            productsCell.textContent = String(Array.isArray(row.cart) ? row.cart.length : 0);
+            tr.appendChild(productsCell);
+
+            const totalCell = document.createElement('td');
+            totalCell.textContent = `$${calculateTicketTotalFromCartSnapshot(row.cart).toFixed(0)}`;
+            tr.appendChild(totalCell);
+
+            const dateCell = document.createElement('td');
+            dateCell.textContent = formatPendingTicketDate(row.created_at);
+            tr.appendChild(dateCell);
+
+            const actionCell = document.createElement('td');
+            actionCell.style.textAlign = 'center';
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'btn btn2 quick-action-btn';
+            btn.textContent = 'Retomar';
+            btn.addEventListener('click', () => {
+                resumePendingTicketById(row.id);
+            });
+            actionCell.appendChild(btn);
+            tr.appendChild(actionCell);
+
+            body.appendChild(tr);
+        });
+}
+
+function openPendingTicketsPopup() {
+    renderPendingTicketsPopupList();
+    const popupId = 'pendingTicketsPopUp';
+    if (typeof mostrarPopUp === 'function') {
+        mostrarPopUp(popupId);
+    } else {
+        document.getElementById(popupId)?.classList.remove('hidden');
+    }
+}
+
+function closePendingTicketsPopup() {
+    const popupId = 'pendingTicketsPopUp';
+    if (typeof cerrarPopUp === 'function') {
+        cerrarPopUp(popupId);
+    } else {
+        document.getElementById(popupId)?.classList.add('hidden');
+    }
+    focusBarcodeInputForNextScan();
+}
+
+async function leaveCurrentTicketAsPending() {
+    if (!shiftStarted) {
+        await ensureShiftStartedOnLoad();
+        if (!shiftStarted) {
+            alert('Debes iniciar turno antes de dejar tickets pendientes.');
+            return;
+        }
+    }
+    if (!Array.isArray(cart) || cart.length === 0) {
+        alert('El carrito está vacío. Agrega productos antes de dejar un ticket pendiente.');
+        return;
+    }
+
+    const currentTicket = getDisplayedTicketNumber();
+    const pendingTickets = readPendingTicketsState();
+    const newPendingRow = {
+        id: createPendingTicketId(),
+        numero_ticket: currentTicket,
+        created_at: new Date().toISOString(),
+        cart: normalizeCartStateItems(cart),
+    };
+
+    const updatedPending = [newPendingRow, ...pendingTickets.filter((row) => Number(row.numero_ticket || 0) !== currentTicket)];
+    writePendingTicketsState(updatedPending);
+
+    const nextTicket = getNextAvailableSalesTicketNumber(updatedPending);
+    setDisplayedTicketNumber(nextTicket);
+    setStoredTicketCounter(nextTicket);
+    setPendingTicketCounterSync(nextTicket);
+
+    cart = [];
+    selectedCartIndex = -1;
+    clearPaymentWarning();
+    updateCartUI();
+    resetPaymentInputs();
+    focusBarcodeInputForNextScan();
+
+    if (typeof window.appAlert === 'function') {
+        await window.appAlert(`Ticket ${currentTicket} guardado como pendiente. Nuevo ticket activo: ${nextTicket}.`, 'success', {
+            title: 'Ticket pendiente',
+            okText: 'Entendido',
+        });
+    } else {
+        alert(`Ticket ${currentTicket} guardado como pendiente. Nuevo ticket activo: ${nextTicket}.`);
+    }
+}
+
+async function resumePendingTicketById(pendingId) {
+    const pendingTickets = readPendingTicketsState();
+    const index = pendingTickets.findIndex((row) => String(row.id) === String(pendingId || ''));
+    if (index < 0) {
+        alert('No se encontró el ticket pendiente seleccionado.');
+        renderPendingTicketsPopupList();
+        return;
+    }
+
+    const pending = pendingTickets[index];
+    let remaining = pendingTickets.filter((_, idx) => idx !== index);
+
+    const currentCartSnapshot = normalizeCartStateItems(cart);
+    if (currentCartSnapshot.length > 0) {
+        const currentTicket = getDisplayedTicketNumber();
+        const autoPendingRow = {
+            id: createPendingTicketId(),
+            numero_ticket: currentTicket,
+            created_at: new Date().toISOString(),
+            cart: currentCartSnapshot,
+        };
+        remaining = [
+            autoPendingRow,
+            ...remaining.filter((row) => Number(row.numero_ticket || 0) !== currentTicket),
+        ];
+    }
+    writePendingTicketsState(remaining);
+
+    cart = normalizeCartStateItems(pending.cart);
+    selectedCartIndex = -1;
+    setDisplayedTicketNumber(pending.numero_ticket);
+    clearPaymentWarning();
+    updateCartUI();
+    resetPaymentInputs();
+    closePendingTicketsPopup();
+    focusBarcodeInputForNextScan();
 }
 
 function parseStoredBoolean(key) {
@@ -857,6 +1264,23 @@ function setVisibilityByPermission(element, allowed, mode = 'disable') {
     element.style.pointerEvents = allowed ? '' : '';
 }
 
+function setSectionNavAccessState(element, allowed) {
+    if (!element) return;
+    // Debe quedar clickeable para permitir elevacion puntual con credenciales admin.
+    if ('disabled' in element) {
+        element.disabled = false;
+    }
+    element.style.display = '';
+    element.style.opacity = allowed ? '' : '0.65';
+    element.style.pointerEvents = '';
+    element.dataset.sectionLocked = allowed ? '0' : '1';
+    if (!allowed) {
+        element.title = 'Requiere autorización de administrador';
+    } else if (element.title === 'Requiere autorización de administrador') {
+        element.title = '';
+    }
+}
+
 function applyUserPermissionsToUI() {
     const permissions = readUserPermissions();
     if (!permissions) return;
@@ -875,21 +1299,21 @@ function applyUserPermissionsToUI() {
         permissions.productos_reporte_ventas ||
         permissions.productos_crear_promociones ||
         permissions.productos_modificar_varios;
-    setVisibilityByPermission(document.getElementById('nav-product-btn'), Boolean(hasAnyProductPermission), 'disable');
+    setSectionNavAccessState(document.getElementById('nav-product-btn'), Boolean(hasAnyProductPermission));
 
     const hasAnyInventoryPermission =
         permissions.inventario_agregar_mercancia ||
         permissions.inventario_reportes_existencia ||
         permissions.inventario_movimientos ||
         permissions.inventario_ajustar;
-    setVisibilityByPermission(document.getElementById('nav-inventory-btn'), Boolean(hasAnyInventoryPermission), 'disable');
+    setSectionNavAccessState(document.getElementById('nav-inventory-btn'), Boolean(hasAnyInventoryPermission));
 
     const hasAnyShoppingPermission = permissions.compras_crear_orden || permissions.compras_recibir_orden;
-    setVisibilityByPermission(document.getElementById('nav-shopping-btn'), Boolean(hasAnyShoppingPermission), 'disable');
+    setSectionNavAccessState(document.getElementById('nav-shopping-btn'), Boolean(hasAnyShoppingPermission));
 
-    setVisibilityByPermission(document.getElementById('nav-configuration-btn'), Boolean(permissions.configuracion_acceso), 'disable');
-    setVisibilityByPermission(document.getElementById('nav-reports-btn'), Boolean(permissions.reportes_ver), 'disable');
-    setVisibilityByPermission(document.getElementById('nav-cut-btn'), Boolean(permissions.corte_turno || permissions.corte_dia || permissions.corte_todos_turnos), 'disable');
+    setSectionNavAccessState(document.getElementById('nav-configuration-btn'), Boolean(permissions.configuracion_acceso));
+    setSectionNavAccessState(document.getElementById('nav-reports-btn'), Boolean(permissions.reportes_ver));
+    setSectionNavAccessState(document.getElementById('nav-cut-btn'), Boolean(permissions.corte_turno || permissions.corte_dia || permissions.corte_todos_turnos));
 }
 
 function applyShiftInitialAmountUI(amount) {
@@ -902,12 +1326,1604 @@ function applyShiftInitialAmountUI(amount) {
 
 function refreshCutCloseButtonState() {
     const closeBtn = document.getElementById('cut-close-shift-btn');
-    if (!closeBtn) return;
+    const printBtn = document.getElementById('cut-print-session-btn');
+    if (!closeBtn && !printBtn) return;
     const canCloseTurn = hasUserPermission('corte_turno');
-    const shouldShow = Boolean(cutCloseContext.sessionResumenLoaded);
-    closeBtn.classList.toggle('hidden', !shouldShow);
-    closeBtn.disabled = !canCloseTurn || !shouldShow;
+    const shouldShowClose = Boolean(cutCloseContext.sessionResumenLoaded);
+    const shouldShowPrint = shouldShowClose || Number(cutCloseContext.historicalCutId || 0) > 0;
+
+    if (closeBtn) {
+        closeBtn.classList.toggle('hidden', !shouldShowClose);
+        closeBtn.disabled = !canCloseTurn || !shouldShowClose;
+    }
+    if (printBtn) {
+        const isHistorical = Number(cutCloseContext.historicalCutId || 0) > 0 && !shouldShowClose;
+        printBtn.innerHTML = `<i class="fas fa-print" aria-hidden="true"></i> ${isHistorical ? 'Reimprimir corte' : 'Imprimir reporte'}`;
+        printBtn.classList.toggle('hidden', !shouldShowPrint);
+        printBtn.disabled = !canCloseTurn || !shouldShowPrint;
+    }
 }
+
+function getCurrentCutCashierLabel() {
+    const profileRaw = localStorage.getItem('user_profile');
+    let profile = {};
+    try {
+        profile = profileRaw ? JSON.parse(profileRaw) : {};
+    } catch (_) {
+        profile = {};
+    }
+    const cajeroId = String(localStorage.getItem('id_user') || '').trim();
+    const name = String(profile?.nombre || profile?.username_login || '').trim();
+    if (name) return name;
+    if (cajeroId) return `Cajero ${cajeroId}`;
+    return 'Cajero';
+}
+
+function formatCutDateForHeader(dateValue) {
+    const raw = String(dateValue || '').trim().slice(0, 10);
+    const matched = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!matched) return '--/--/----';
+    const months = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic'];
+    const year = matched[1];
+    const monthIndex = Number(matched[2]) - 1;
+    const day = matched[3];
+    const monthLabel = months[monthIndex] || matched[2];
+    return `${day}/${monthLabel}/${year}`;
+}
+
+function formatCutTimeForHeader(timeValue) {
+    const raw = String(timeValue || '').trim();
+    if (!raw) return '--:--';
+    const match = raw.match(/(\d{2}):(\d{2})/);
+    if (!match) return '--:--';
+    const hour24 = Number(match[1]);
+    const minute = match[2];
+    if (!Number.isFinite(hour24)) return '--:--';
+    const suffix = hour24 >= 12 ? 'pm' : 'am';
+    const hour12 = ((hour24 + 11) % 12) + 1;
+    return `${hour12}:${minute} ${suffix}`;
+}
+
+function buildCutHistoryTimeRange(startValue, endValue) {
+    const start = formatCutTimeForHeader(startValue);
+    const end = formatCutTimeForHeader(endValue);
+    if (start !== '--:--' || end !== '--:--') {
+        return `${start} - ${end}`;
+    }
+    return '--:-- - --:--';
+}
+
+function updateCutHeadline(context = {}) {
+    const cashierBtn = document.getElementById('cut-header-cashier-btn');
+    const dateBtn = document.getElementById('cut-header-date-btn');
+    const timeEl = document.getElementById('cut-header-time');
+    if (!cashierBtn || !dateBtn || !timeEl) return;
+
+    const cashierName = String(context.cashierName || getCurrentCutCashierLabel()).trim() || 'Cajero';
+    const dateIso = String(context.dateIso || cutCloseContext.currentDate || new Date().toISOString().slice(0, 10)).trim();
+    const startTime = String(context.startTime || '').trim();
+    const endTime = String(context.endTime || '').trim();
+    const statusText = String(context.statusText || '').trim();
+
+    cashierBtn.textContent = cashierName;
+    dateBtn.textContent = formatCutDateForHeader(dateIso);
+
+    let timeText = `De ${formatCutTimeForHeader(startTime)} a ${formatCutTimeForHeader(endTime)}`;
+    if (statusText) {
+        timeText += ` | ${statusText}`;
+    }
+    timeEl.textContent = timeText;
+}
+
+function updateCutSessionContext(context = {}) {
+    const contextEl = document.getElementById('cut-session-context');
+    if (!contextEl) return;
+
+    const shouldShow = Boolean(context.visible);
+    if (!shouldShow) {
+        contextEl.classList.add('hidden');
+        return;
+    }
+
+    contextEl.classList.remove('hidden');
+}
+
+function canViewAllCutHistory() {
+    return hasUserPermission('corte_todos_turnos');
+}
+
+function getCutHistoryDateFilterValue() {
+    const input = document.getElementById('cut-history-date-filter');
+    const value = String(input?.value || '').trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+    return cutCloseContext.currentDate || new Date().toISOString().slice(0, 10);
+}
+
+async function fetchCutHistoryRowsForPopup(dateIso, requestedCashierId = '') {
+    const caja = String(localStorage.getItem('n_caja') || localStorage.getItem('caja') || '').trim();
+    const currentCashierId = String(localStorage.getItem('id_user') || '').trim();
+    if (!caja) return [];
+
+    const query = new URLSearchParams({ desde: dateIso, hasta: dateIso, caja });
+    const useAll = canViewAllCutHistory();
+    const cashierId = useAll ? String(requestedCashierId || '').trim() : currentCashierId;
+    if (cashierId) query.set('cajero', cashierId);
+
+    const response = await fetch(API_URL + `api/corte/historial?${query.toString()}`, {
+        headers: withAuthHeaders(),
+    });
+    const data = await response.json().catch(() => []);
+    if (!response.ok || !Array.isArray(data)) {
+        throw new Error(data?.message || 'No se pudo cargar historial de cortes');
+    }
+    return data;
+}
+
+async function loadCutHistoryCashierFilterOptions(dateIso) {
+    const cashierFilter = document.getElementById('cut-history-cashier-filter');
+    if (!cashierFilter) return;
+    const wrapper = cashierFilter.closest('.form-row');
+    const allowAll = canViewAllCutHistory();
+
+    if (!allowAll) {
+        if (wrapper) wrapper.style.display = 'none';
+        cashierFilter.innerHTML = '<option value="">Mi turno</option>';
+        return;
+    }
+
+    if (wrapper) wrapper.style.display = '';
+    const rows = await fetchCutHistoryRowsForPopup(dateIso, '');
+    const map = new Map();
+    rows.forEach((row) => {
+        const id = String(row?.usuario_id || '').trim();
+        if (!id) return;
+        if (!map.has(id)) {
+            const name = String(row?.cajero_nombre || '').trim() || `Usuario ${id}`;
+            map.set(id, name);
+        }
+    });
+
+    const previous = String(cashierFilter.value || '').trim();
+    cashierFilter.innerHTML = '<option value="">Todos</option>';
+    Array.from(map.entries())
+        .sort((a, b) => String(a[1]).localeCompare(String(b[1]), 'es'))
+        .forEach(([id, name]) => {
+            const option = document.createElement('option');
+            option.value = id;
+            option.textContent = `${name} (${id})`;
+            cashierFilter.appendChild(option);
+        });
+    if (previous && map.has(previous)) {
+        cashierFilter.value = previous;
+    }
+}
+
+function writeCutListValues(listId, values, emptyText) {
+    const list = document.getElementById(listId);
+    if (!list) return;
+    list.innerHTML = '';
+    const rows = Array.isArray(values) ? values : [];
+    if (!rows.length) {
+        const li = document.createElement('li');
+        li.textContent = emptyText;
+        list.appendChild(li);
+        return;
+    }
+    rows.forEach((value) => {
+        const li = document.createElement('li');
+        li.textContent = value;
+        list.appendChild(li);
+    });
+}
+
+function applyHistoricalCutToView(row) {
+    const selected = row || {};
+    const totalVentas = Number(selected.total_ventas || 0);
+    const transacciones = Number(selected.transacciones || 0);
+    const montoInicial = Number(selected.monto_inicial || 0);
+    const montoDeclarado = Number(selected.monto_declarado || 0);
+    const diferencia = Number(selected.diferencia_efectivo || 0);
+    const totalEfectivo = Number(selected.total_efectivo || 0);
+    const totalTarjeta = Number(selected.total_tarjeta || 0);
+    const totalMixto = Number(selected.total_mixto || 0);
+    const estado = String(selected.estado || 'cerrado').trim() || 'cerrado';
+    const dateIso = String(selected.fecha || cutCloseContext.currentDate || new Date().toISOString().slice(0, 10)).trim();
+    const cutId = Number(selected.id_corte || 0);
+
+    updateCutHeadline({
+        cashierName: String(selected.cajero_nombre || getCurrentCutCashierLabel()).trim(),
+        dateIso,
+        startTime: selected.hora_apertura || '',
+        endTime: selected.hora_cierre || '',
+        statusText: estado === 'cerrado' ? 'Turno cerrado' : 'Turno abierto',
+    });
+    updateCutSessionContext({ visible: false });
+
+    const cutSummary = document.getElementById('cut-summary');
+    const cutBreakdown = document.getElementById('cut-breakdown');
+    const salesKpi = document.getElementById('cut-kpi-sales-total');
+    const profitKpi = document.getElementById('cut-kpi-profit-total');
+    const departmentTotal = document.getElementById('cut-department-total');
+    if (cutSummary) {
+        cutSummary.textContent = `Corte historico #${cutId || '-'} | ${transacciones.toFixed(0)} ventas | Total $${totalVentas.toFixed(0)}`;
+    }
+    if (cutBreakdown) {
+        cutBreakdown.innerHTML = '';
+    }
+    if (salesKpi) {
+        salesKpi.textContent = `$${totalVentas.toFixed(0)}`;
+    }
+    if (profitKpi) {
+        profitKpi.textContent = '$0';
+    }
+
+    writeCutListValues(
+        'cut-cash-detail-list',
+        [
+            `Fondo de caja: $${montoInicial.toFixed(0)}`,
+            `Ventas en efectivo: $${totalEfectivo.toFixed(0)}`,
+            `Ventas mixtas: $${totalMixto.toFixed(0)}`,
+            `Monto declarado: $${montoDeclarado.toFixed(0)}`,
+            `Diferencia: ${diferencia >= 0 ? '+' : ''}$${diferencia.toFixed(0)}`,
+        ],
+        'Sin datos de caja para este corte.'
+    );
+
+    const cashTotal = document.getElementById('cut-cash-total');
+    if (cashTotal) {
+        cashTotal.textContent = `Total en corte: $${totalVentas.toFixed(0)}`;
+    }
+
+    writeCutListValues(
+        'cut-profit-detail-list',
+        [
+            `En efectivo: $${totalEfectivo.toFixed(0)}`,
+            `Con tarjeta credito/debito: $${totalTarjeta.toFixed(0)}`,
+            `Ventas mixtas: $${totalMixto.toFixed(0)}`,
+            `Devoluciones: -$0`,
+        ],
+        'Sin datos de ventas para este corte.'
+    );
+    const profitTotal = document.getElementById('cut-profit-total');
+    if (profitTotal) {
+        profitTotal.textContent = `Total ventas: $${totalVentas.toFixed(0)}`;
+    }
+
+    writeCutListValues('cut-session-income-list', [], 'Detalle de ingresos no disponible en corte historico.');
+    writeCutListValues('cut-session-expense-list', [], 'Detalle de salidas no disponible en corte historico.');
+    writeCutListValues('cut-mixed-summary-list', [], 'Desglose mixto no disponible en corte historico.');
+    const mixedSummaryTotal = document.getElementById('cut-mixed-summary-total');
+    if (mixedSummaryTotal) {
+        mixedSummaryTotal.textContent = '';
+    }
+    writeCutListValues('cut-department-list', [], 'Desglose por departamento no disponible en corte historico.');
+    if (departmentTotal) {
+        departmentTotal.textContent = '';
+    }
+    writeCutListValues('cut-mixed-ticket-list', [], 'Detalle mixto por ticket no disponible en corte historico.');
+    const mixedTicketTotal = document.getElementById('cut-mixed-ticket-total');
+    if (mixedTicketTotal) {
+        mixedTicketTotal.textContent = '';
+    }
+    writeCutListValues('cut-top-products-by-department', [], 'Top de productos no disponible en corte historico.');
+
+    const scopeInfo = document.getElementById('cut-close-scope-info');
+    const breakdownList = document.getElementById('cut-close-breakdown');
+    const detailBody = document.getElementById('cut-close-detail-body');
+    if (scopeInfo) {
+        scopeInfo.textContent = `Mostrando corte historico #${cutId || '-'} del ${formatCutDateForHeader(dateIso)}.`;
+    }
+    if (breakdownList) {
+        breakdownList.innerHTML = '';
+        const li = document.createElement('li');
+        li.textContent = `Cajero: ${String(selected.cajero_nombre || '').trim() || '-'} | Caja: ${selected.caja_id || '-'}`;
+        breakdownList.appendChild(li);
+    }
+    if (detailBody) {
+        detailBody.innerHTML = '';
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+            <td>${dateIso}</td>
+            <td>${cutId ? `Corte #${cutId}` : 'Corte'}</td>
+            <td>${estado}</td>
+            <td style="text-align:right;">${totalVentas.toFixed(0)}</td>
+        `;
+        detailBody.appendChild(tr);
+    }
+
+    cutCloseContext.scope = null;
+    cutCloseContext.resumenLoaded = false;
+    cutCloseContext.sessionResumenLoaded = false;
+    cutCloseContext.esperadoEfectivo = 0;
+    cutCloseContext.esperadoTarjeta = 0;
+    cutCloseContext.currentDate = dateIso;
+    cutCloseContext.sessionReportSnapshot = null;
+    cutCloseContext.historicalCutId = cutId > 0 ? cutId : null;
+    refreshCutCloseButtonState();
+}
+
+function renderCutHistoryPopupRows(rows) {
+    const body = document.getElementById('cut-history-body');
+    if (!body) return;
+    body.innerHTML = '';
+
+    const list = Array.isArray(rows) ? rows : [];
+    if (!list.length) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = '<td colspan="7" style="text-align:center;">No hay cortes para los filtros seleccionados.</td>';
+        body.appendChild(tr);
+        return;
+    }
+
+    list.forEach((row, index) => {
+        const tr = document.createElement('tr');
+        const actionId = `cut-history-open-${index}`;
+        tr.innerHTML = `
+            <td>${row.caja_id || '-'}</td>
+            <td>${row.cajero_nombre || '-'}</td>
+            <td>${formatCutDateForHeader(row.fecha || '')}</td>
+            <td>${buildCutHistoryTimeRange(row.hora_apertura, row.hora_cierre)}</td>
+            <td style="text-align:right;">$${Number(row.total_ventas || 0).toFixed(0)}</td>
+            <td>${row.estado || '-'}</td>
+            <td style="text-align:center;"><button id="${actionId}" type="button" class="btn cut-btn-ghost">Ver</button></td>
+        `;
+        body.appendChild(tr);
+        const btn = document.getElementById(actionId);
+        if (btn) {
+            btn.addEventListener('click', () => {
+                applyHistoricalCutToView(cutHistoryContext.rows[index] || row);
+                closeCutHistoryPopup();
+            });
+        }
+    });
+}
+
+async function reloadCutHistoryPopupData() {
+    const msg = document.getElementById('cut-history-msg');
+    const cashierFilter = document.getElementById('cut-history-cashier-filter');
+    const dateIso = getCutHistoryDateFilterValue();
+    const cashierId = String(cashierFilter?.value || '').trim();
+
+    if (msg) msg.textContent = 'Cargando cortes...';
+    try {
+        const rows = await fetchCutHistoryRowsForPopup(dateIso, cashierId);
+        cutHistoryContext.rows = rows;
+        renderCutHistoryPopupRows(rows);
+        if (msg) {
+            msg.textContent = rows.length
+                ? `Se encontraron ${rows.length} corte(s) para ${formatCutDateForHeader(dateIso)}.`
+                : `Sin resultados para ${formatCutDateForHeader(dateIso)}.`;
+        }
+    } catch (error) {
+        cutHistoryContext.rows = [];
+        renderCutHistoryPopupRows([]);
+        if (msg) msg.textContent = error.message || 'No se pudo cargar historial de cortes.';
+    }
+}
+
+function closeCutHistoryPopup() {
+    const overlay = document.getElementById('cut-history-popup');
+    if (!overlay) return;
+    overlay.classList.add('hidden');
+    overlay.style.display = '';
+}
+
+function ensureCutHistoryPopupBindings() {
+    if (window.__cutHistoryPopupInit) return;
+    window.__cutHistoryPopupInit = true;
+
+    const dateFilter = document.getElementById('cut-history-date-filter');
+    const cashierFilter = document.getElementById('cut-history-cashier-filter');
+    if (dateFilter) {
+        dateFilter.addEventListener('change', async () => {
+            const dateIso = getCutHistoryDateFilterValue();
+            await loadCutHistoryCashierFilterOptions(dateIso);
+            await reloadCutHistoryPopupData();
+        });
+    }
+    if (cashierFilter) {
+        cashierFilter.addEventListener('change', async () => {
+            await reloadCutHistoryPopupData();
+        });
+    }
+    document.addEventListener('keydown', (event) => {
+        if (event.key !== 'Escape') return;
+        const overlay = document.getElementById('cut-history-popup');
+        if (!overlay || overlay.classList.contains('hidden')) return;
+        closeCutHistoryPopup();
+    });
+}
+
+async function openCutHistoryPopup(mode = 'cashier') {
+    const overlay = document.getElementById('cut-history-popup');
+    const dateFilter = document.getElementById('cut-history-date-filter');
+    const msg = document.getElementById('cut-history-msg');
+    if (!overlay || !dateFilter) return;
+
+    cutHistoryContext.mode = String(mode || 'cashier');
+    ensureCutHistoryPopupBindings();
+
+    const defaultDate = cutCloseContext.currentDate || new Date().toISOString().slice(0, 10);
+    dateFilter.value = defaultDate;
+
+    overlay.classList.remove('hidden');
+    overlay.style.display = 'flex';
+    if (msg) msg.textContent = 'Cargando cortes...';
+
+    try {
+        await loadCutHistoryCashierFilterOptions(defaultDate);
+        await reloadCutHistoryPopupData();
+    } catch (error) {
+        cutHistoryContext.rows = [];
+        renderCutHistoryPopupRows([]);
+        if (msg) msg.textContent = error.message || 'No se pudo cargar historial de cortes.';
+    }
+}
+
+function getCutRebuildFiltersFromUI() {
+    const today = new Date().toISOString().slice(0, 10);
+    const fromDateInput = document.getElementById('cut-rebuild-from-date');
+    const toDateInput = document.getElementById('cut-rebuild-to-date');
+    const fromTimeInput = document.getElementById('cut-rebuild-from-time');
+    const toTimeInput = document.getElementById('cut-rebuild-to-time');
+    const boxFilter = document.getElementById('cut-rebuild-box-filter');
+    const cashierFilter = document.getElementById('cut-rebuild-cashier-filter');
+    const turnFilter = document.getElementById('cut-rebuild-turn-filter');
+
+    const fromDate = String(fromDateInput?.value || cutCloseContext.currentDate || today).trim();
+    const toDate = String(toDateInput?.value || fromDate || today).trim();
+    const fromTime = String(fromTimeInput?.value || '00:00').trim() || '00:00';
+    const toTime = String(toTimeInput?.value || '23:59').trim() || '23:59';
+    const caja = String(boxFilter?.value || '').trim();
+    const cajero = String(cashierFilter?.value || '').trim();
+    const turno = String(turnFilter?.value || '').trim();
+
+    return {
+        desde: fromDate,
+        hasta: toDate,
+        hora_desde: fromTime,
+        hora_hasta: toTime,
+        caja,
+        cajero,
+        turno,
+    };
+}
+
+function getCutRebuildSelectedSaleIds() {
+    return Array.from(cutRebuildContext.selectedSaleIds)
+        .map((value) => Number(value || 0))
+        .filter((value) => Number.isFinite(value) && value > 0);
+}
+
+function getCutRebuildSelectedCutIds() {
+    return Array.from(cutRebuildContext.selectedCutIds)
+        .map((value) => Number(value || 0))
+        .filter((value) => Number.isFinite(value) && value > 0);
+}
+
+function invalidateCutRebuildPersistState() {
+    cutRebuildContext.persistedCutId = null;
+    cutRebuildContext.persistedSignature = '';
+}
+
+function buildCutRebuildPersistSignature() {
+    const saleIds = getCutRebuildSelectedSaleIds().sort((a, b) => a - b);
+    const cutIds = getCutRebuildSelectedCutIds().sort((a, b) => a - b);
+    const keeperCutId = Number(cutRebuildContext.keeperCutId || 0) || 0;
+    return `${saleIds.join(',')}|${cutIds.join(',')}|${keeperCutId}`;
+}
+
+function setCutRebuildMessage(message, warning = false) {
+    const msg = document.getElementById('cut-rebuild-msg');
+    if (!msg) return;
+    msg.textContent = String(message || '');
+    msg.classList.toggle('cut-rebuild-warning', Boolean(warning));
+}
+
+function setCutRebuildCutsMessage(message, warning = false) {
+    const msg = document.getElementById('cut-rebuild-cuts-msg');
+    if (!msg) return;
+    msg.textContent = String(message || '');
+    msg.classList.toggle('cut-rebuild-warning', Boolean(warning));
+}
+
+function formatCutRebuildSaleDateTime(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return '-';
+    const parsed = new Date(raw.replace(' ', 'T'));
+    if (!Number.isNaN(parsed.getTime())) {
+        const day = String(parsed.getDate()).padStart(2, '0');
+        const month = String(parsed.getMonth() + 1).padStart(2, '0');
+        const year = parsed.getFullYear();
+        const hour = String(parsed.getHours()).padStart(2, '0');
+        const minute = String(parsed.getMinutes()).padStart(2, '0');
+        return `${day}/${month}/${year} ${hour}:${minute}`;
+    }
+    const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})/);
+    if (match) {
+        return `${match[3]}/${match[2]}/${match[1]} ${match[4]}:${match[5]}`;
+    }
+    return raw;
+}
+
+function announceCutRebuildSelectionStatus() {
+    const salesCount = cutRebuildContext.selectedSaleIds.size;
+    const cutsCount = cutRebuildContext.selectedCutIds.size;
+    const hasPersistedCut = Number(cutRebuildContext.persistedCutId || 0) > 0;
+    if (!salesCount) {
+        setCutRebuildMessage('Selecciona una o mas ventas para continuar.', false);
+        return;
+    }
+    if (!hasPersistedCut) {
+        setCutRebuildMessage(
+            `Ventas seleccionadas: ${salesCount}. Pulsa "Generar corte" y completa la configuracion final.`,
+            false
+        );
+        return;
+    }
+    if (!cutsCount) {
+        setCutRebuildMessage(
+            `Ventas seleccionadas: ${salesCount}. Corte final #${cutRebuildContext.persistedCutId} listo para imprimir.`,
+            false
+        );
+        return;
+    }
+    setCutRebuildMessage(
+        `Ventas seleccionadas: ${salesCount} | Cortes elegidos: ${cutsCount} | Conservar: #${cutRebuildContext.keeperCutId || '-'}.`,
+        false
+    );
+}
+
+function updateCutRebuildActionButtons() {
+    const mergeBtn = document.getElementById('cut-rebuild-merge-btn');
+    const printBtn = document.getElementById('cut-rebuild-print-btn');
+    const cutsGenerateBtn = document.getElementById('cut-rebuild-cuts-generate-btn');
+    const cutsGeneratePrintBtn = document.getElementById('cut-rebuild-cuts-generate-print-btn');
+    const cutsPreviewPrintBtn = document.getElementById('cut-rebuild-cuts-preview-print-btn');
+    const selectedCount = cutRebuildContext.selectedSaleIds.size;
+    const hasPersistedCut = Number(cutRebuildContext.persistedCutId || 0) > 0;
+    if (mergeBtn) {
+        mergeBtn.disabled = selectedCount < 1;
+    }
+    if (printBtn) {
+        printBtn.disabled = selectedCount < 1 || !hasPersistedCut;
+    }
+    if (cutsGenerateBtn) {
+        cutsGenerateBtn.disabled = selectedCount < 1;
+    }
+    if (cutsGeneratePrintBtn) {
+        cutsGeneratePrintBtn.disabled = selectedCount < 1;
+    }
+    if (cutsPreviewPrintBtn) {
+        cutsPreviewPrintBtn.disabled = selectedCount < 1;
+    }
+}
+
+function renderCutRebuildRows(rows = []) {
+    const body = document.getElementById('cut-rebuild-body');
+    const selectAll = document.getElementById('cut-rebuild-sale-select-all');
+    if (!body) return;
+    body.innerHTML = '';
+
+    const list = Array.isArray(rows) ? rows : [];
+    const validSaleIds = new Set(
+        list
+            .map((row) => Number(row?.id_venta || 0))
+            .filter((id) => Number.isFinite(id) && id > 0)
+    );
+    cutRebuildContext.selectedSaleIds = new Set(
+        Array.from(cutRebuildContext.selectedSaleIds).filter((id) => validSaleIds.has(Number(id || 0)))
+    );
+    if (!list.length) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = '<td colspan="9" style="text-align:center;">No hay ventas para los filtros seleccionados.</td>';
+        body.appendChild(tr);
+        if (selectAll) {
+            selectAll.checked = false;
+            selectAll.indeterminate = false;
+            selectAll.disabled = true;
+        }
+        updateCutRebuildActionButtons();
+        return;
+    }
+
+    list.forEach((row) => {
+        const saleId = Number(row?.id_venta || 0);
+        const checked = cutRebuildContext.selectedSaleIds.has(saleId);
+        const hasAssociatedCut = Boolean(row?.tiene_corte_asociado || Number(row?.turno_id || 0) > 0);
+        const associatedCutId = Number(row?.turno_id || 0) || null;
+        const associatedCutLabel = hasAssociatedCut
+            ? `Con corte${associatedCutId ? ` #${associatedCutId}` : ''}`
+            : 'Sin corte asociado';
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+            <td style="text-align:center;">
+                <input type="checkbox" data-cut-rebuild-sale-select="${saleId}" ${checked ? 'checked' : ''}>
+            </td>
+            <td>${formatCutRebuildSaleDateTime(row?.fecha)}</td>
+            <td>${row?.numero_ticket || '-'}</td>
+            <td>${row?.caja_id || '-'}</td>
+            <td>${row?.cajero_nombre || '-'}</td>
+            <td style="text-align:right;">#${Number(row?.turno_id || 0) || '-'}</td>
+            <td style="text-align:center;">
+                <input class="cut-rebuild-linked-check" type="checkbox" disabled ${hasAssociatedCut ? 'checked' : ''} title="${associatedCutLabel}">
+            </td>
+            <td>${row?.metodo_pago || '-'}</td>
+            <td style="text-align:right;">$${formatMoney(row?.total || 0)}</td>
+        `;
+        body.appendChild(tr);
+    });
+
+    body.querySelectorAll('input[data-cut-rebuild-sale-select]').forEach((input) => {
+        input.addEventListener('change', (event) => {
+            const saleId = Number(event.target?.getAttribute('data-cut-rebuild-sale-select') || 0);
+            if (!saleId) return;
+            if (event.target.checked) {
+                cutRebuildContext.selectedSaleIds.add(saleId);
+            } else {
+                cutRebuildContext.selectedSaleIds.delete(saleId);
+            }
+            invalidateCutRebuildPersistState();
+            renderCutRebuildRows(cutRebuildContext.sales);
+            announceCutRebuildSelectionStatus();
+        });
+    });
+
+    if (selectAll) {
+        const selectedCount = list.filter((row) => cutRebuildContext.selectedSaleIds.has(Number(row?.id_venta || 0))).length;
+        selectAll.disabled = list.length < 1;
+        selectAll.checked = list.length > 0 && selectedCount === list.length;
+        selectAll.indeterminate = selectedCount > 0 && selectedCount < list.length;
+        selectAll.onchange = (event) => {
+            if (event.target.checked) {
+                list.forEach((row) => {
+                    const saleId = Number(row?.id_venta || 0);
+                    if (saleId > 0) {
+                        cutRebuildContext.selectedSaleIds.add(saleId);
+                    }
+                });
+            } else {
+                list.forEach((row) => {
+                    const saleId = Number(row?.id_venta || 0);
+                    if (saleId > 0) {
+                        cutRebuildContext.selectedSaleIds.delete(saleId);
+                    }
+                });
+            }
+            invalidateCutRebuildPersistState();
+            renderCutRebuildRows(cutRebuildContext.sales);
+            announceCutRebuildSelectionStatus();
+        };
+    }
+
+    updateCutRebuildActionButtons();
+}
+
+function selectAllCutRebuildSales() {
+    const list = Array.isArray(cutRebuildContext.sales) ? cutRebuildContext.sales : [];
+    if (!list.length) {
+        setCutRebuildMessage('No hay ventas disponibles para seleccionar.', false);
+        return;
+    }
+    list.forEach((row) => {
+        const saleId = Number(row?.id_venta || 0);
+        if (saleId > 0) {
+            cutRebuildContext.selectedSaleIds.add(saleId);
+        }
+    });
+    invalidateCutRebuildPersistState();
+    renderCutRebuildRows(cutRebuildContext.sales);
+    announceCutRebuildSelectionStatus();
+}
+
+function clearCutRebuildSalesSelection() {
+    if (!cutRebuildContext.selectedSaleIds.size) {
+        setCutRebuildMessage('No hay ventas seleccionadas para limpiar.', false);
+        return;
+    }
+    cutRebuildContext.selectedSaleIds = new Set();
+    invalidateCutRebuildPersistState();
+    renderCutRebuildRows(cutRebuildContext.sales);
+    announceCutRebuildSelectionStatus();
+}
+
+function renderCutRebuildCutPickerRows(rows = []) {
+    const body = document.getElementById('cut-rebuild-cuts-body');
+    if (!body) return;
+    body.innerHTML = '';
+
+    const list = Array.isArray(rows) ? rows : [];
+    if (!list.length) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = '<td colspan="10" style="text-align:center;">No hay cortes previos para este cajero/caja en el periodo. Si continuas se creara un corte nuevo.</td>';
+        body.appendChild(tr);
+        return;
+    }
+
+    list.forEach((row) => {
+        const cutId = Number(row?.id_corte || 0);
+        const checked = cutRebuildContext.selectedCutIds.has(cutId);
+        const keeper = checked && Number(cutRebuildContext.keeperCutId || 0) === cutId;
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+            <td style="text-align:center;">
+                <input type="checkbox" data-cut-rebuild-select="${cutId}" ${checked ? 'checked' : ''}>
+            </td>
+            <td style="text-align:center;">
+                <input type="radio" name="cut-rebuild-keeper" data-cut-rebuild-keeper="${cutId}" ${keeper ? 'checked' : ''} ${checked ? '' : 'disabled'}>
+            </td>
+            <td style="text-align:right;">#${cutId || '-'}</td>
+            <td>${formatCutDateForHeader(row?.fecha || '')}</td>
+            <td>${buildCutHistoryTimeRange(row?.hora_apertura, row?.hora_cierre)}</td>
+            <td>${row?.caja_id || '-'}</td>
+            <td>${row?.cajero_nombre || '-'}</td>
+            <td>${row?.estado || '-'}</td>
+            <td style="text-align:right;">${Number(row?.transacciones || 0)}</td>
+            <td style="text-align:right;">$${formatMoney(row?.total_ventas || 0)}</td>
+        `;
+        body.appendChild(tr);
+    });
+
+    body.querySelectorAll('input[data-cut-rebuild-select]').forEach((input) => {
+        input.addEventListener('change', (event) => {
+            const cutId = Number(event.target?.getAttribute('data-cut-rebuild-select') || 0);
+            if (!cutId) return;
+            if (event.target.checked) {
+                cutRebuildContext.selectedCutIds.add(cutId);
+                if (!cutRebuildContext.keeperCutId || !cutRebuildContext.selectedCutIds.has(Number(cutRebuildContext.keeperCutId))) {
+                    cutRebuildContext.keeperCutId = cutId;
+                }
+            } else {
+                cutRebuildContext.selectedCutIds.delete(cutId);
+                if (Number(cutRebuildContext.keeperCutId || 0) === cutId) {
+                    cutRebuildContext.keeperCutId = cutRebuildContext.selectedCutIds.size
+                        ? Number(Array.from(cutRebuildContext.selectedCutIds)[0] || 0)
+                        : null;
+                }
+            }
+            invalidateCutRebuildPersistState();
+            renderCutRebuildCutPickerRows(rows);
+            const selectedCount = cutRebuildContext.selectedCutIds.size;
+            if (!selectedCount) {
+                setCutRebuildCutsMessage('No seleccionaste cortes previos. Se creara un corte nuevo al aplicar.', false);
+            } else {
+                setCutRebuildCutsMessage(`Cortes seleccionados: ${selectedCount}. Conservando #${cutRebuildContext.keeperCutId || '-'}.`, false);
+            }
+        });
+    });
+
+    body.querySelectorAll('input[data-cut-rebuild-keeper]').forEach((input) => {
+        input.addEventListener('change', (event) => {
+            const cutId = Number(event.target?.getAttribute('data-cut-rebuild-keeper') || 0);
+            if (!cutId || !cutRebuildContext.selectedCutIds.has(cutId)) return;
+            cutRebuildContext.keeperCutId = cutId;
+            invalidateCutRebuildPersistState();
+            renderCutRebuildCutPickerRows(rows);
+            setCutRebuildCutsMessage(`Conservaras el corte #${cutId}.`, false);
+        });
+    });
+}
+
+function getCutRebuildCandidateCutsForContext(context) {
+    const selectedDateSet = new Set(
+        (Array.isArray(context?.dateSet) ? context.dateSet : [])
+            .map((value) => String(value || '').trim())
+            .filter((value) => /^\d{4}-\d{2}-\d{2}$/.test(value))
+    );
+    return (Array.isArray(cutRebuildContext.cuts) ? cutRebuildContext.cuts : [])
+        .filter((row) => (
+            Number(row?.usuario_id || 0) === Number(context?.userId || 0)
+            && Number(row?.caja_id || 0) === Number(context?.boxId || 0)
+            && (
+                selectedDateSet.size < 1
+                || selectedDateSet.has(String(row?.fecha || '').trim().slice(0, 10))
+            )
+        ));
+}
+
+function syncCutRebuildSelectedCutsForCandidateCuts(candidateCuts = []) {
+    const validCutIds = new Set(
+        candidateCuts.map((row) => Number(row?.id_corte || 0)).filter((id) => id > 0)
+    );
+    cutRebuildContext.selectedCutIds = new Set(
+        Array.from(cutRebuildContext.selectedCutIds).filter((id) => validCutIds.has(Number(id || 0)))
+    );
+    if (!cutRebuildContext.selectedCutIds.has(Number(cutRebuildContext.keeperCutId || 0))) {
+        cutRebuildContext.keeperCutId = cutRebuildContext.selectedCutIds.size
+            ? Number(Array.from(cutRebuildContext.selectedCutIds)[0] || 0)
+            : null;
+    }
+}
+
+function renderCutRebuildCutsPopupForContext(context) {
+    const candidateCuts = getCutRebuildCandidateCutsForContext(context);
+    syncCutRebuildSelectedCutsForCandidateCuts(candidateCuts);
+    renderCutRebuildCutPickerRows(candidateCuts);
+    if (!candidateCuts.length) {
+        setCutRebuildCutsMessage('No hay cortes previos en la seleccion. Si aplicas, se creara un corte nuevo.', false);
+    } else if (!cutRebuildContext.selectedCutIds.size) {
+        setCutRebuildCutsMessage(
+            `Cortes disponibles: ${candidateCuts.length}. Selecciona los que quieras unificar o deja vacio para crear uno nuevo.`,
+            false
+        );
+    } else {
+        setCutRebuildCutsMessage(
+            `Cortes seleccionados: ${cutRebuildContext.selectedCutIds.size}. Conservando #${cutRebuildContext.keeperCutId || '-'}.`,
+            false
+        );
+    }
+    return candidateCuts;
+}
+
+async function loadCutRebuildFilterOptions() {
+    const boxFilter = document.getElementById('cut-rebuild-box-filter');
+    const cashierFilter = document.getElementById('cut-rebuild-cashier-filter');
+    if (!boxFilter || !cashierFilter) return;
+
+    const previousBox = String(boxFilter.value || '').trim();
+    const previousCashier = String(cashierFilter.value || '').trim();
+
+    const [boxesResult, usersResult] = await Promise.allSettled([
+        fetch(API_URL + 'api/getCajas', {
+            headers: withAuthHeaders(),
+        }),
+        fetch(API_URL + 'api/usuarios', {
+            headers: withAuthHeaders(),
+        }),
+    ]);
+
+    boxFilter.innerHTML = '<option value="">Todas</option>';
+    if (boxesResult.status === 'fulfilled') {
+        const rows = await boxesResult.value.json().catch(() => []);
+        const list = Array.isArray(rows) ? rows : [];
+        list.forEach((row) => {
+            const id = String(row?.n_caja || row?.caja_id || '').trim();
+            if (!id) return;
+            const option = document.createElement('option');
+            option.value = id;
+            option.textContent = row?.nombre_caja ? `${row.nombre_caja} (${id})` : `Caja ${id}`;
+            boxFilter.appendChild(option);
+        });
+    }
+    if (previousBox) boxFilter.value = previousBox;
+
+    cashierFilter.innerHTML = '<option value="">Todos</option>';
+    if (usersResult.status === 'fulfilled') {
+        const rows = await usersResult.value.json().catch(() => []);
+        const list = Array.isArray(rows) ? rows : [];
+        list.forEach((row) => {
+            const id = String(row?.id || '').trim();
+            if (!id) return;
+            const option = document.createElement('option');
+            option.value = id;
+            const login = String(row?.user || '').trim();
+            const name = String(row?.nombre || '').trim() || `Usuario ${id}`;
+            option.textContent = login ? `${name} (${login})` : `${name} (${id})`;
+            cashierFilter.appendChild(option);
+        });
+    }
+    if (previousCashier) cashierFilter.value = previousCashier;
+}
+
+function ensureCutRebuildPopupBindings() {
+    if (window.__cutRebuildPopupInit) return;
+    window.__cutRebuildPopupInit = true;
+
+    const overlay = document.getElementById('cut-rebuild-popup');
+    if (overlay) {
+        overlay.addEventListener('click', (event) => {
+            if (event.target === overlay) {
+                closeCutRebuildPopup();
+            }
+        });
+    }
+
+    document.addEventListener('keydown', (event) => {
+        if (event.key !== 'Escape') return;
+        const cutsPopup = document.getElementById('cut-rebuild-cuts-popup');
+        if (cutsPopup && !cutsPopup.classList.contains('hidden')) {
+            closeCutRebuildCutsPopup();
+            return;
+        }
+        const popup = document.getElementById('cut-rebuild-popup');
+        if (!popup || popup.classList.contains('hidden')) return;
+        closeCutRebuildPopup();
+    });
+}
+
+function ensureCutRebuildCutsPopupBindings() {
+    if (window.__cutRebuildCutsPopupInit) return;
+    window.__cutRebuildCutsPopupInit = true;
+
+    const overlay = document.getElementById('cut-rebuild-cuts-popup');
+    if (overlay) {
+        overlay.addEventListener('click', (event) => {
+            if (event.target === overlay) {
+                closeCutRebuildCutsPopup();
+            }
+        });
+    }
+
+    ['cut-rebuild-output-from-date', 'cut-rebuild-output-from-time', 'cut-rebuild-output-to-date', 'cut-rebuild-output-to-time', 'cut-rebuild-output-caja', 'cut-rebuild-output-cajero'].forEach((id) => {
+        const input = document.getElementById(id);
+        if (!input) return;
+        const handler = () => {
+            invalidateCutRebuildPersistState();
+            updateCutRebuildActionButtons();
+            setCutRebuildCutsMessage('Se detectaron cambios. Presiona "Generar corte" para guardar la configuracion.', false);
+        };
+        input.addEventListener('change', handler);
+        input.addEventListener('input', handler);
+    });
+}
+
+function getSelectedCutRebuildSalesContext() {
+    const selectedRows = cutRebuildContext.sales.filter((row) => {
+        const id = Number(row?.id_venta || 0);
+        return cutRebuildContext.selectedSaleIds.has(id);
+    });
+    if (!selectedRows.length) {
+        return { ok: false, message: 'Selecciona al menos una venta.' };
+    }
+    const userIds = Array.from(new Set(
+        selectedRows.map((row) => Number(row?.usuario_id || 0)).filter((id) => id > 0)
+    ));
+    const boxIds = Array.from(new Set(
+        selectedRows.map((row) => Number(row?.caja_id || 0)).filter((id) => id > 0)
+    ));
+    const dateSet = Array.from(new Set(
+        selectedRows
+            .map((row) => String(row?.fecha || '').trim().slice(0, 10))
+            .filter((value) => /^\d{4}-\d{2}-\d{2}$/.test(value))
+    )).sort();
+    if (userIds.length !== 1 || boxIds.length !== 1) {
+        return {
+            ok: false,
+            message: 'Las ventas seleccionadas deben ser del mismo cajero y misma caja.',
+        };
+    }
+    return {
+        ok: true,
+        userId: userIds[0],
+        boxId: boxIds[0],
+        dateIso: dateSet[0] || new Date().toISOString().slice(0, 10),
+        dateSet,
+        rows: selectedRows,
+    };
+}
+
+function applyCutRebuildOutputDefaults(context) {
+    const fromDateInput = document.getElementById('cut-rebuild-output-from-date');
+    const fromTimeInput = document.getElementById('cut-rebuild-output-from-time');
+    const toDateInput = document.getElementById('cut-rebuild-output-to-date');
+    const toTimeInput = document.getElementById('cut-rebuild-output-to-time');
+    const cajaInput = document.getElementById('cut-rebuild-output-caja');
+    const cajeroInput = document.getElementById('cut-rebuild-output-cajero');
+    if (!fromDateInput || !fromTimeInput || !toDateInput || !toTimeInput || !cajaInput || !cajeroInput) return;
+
+    const rows = Array.isArray(context?.rows) ? context.rows : [];
+    const parsedTimes = rows
+        .map((row) => new Date(String(row?.fecha || '').replace(' ', 'T')))
+        .filter((dt) => !Number.isNaN(dt.getTime()))
+        .sort((a, b) => a.getTime() - b.getTime());
+
+    const first = parsedTimes[0] || null;
+    const last = parsedTimes[parsedTimes.length - 1] || first || null;
+    const fallbackDate = String(context?.dateIso || '').trim() || new Date().toISOString().slice(0, 10);
+
+    const fromDate = first ? first.toISOString().slice(0, 10) : fallbackDate;
+    const fromHour = first ? String(first.getHours()).padStart(2, '0') : '00';
+    const fromMinute = first ? String(first.getMinutes()).padStart(2, '0') : '00';
+    const toDate = last ? last.toISOString().slice(0, 10) : fromDate;
+    const toHour = last ? String(last.getHours()).padStart(2, '0') : '23';
+    const toMinute = last ? String(last.getMinutes()).padStart(2, '0') : '59';
+
+    fromDateInput.value = fromDate;
+    fromTimeInput.value = `${fromHour}:${fromMinute}`;
+    toDateInput.value = toDate;
+    toTimeInput.value = `${toHour}:${toMinute}`;
+
+    const boxFilter = document.getElementById('cut-rebuild-box-filter');
+    const cashierFilter = document.getElementById('cut-rebuild-cashier-filter');
+    const sourceBoxOptions = boxFilter ? Array.from(boxFilter.options) : [];
+    const sourceCashierOptions = cashierFilter ? Array.from(cashierFilter.options) : [];
+
+    cajaInput.innerHTML = '<option value="">Seleccionar caja</option>';
+    sourceBoxOptions.forEach((opt) => {
+        const value = String(opt?.value || '').trim();
+        if (!value) return;
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = String(opt?.textContent || `Caja ${value}`).trim();
+        cajaInput.appendChild(option);
+    });
+    const preferredBox = String(context?.boxId || boxFilter?.value || '').trim();
+    if (preferredBox && cajaInput.querySelector(`option[value="${preferredBox}"]`)) {
+        cajaInput.value = preferredBox;
+    }
+
+    cajeroInput.innerHTML = '<option value="">Seleccionar cajero</option>';
+    sourceCashierOptions.forEach((opt) => {
+        const value = String(opt?.value || '').trim();
+        if (!value) return;
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = String(opt?.textContent || `Usuario ${value}`).trim();
+        cajeroInput.appendChild(option);
+    });
+    const preferredCashier = String(context?.userId || cashierFilter?.value || '').trim();
+    if (preferredCashier && cajeroInput.querySelector(`option[value="${preferredCashier}"]`)) {
+        cajeroInput.value = preferredCashier;
+    }
+}
+
+function getCutRebuildOutputConfigFromUI() {
+    const fromDateInput = document.getElementById('cut-rebuild-output-from-date');
+    const fromTimeInput = document.getElementById('cut-rebuild-output-from-time');
+    const toDateInput = document.getElementById('cut-rebuild-output-to-date');
+    const toTimeInput = document.getElementById('cut-rebuild-output-to-time');
+    const cajaInput = document.getElementById('cut-rebuild-output-caja');
+    const cajeroInput = document.getElementById('cut-rebuild-output-cajero');
+
+    const cutFromDate = String(fromDateInput?.value || '').trim();
+    const cutFromTime = String(fromTimeInput?.value || '').trim();
+    const cutToDate = String(toDateInput?.value || '').trim();
+    const cutToTime = String(toTimeInput?.value || '').trim();
+    const cutCajaId = Number(cajaInput?.value || 0);
+    const cutCajeroId = Number(cajeroInput?.value || 0);
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(cutFromDate)) {
+        return { ok: false, message: 'Debes indicar la fecha de inicio del corte.' };
+    }
+    if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(cutFromTime)) {
+        return { ok: false, message: 'Debes indicar la hora de inicio del corte.' };
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(cutToDate)) {
+        return { ok: false, message: 'Debes indicar la fecha de fin del corte.' };
+    }
+    if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(cutToTime)) {
+        return { ok: false, message: 'Debes indicar la hora de fin del corte.' };
+    }
+    if (!Number.isFinite(cutCajaId) || cutCajaId < 1) {
+        return { ok: false, message: 'Debes seleccionar la caja a asignar.' };
+    }
+    if (!Number.isFinite(cutCajeroId) || cutCajeroId < 1) {
+        return { ok: false, message: 'Debes seleccionar el cajero a asignar.' };
+    }
+
+    const fromDateTime = `${cutFromDate} ${cutFromTime}:00`;
+    const toDateTime = `${cutToDate} ${cutToTime}:59`;
+    if (fromDateTime > toDateTime) {
+        return { ok: false, message: 'La fecha/hora de inicio no puede ser mayor a la fecha/hora de fin.' };
+    }
+
+    return {
+        ok: true,
+        cut_from_date: cutFromDate,
+        cut_from_time: cutFromTime,
+        cut_to_date: cutToDate,
+        cut_to_time: cutToTime,
+        cut_caja_id: cutCajaId,
+        cut_cajero_id: cutCajeroId,
+    };
+}
+
+async function openCutRebuildPopup() {
+    if (!isSessionAdminSiaUser()) {
+        alert('Solo admin_sia puede acceder a reconstruccion de corte.');
+        return;
+    }
+    const overlay = document.getElementById('cut-rebuild-popup');
+    const fromDateInput = document.getElementById('cut-rebuild-from-date');
+    const toDateInput = document.getElementById('cut-rebuild-to-date');
+    const fromTimeInput = document.getElementById('cut-rebuild-from-time');
+    const toTimeInput = document.getElementById('cut-rebuild-to-time');
+    if (!overlay || !fromDateInput || !toDateInput || !fromTimeInput || !toTimeInput) return;
+
+    ensureCutRebuildPopupBindings();
+    ensureCutRebuildCutsPopupBindings();
+    const now = new Date();
+    const defaultToDate = now.toISOString().slice(0, 10);
+    const defaultFromDate = new Date(now.getTime() - (6 * 24 * 60 * 60 * 1000)).toISOString().slice(0, 10);
+    if (!fromDateInput.value && !toDateInput.value) {
+        fromDateInput.value = defaultFromDate;
+        toDateInput.value = defaultToDate;
+    } else {
+        if (!fromDateInput.value) fromDateInput.value = toDateInput.value || defaultFromDate;
+        if (!toDateInput.value) toDateInput.value = fromDateInput.value || defaultToDate;
+    }
+    if (!fromTimeInput.value) fromTimeInput.value = '00:00';
+    if (!toTimeInput.value) toTimeInput.value = '23:59';
+
+    cutRebuildContext.selectedSaleIds = new Set();
+    cutRebuildContext.selectedCutIds = new Set();
+    cutRebuildContext.keeperCutId = null;
+    invalidateCutRebuildPersistState();
+
+    overlay.classList.remove('hidden');
+    overlay.style.display = 'flex';
+    closeCutRebuildCutsPopup({ restoreMain: false });
+    setCutRebuildMessage('Cargando opciones de filtro...', false);
+
+    try {
+        await loadCutRebuildFilterOptions();
+        cutRebuildContext.filtersLoaded = true;
+    } catch (_) {
+        cutRebuildContext.filtersLoaded = false;
+    }
+    await runCutRebuildPreview({ preserveSelection: false });
+}
+
+function closeCutRebuildPopup() {
+    const overlay = document.getElementById('cut-rebuild-popup');
+    if (!overlay) return;
+    overlay.classList.add('hidden');
+    overlay.style.display = 'none';
+    closeCutRebuildCutsPopup({ restoreMain: false });
+}
+
+function closeCutRebuildCutsPopup(options = {}) {
+    const restoreMain = options?.restoreMain !== false;
+    const overlay = document.getElementById('cut-rebuild-cuts-popup');
+    if (!overlay) return;
+    overlay.classList.add('hidden');
+    overlay.style.display = 'none';
+    if (!restoreMain) return;
+    const mainOverlay = document.getElementById('cut-rebuild-popup');
+    if (!mainOverlay) return;
+    mainOverlay.classList.remove('hidden');
+    mainOverlay.style.display = 'flex';
+}
+
+function openCutRebuildCutsPopup() {
+    const context = getSelectedCutRebuildSalesContext();
+    if (!context.ok) {
+        setCutRebuildMessage(context.message, true);
+        alert(context.message);
+        return;
+    }
+    const overlay = document.getElementById('cut-rebuild-cuts-popup');
+    if (!overlay) return;
+
+    applyCutRebuildOutputDefaults(context);
+    const mainOverlay = document.getElementById('cut-rebuild-popup');
+    if (mainOverlay) {
+        mainOverlay.classList.add('hidden');
+        mainOverlay.style.display = 'none';
+    }
+    overlay.classList.remove('hidden');
+    overlay.style.display = 'flex';
+    renderCutRebuildCutsPopupForContext(context);
+    updateCutRebuildActionButtons();
+}
+
+async function runCutRebuildPreview(options = {}) {
+    const preserveSelection = Boolean(options?.preserveSelection);
+    const filters = getCutRebuildFiltersFromUI();
+    if (!filters.desde || !filters.hasta) {
+        setCutRebuildMessage('Debes indicar desde y hasta para buscar.', true);
+        return;
+    }
+    if (filters.desde > filters.hasta) {
+        setCutRebuildMessage('Rango de fechas invalido: desde no puede ser mayor a hasta.', true);
+        return;
+    }
+    const fromDateTime = `${filters.desde} ${filters.hora_desde || '00:00'}:00`;
+    const toDateTime = `${filters.hasta} ${filters.hora_hasta || '23:59'}:59`;
+    if (fromDateTime > toDateTime) {
+        setCutRebuildMessage('Rango de fecha/hora invalido.', true);
+        return;
+    }
+
+    const query = new URLSearchParams({
+        desde: filters.desde,
+        hasta: filters.hasta,
+        hora_desde: filters.hora_desde,
+        hora_hasta: filters.hora_hasta,
+    });
+    if (filters.caja) query.set('caja', filters.caja);
+    if (filters.cajero) query.set('cajero', filters.cajero);
+    if (filters.turno) query.set('turno', filters.turno);
+
+    const previousSelectedSales = new Set(cutRebuildContext.selectedSaleIds);
+    const previousSelectedCuts = new Set(cutRebuildContext.selectedCutIds);
+    const previousKeeper = Number(cutRebuildContext.keeperCutId || 0) || null;
+
+    setCutRebuildMessage('Buscando cortes y ventas para reconstruccion...', false);
+    try {
+        const response = await fetch(API_URL + `api/corte/rebuild-preview?${query.toString()}`, {
+            headers: withAuthHeaders(),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            throw new Error(data?.message || 'No se pudo cargar reconstruccion de cortes');
+        }
+
+        const cuts = Array.isArray(data?.cuts) ? data.cuts : [];
+        const sales = Array.isArray(data?.sales) ? data.sales : [];
+        cutRebuildContext.cuts = cuts;
+        cutRebuildContext.sales = sales;
+        const validCutIds = new Set(cuts.map((row) => Number(row?.id_corte || 0)).filter((id) => id > 0));
+        const validSaleIds = new Set(sales.map((row) => Number(row?.id_venta || 0)).filter((id) => id > 0));
+        if (preserveSelection) {
+            cutRebuildContext.selectedSaleIds = new Set(
+                Array.from(previousSelectedSales).filter((id) => validSaleIds.has(Number(id || 0)))
+            );
+            cutRebuildContext.selectedCutIds = new Set(
+                Array.from(previousSelectedCuts).filter((id) => validCutIds.has(Number(id || 0)))
+            );
+            cutRebuildContext.keeperCutId = cutRebuildContext.selectedCutIds.has(previousKeeper)
+                ? previousKeeper
+                : Number(Array.from(cutRebuildContext.selectedCutIds)[0] || 0) || null;
+        } else {
+            cutRebuildContext.selectedSaleIds = new Set();
+            cutRebuildContext.selectedCutIds = new Set();
+            cutRebuildContext.keeperCutId = null;
+        }
+        invalidateCutRebuildPersistState();
+
+        renderCutRebuildRows(sales);
+        const totalTx = Number(data?.totals?.transacciones || 0);
+        const totalAmount = Number(data?.totals?.total || 0);
+        const selectedSales = cutRebuildContext.selectedSaleIds.size;
+        if (!sales.length) {
+            setCutRebuildMessage(
+                `No hay ventas para esos filtros. Ventas filtradas: ${totalTx} | Total: $${formatMoney(totalAmount)}.`,
+                false
+            );
+        } else {
+            setCutRebuildMessage(
+                `Ventas encontradas: ${sales.length} | Cortes detectados: ${cuts.length} | Total: $${formatMoney(totalAmount)} | Ventas seleccionadas: ${selectedSales}.`,
+                false
+            );
+        }
+    } catch (error) {
+        cutRebuildContext.cuts = [];
+        cutRebuildContext.sales = [];
+        cutRebuildContext.selectedSaleIds = new Set();
+        cutRebuildContext.selectedCutIds = new Set();
+        cutRebuildContext.keeperCutId = null;
+        invalidateCutRebuildPersistState();
+        renderCutRebuildRows([]);
+        setCutRebuildMessage(error.message || 'No se pudo consultar reconstruccion de corte.', true);
+    }
+}
+
+async function refreshCutRebuildAfterPersist(options = {}) {
+    const persistedCutId = Number(options?.keepCutId || cutRebuildContext.persistedCutId || 0) || null;
+    const persistedSignature = String(cutRebuildContext.persistedSignature || '').trim();
+    await runCutRebuildPreview({ preserveSelection: true });
+    if (persistedCutId) {
+        cutRebuildContext.persistedCutId = persistedCutId;
+        if (persistedSignature) {
+            cutRebuildContext.persistedSignature = persistedSignature;
+        }
+        if (!cutRebuildContext.selectedCutIds.size) {
+            cutRebuildContext.selectedCutIds = new Set([persistedCutId]);
+        }
+        if (!cutRebuildContext.keeperCutId) {
+            cutRebuildContext.keeperCutId = persistedCutId;
+        }
+    }
+    const cutsOverlay = document.getElementById('cut-rebuild-cuts-popup');
+    if (!cutsOverlay || cutsOverlay.classList.contains('hidden')) {
+        updateCutRebuildActionButtons();
+        return;
+    }
+    const context = getSelectedCutRebuildSalesContext();
+    if (!context.ok) {
+        setCutRebuildCutsMessage(context.message, true);
+        updateCutRebuildActionButtons();
+        return;
+    }
+    renderCutRebuildCutsPopupForContext(context);
+    updateCutRebuildActionButtons();
+}
+
+async function persistCutRebuildSelection(options = {}) {
+    if (!isSessionAdminSiaUser()) {
+        throw new Error('Solo admin_sia puede unificar cortes.');
+    }
+    const showMessage = options?.showMessage !== false;
+    const askConfirmation = options?.askConfirmation !== false;
+    const selectedContext = getSelectedCutRebuildSalesContext();
+    if (!selectedContext.ok) {
+        throw new Error(selectedContext.message);
+    }
+    const saleIds = getCutRebuildSelectedSaleIds();
+    if (!saleIds.length) {
+        throw new Error('Selecciona al menos una venta.');
+    }
+    if (!document.getElementById('cut-rebuild-output-from-date')?.value) {
+        applyCutRebuildOutputDefaults(selectedContext);
+    }
+    const outputConfig = getCutRebuildOutputConfigFromUI();
+    if (!outputConfig.ok) {
+        throw new Error(outputConfig.message);
+    }
+
+    const cutIds = getCutRebuildSelectedCutIds();
+    const keeperCutId = cutIds.length
+        ? (Number(cutRebuildContext.keeperCutId || cutIds[0] || 0) || Number(cutIds[0] || 0))
+        : null;
+    const currentSignature = `${buildCutRebuildPersistSignature()}|${outputConfig.cut_from_date}|${outputConfig.cut_from_time}|${outputConfig.cut_to_date}|${outputConfig.cut_to_time}|${outputConfig.cut_caja_id}|${outputConfig.cut_cajero_id}`;
+    if (
+        cutRebuildContext.persistedCutId
+        && cutRebuildContext.persistedSignature
+        && cutRebuildContext.persistedSignature === currentSignature
+    ) {
+        return Number(cutRebuildContext.persistedCutId || 0) || null;
+    }
+
+    if (askConfirmation) {
+        let question = '';
+        if (!cutIds.length) {
+            question = `Se creara un corte nuevo de ${outputConfig.cut_from_date} ${outputConfig.cut_from_time} a ${outputConfig.cut_to_date} ${outputConfig.cut_to_time}.`;
+        } else if (cutIds.length === 1) {
+            question = `Se usara el corte #${keeperCutId} con tramo ${outputConfig.cut_from_date} ${outputConfig.cut_from_time} -> ${outputConfig.cut_to_date} ${outputConfig.cut_to_time}.`;
+        } else {
+            question = `Se unificaran ${cutIds.length} cortes y se conservara #${keeperCutId}. Tramo final: ${outputConfig.cut_from_date} ${outputConfig.cut_from_time} -> ${outputConfig.cut_to_date} ${outputConfig.cut_to_time}.`;
+        }
+        let confirmed = true;
+        if (typeof window.appConfirm === 'function') {
+            confirmed = await window.appConfirm(question, 'warning');
+        } else {
+            confirmed = window.confirm(question);
+        }
+        if (!confirmed) {
+            throw new Error('Operacion cancelada por el usuario.');
+        }
+    }
+
+    const filters = getCutRebuildFiltersFromUI();
+    const payload = {
+        ...filters,
+        ...outputConfig,
+        sale_ids: saleIds,
+        cut_ids: cutIds,
+    };
+    if (keeperCutId) {
+        payload.keep_cut_id = keeperCutId;
+    }
+
+    const mergeBtn = document.getElementById('cut-rebuild-merge-btn');
+    const printBtn = document.getElementById('cut-rebuild-print-btn');
+    if (mergeBtn) mergeBtn.disabled = true;
+    if (printBtn) printBtn.disabled = true;
+
+    try {
+        const response = await fetch(API_URL + 'api/corte/merge', {
+            method: 'POST',
+            headers: {
+                ...withAuthHeaders({
+                    'Content-Type': 'application/json',
+                }),
+            },
+            body: JSON.stringify(payload),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            throw new Error(data?.message || 'No se pudo guardar la reconstruccion');
+        }
+        const finalKeep = Number(data?.keep_cut_id || keeperCutId || 0) || null;
+        cutRebuildContext.selectedCutIds = finalKeep ? new Set([finalKeep]) : new Set();
+        cutRebuildContext.keeperCutId = finalKeep;
+        cutRebuildContext.persistedCutId = finalKeep;
+        cutRebuildContext.persistedSignature = currentSignature;
+        if (showMessage) {
+            const movedSales = Number(data?.reassigned_sales || 0);
+            const movedMovements = Number(data?.reassigned_movements || 0);
+            const label = data?.created_new_cut
+                ? `Corte nuevo #${finalKeep || '-'} creado.`
+                : (data?.message || 'Reconstruccion aplicada.');
+            setCutRebuildMessage(`${label} Ventas reasignadas: ${movedSales} | Movimientos reasignados: ${movedMovements}.`, false);
+        }
+        return finalKeep;
+    } finally {
+        updateCutRebuildActionButtons();
+    }
+}
+
+async function confirmCutRebuildCutsSelection(options = {}) {
+    const printAfter = Boolean(options?.printAfter);
+    const keepOpen = options?.keepOpen !== false;
+    try {
+        const keepCutId = await persistCutRebuildSelection({ showMessage: true, askConfirmation: true });
+        await refreshCutRebuildAfterPersist({ keepCutId });
+        setCutRebuildCutsMessage(
+            `Corte #${Number(keepCutId || 0) || '-'} actualizado. Puedes imprimirlo o seguir ajustando la configuracion.`,
+            false
+        );
+        if (printAfter) {
+            await printCutRebuildReport({ skipPersist: true, messageTarget: 'cuts' });
+        }
+        if (!keepOpen) {
+            closeCutRebuildCutsPopup();
+        }
+    } catch (error) {
+        if (String(error?.message || '').includes('cancelada')) {
+            return;
+        }
+        setCutRebuildCutsMessage(error.message || 'No se pudo aplicar la seleccion.', true);
+        alert(error.message || 'No se pudo aplicar la seleccion.');
+    }
+}
+
+function mergeSelectedCuts() {
+    openCutRebuildCutsPopup();
+}
+
+function buildCutRebuildPrintPayload({ selectedContext, saleIds, outputConfig, cutIds = [], keepCutId = null }) {
+    const filters = getCutRebuildFiltersFromUI();
+    const cajaRaw = String(localStorage.getItem('n_caja') || localStorage.getItem('caja') || '').trim();
+    const normalizedCutIds = Array.from(new Set(
+        (Array.isArray(cutIds) ? cutIds : [])
+            .map((value) => Number(value || 0))
+            .filter((value) => Number.isFinite(value) && value > 0)
+    ));
+    const keeperCutId = Number(keepCutId || 0) || null;
+    if (keeperCutId && !normalizedCutIds.includes(keeperCutId)) {
+        normalizedCutIds.unshift(keeperCutId);
+    }
+    const targetCaja = String(
+        outputConfig?.cut_caja_id
+        || filters.caja
+        || selectedContext?.boxId
+        || ''
+    ).trim();
+    const targetCajero = String(
+        outputConfig?.cut_cajero_id
+        || filters.cajero
+        || selectedContext?.userId
+        || ''
+    ).trim();
+    const payload = {
+        ...filters,
+        ...(outputConfig?.ok ? outputConfig : {}),
+        caja: targetCaja,
+        cajero: targetCajero,
+        turno: String(keeperCutId || normalizedCutIds[0] || ''),
+        sale_ids: saleIds,
+        cut_ids: normalizedCutIds,
+        keep_cut_id: keeperCutId,
+    };
+    if (/^\d+$/.test(cajaRaw)) {
+        payload.numero_caja = Number(cajaRaw);
+    }
+    return payload;
+}
+
+async function printCutRebuildTicketWithPayload(payload, options = {}) {
+    const messageTarget = String(options?.messageTarget || 'main').toLowerCase() === 'cuts' ? 'cuts' : 'main';
+    const setMessage = messageTarget === 'cuts' ? setCutRebuildCutsMessage : setCutRebuildMessage;
+    try {
+        const payloadData = await fetchPrintPayload('api/print/cut-rebuilt-ticket', payload, 'No se pudo generar el reporte reconstruido');
+        const printResult = await printTicketLocalFirst({
+            payloadData,
+            localSuccessMessage: 'Reporte reconstruido enviado a impresion local',
+            fallbackEndpoint: 'api/print/cut-rebuilt-ticket',
+            fallbackPayload: payload,
+            fallbackErrorMessage: 'No se pudo imprimir el reporte reconstruido',
+        });
+        setMessage(printResult?.message || 'Reporte reconstruido enviado a impresion.', false);
+    } catch (error) {
+        console.error('Error printing rebuilt cut report:', error);
+        setMessage(error.message || 'No se pudo imprimir el reporte reconstruido.', true);
+        alert(error.message || 'No se pudo imprimir el reporte reconstruido.');
+    }
+}
+
+async function printCutRebuildPreviewReport() {
+    if (!isSessionAdminSiaUser()) {
+        alert('Solo admin_sia puede imprimir reconstrucciones de corte.');
+        return;
+    }
+    const selectedContext = getSelectedCutRebuildSalesContext();
+    if (!selectedContext.ok) {
+        setCutRebuildCutsMessage(selectedContext.message, true);
+        alert(selectedContext.message);
+        return;
+    }
+    const saleIds = getCutRebuildSelectedSaleIds();
+    if (!saleIds.length) {
+        setCutRebuildCutsMessage('Selecciona al menos una venta para imprimir.', true);
+        alert('Selecciona al menos una venta para imprimir.');
+        return;
+    }
+    if (!document.getElementById('cut-rebuild-output-from-date')?.value) {
+        applyCutRebuildOutputDefaults(selectedContext);
+    }
+    const outputConfig = getCutRebuildOutputConfigFromUI();
+    if (!outputConfig.ok) {
+        setCutRebuildCutsMessage(outputConfig.message, true);
+        alert(outputConfig.message);
+        return;
+    }
+    const cutIds = getCutRebuildSelectedCutIds();
+    const keeperCutId = cutIds.length
+        ? (Number(cutRebuildContext.keeperCutId || cutIds[0] || 0) || Number(cutIds[0] || 0))
+        : null;
+    setCutRebuildCutsMessage('Generando previsualizacion para imprimir...', false);
+    const payload = buildCutRebuildPrintPayload({
+        selectedContext,
+        saleIds,
+        outputConfig,
+        cutIds,
+        keepCutId: keeperCutId,
+    });
+    await printCutRebuildTicketWithPayload(payload, { messageTarget: 'cuts' });
+}
+
+async function printCutRebuildReport(options = {}) {
+    if (!isSessionAdminSiaUser()) {
+        alert('Solo admin_sia puede imprimir reconstrucciones de corte.');
+        return;
+    }
+    const messageTarget = String(options?.messageTarget || 'main').toLowerCase() === 'cuts' ? 'cuts' : 'main';
+    const setMessage = messageTarget === 'cuts' ? setCutRebuildCutsMessage : setCutRebuildMessage;
+    const skipPersist = Boolean(options?.skipPersist);
+    const selectedContext = getSelectedCutRebuildSalesContext();
+    if (!selectedContext.ok) {
+        setMessage(selectedContext.message, true);
+        alert(selectedContext.message);
+        return;
+    }
+    const saleIds = getCutRebuildSelectedSaleIds();
+    if (!saleIds.length) {
+        setMessage('Selecciona al menos una venta para generar el reporte.', true);
+        alert('Selecciona al menos una venta para generar el reporte.');
+        return;
+    }
+    if (!document.getElementById('cut-rebuild-output-from-date')?.value) {
+        applyCutRebuildOutputDefaults(selectedContext);
+    }
+    const outputConfig = getCutRebuildOutputConfigFromUI();
+    if (!outputConfig.ok) {
+        setMessage(outputConfig.message, true);
+        alert(outputConfig.message);
+        return;
+    }
+
+    let keepCutId = Number(cutRebuildContext.persistedCutId || 0) || null;
+    if (!skipPersist || !keepCutId) {
+        setMessage('Aplicando reconstruccion para generar reporte...', false);
+        try {
+            keepCutId = await persistCutRebuildSelection({ showMessage: false, askConfirmation: false });
+        } catch (error) {
+            if (String(error?.message || '').includes('cancelada')) {
+                return;
+            }
+            setMessage(error.message || 'No se pudo preparar el corte reconstruido.', true);
+            alert(error.message || 'No se pudo preparar el corte reconstruido.');
+            return;
+        }
+    }
+    if (!keepCutId) {
+        setMessage('No se pudo determinar el corte generado para imprimir.', true);
+        return;
+    }
+
+    const payload = buildCutRebuildPrintPayload({
+        selectedContext,
+        saleIds,
+        outputConfig,
+        cutIds: [keepCutId],
+        keepCutId,
+    });
+    await printCutRebuildTicketWithPayload(payload, { messageTarget });
+}
+
+window.openCutRebuildPopup = openCutRebuildPopup;
+window.closeCutRebuildPopup = closeCutRebuildPopup;
+window.openCutRebuildCutsPopup = openCutRebuildCutsPopup;
+window.closeCutRebuildCutsPopup = closeCutRebuildCutsPopup;
+window.confirmCutRebuildCutsSelection = confirmCutRebuildCutsSelection;
+window.runCutRebuildPreview = runCutRebuildPreview;
+window.mergeSelectedCuts = mergeSelectedCuts;
+window.printCutRebuildReport = printCutRebuildReport;
+window.printCutRebuildPreviewReport = printCutRebuildPreviewReport;
+window.selectAllCutRebuildSales = selectAllCutRebuildSales;
+window.clearCutRebuildSalesSelection = clearCutRebuildSalesSelection;
 
 function normalizeSettingBool(value, fallback = false) {
     if (value === null || value === undefined) return fallback;
@@ -999,15 +3015,136 @@ function renderCutEnabledPaymentBreakdown(summaryRows, paymentSettings, scopeLab
 
     const totalVentas = summaryRows.reduce((acc, row) => acc + Number(row.total || 0), 0);
     const totalTx = summaryRows.reduce((acc, row) => acc + Number(row.transacciones || 0), 0);
-    if (cutCloseContext.scope === 'session') {
+
+    const scopeText = String(scopeLabel || '').toLowerCase();
+    const isSessionScope = scopeText.includes('sesion');
+    const isDayScope = scopeText.includes('dia');
+    if (isSessionScope) {
         const statusText = cutCloseContext.turnStatusLabel || '';
-        cutSummary.textContent = `Fecha ${cutCloseContext.currentDate || ''}: ${totalVentas.toFixed(0)} en ${totalTx} ventas${statusText}`;
-    } else if (cutCloseContext.scope === 'day') {
-        cutSummary.textContent = `Fecha ${cutCloseContext.currentDate || ''}: ${totalVentas.toFixed(0)} en ${totalTx} ventas`;
+        cutSummary.textContent = `Resumen de sesion: ${totalTx.toFixed(0)} venta(s) | Total $${totalVentas.toFixed(0)}${statusText}`;
+    } else if (isDayScope) {
+        cutSummary.textContent = `Resumen del dia: ${totalTx.toFixed(0)} venta(s) | Total $${totalVentas.toFixed(0)}`;
     } else {
-        cutSummary.textContent = `Fecha ${cutCloseContext.currentDate || ''}`;
+        cutSummary.textContent = `Sin resumen cargado para la fecha seleccionada.`;
     }
+
     cutBreakdown.innerHTML = '';
+    const methodRows = Array.from(totalsByMethod.values()).filter((row) => Number(row.total || 0) > 0 || Number(row.transacciones || 0) > 0);
+    if (!methodRows.length) {
+        const li = document.createElement('li');
+        li.textContent = 'Sin ventas para los metodos habilitados en el alcance seleccionado.';
+        cutBreakdown.appendChild(li);
+        return;
+    }
+    methodRows.forEach((row) => {
+        const li = document.createElement('li');
+        li.textContent = `${row.label}: $${Number(row.total || 0).toFixed(0)} (${Number(row.transacciones || 0).toFixed(0)} venta(s))`;
+        cutBreakdown.appendChild(li);
+    });
+}
+
+function buildMixedSalesDetails(detailRows = [], mixedRows = []) {
+    const normalizedMixedRows = (Array.isArray(mixedRows) ? mixedRows : [])
+        .map((row) => ({
+            saleId: Number(row?.id_venta || 0),
+            ticket: String(row?.numero_ticket || '').trim(),
+            date: String(row?.fecha || '').trim(),
+            efectivo: Number(row?.efectivo || 0),
+            tarjeta: Number(row?.tarjeta || 0),
+        }))
+        .filter((row) => Number.isFinite(row.efectivo) && Number.isFinite(row.tarjeta))
+        .filter((row) => row.efectivo > 0 || row.tarjeta > 0);
+    if (normalizedMixedRows.length > 0) {
+        const rows = normalizedMixedRows
+            .slice()
+            .sort((a, b) => {
+                const aId = Number(a.saleId || 0);
+                const bId = Number(b.saleId || 0);
+                if (aId > 0 && bId > 0) return aId - bId;
+                if (aId > 0) return -1;
+                if (bId > 0) return 1;
+                const dateCompare = String(a.date || '').localeCompare(String(b.date || ''));
+                if (dateCompare !== 0) return dateCompare;
+                return String(a.ticket || '').localeCompare(String(b.ticket || ''), 'es', { numeric: true, sensitivity: 'base' });
+            })
+            .map((row) => ({
+                saleId: row.saleId,
+                ticket: row.ticket || (row.saleId > 0 ? String(row.saleId) : '-'),
+                efectivo: Number(row.efectivo || 0),
+                tarjeta: Number(row.tarjeta || 0),
+            }));
+        const totals = rows.reduce((acc, row) => {
+            acc.count += 1;
+            acc.efectivo += Number(row.efectivo || 0);
+            acc.tarjeta += Number(row.tarjeta || 0);
+            return acc;
+        }, { count: 0, efectivo: 0, tarjeta: 0 });
+        totals.total = totals.efectivo + totals.tarjeta;
+        return { rows, totals };
+    }
+
+    const bySale = new Map();
+    (Array.isArray(detailRows) ? detailRows : []).forEach((row) => {
+        const saleId = Number(row?.id_venta || 0);
+        const ticketRaw = String(row?.numero_ticket || '').trim();
+        const saleDate = String(row?.fecha || '').trim();
+        const saleKey = saleId > 0
+            ? `id:${saleId}`
+            : (ticketRaw ? `ticket:${ticketRaw}|fecha:${saleDate.slice(0, 16)}` : '');
+        if (!saleKey) return;
+        const paymentMethod = String(row?.metodo_pago || '').trim().toLowerCase();
+        const saleMethod = String(row?.metodo_venta || '').trim().toLowerCase();
+        const current = bySale.get(saleKey) || {
+            saleId,
+            ticket: ticketRaw || (saleId > 0 ? String(saleId) : '-'),
+            date: saleDate,
+            efectivo: 0,
+            tarjeta: 0,
+            isMixedSale: saleMethod === 'mixto',
+        };
+        if (saleId > 0 && !current.saleId) current.saleId = saleId;
+        if (!current.ticket || current.ticket === '-') current.ticket = ticketRaw || current.ticket;
+        if (!current.date) current.date = saleDate;
+        if (saleMethod === 'mixto') current.isMixedSale = true;
+
+        if (paymentMethod === 'efectivo' || paymentMethod === 'tarjeta') {
+            const amount = Number(row?.total || 0);
+            if (Number.isFinite(amount) && amount > 0) {
+                if (paymentMethod === 'efectivo') current.efectivo += amount;
+                if (paymentMethod === 'tarjeta') current.tarjeta += amount;
+            }
+        }
+        bySale.set(saleKey, current);
+    });
+
+    const rows = Array.from(bySale.values())
+        .filter((row) => row.isMixedSale || (row.efectivo > 0 && row.tarjeta > 0))
+        .sort((a, b) => {
+            const aId = Number(a.saleId || 0);
+            const bId = Number(b.saleId || 0);
+            if (aId > 0 && bId > 0) return aId - bId;
+            if (aId > 0) return -1;
+            if (bId > 0) return 1;
+            const dateCompare = String(a.date || '').localeCompare(String(b.date || ''));
+            if (dateCompare !== 0) return dateCompare;
+            return String(a.ticket || '').localeCompare(String(b.ticket || ''), 'es', { numeric: true, sensitivity: 'base' });
+        })
+        .map((row) => ({
+            saleId: row.saleId,
+            ticket: row.ticket,
+            efectivo: Number(row.efectivo || 0),
+            tarjeta: Number(row.tarjeta || 0),
+        }));
+
+    const totals = rows.reduce((acc, row) => {
+        acc.count += 1;
+        acc.efectivo += Number(row.efectivo || 0);
+        acc.tarjeta += Number(row.tarjeta || 0);
+        return acc;
+    }, { count: 0, efectivo: 0, tarjeta: 0 });
+    totals.total = totals.efectivo + totals.tarjeta;
+
+    return { rows, totals };
 }
 
 function renderCutFinancialSections(data = {}, options = {}) {
@@ -1015,29 +3152,47 @@ function renderCutFinancialSections(data = {}, options = {}) {
     const financial = data.resumen_financiero || {};
     const movements = data.movimientos || {};
     const departments = Array.isArray(data.departamentos) ? data.departamentos : [];
-    const topProductsByDepartmentRows = Array.isArray(data.top_productos_departamento) ? data.top_productos_departamento : [];
     const rawSummaryRows = Array.isArray(data.resumen) ? data.resumen : [];
+    const detailRows = Array.isArray(data.detalle) ? data.detalle : [];
+    const mixedRowsFromServer = Array.isArray(data.ventas_mixtas) ? data.ventas_mixtas : [];
 
+    const salesKpi = document.getElementById('cut-kpi-sales-total');
+    const profitKpi = document.getElementById('cut-kpi-profit-total');
     const cashList = document.getElementById('cut-cash-detail-list');
     const cashTotal = document.getElementById('cut-cash-total');
     const profitList = document.getElementById('cut-profit-detail-list');
     const profitTotal = document.getElementById('cut-profit-total');
+    const mixedSummaryList = document.getElementById('cut-mixed-summary-list');
+    const mixedSummaryTotal = document.getElementById('cut-mixed-summary-total');
     const incomeList = document.getElementById('cut-session-income-list');
     const expenseList = document.getElementById('cut-session-expense-list');
     const departmentList = document.getElementById('cut-department-list');
+    const departmentTotal = document.getElementById('cut-department-total');
+    const mixedTicketList = document.getElementById('cut-mixed-ticket-list');
+    const mixedTicketTotal = document.getElementById('cut-mixed-ticket-total');
     const topProductsByDepartmentList = document.getElementById('cut-top-products-by-department');
 
     if (clearOnly) {
+        if (salesKpi) salesKpi.textContent = '$0';
+        if (profitKpi) profitKpi.textContent = '$0';
         if (cashList) cashList.innerHTML = '';
         if (cashTotal) cashTotal.textContent = '';
         if (profitList) profitList.innerHTML = '';
         if (profitTotal) profitTotal.textContent = '';
+        if (mixedSummaryList) mixedSummaryList.innerHTML = '';
+        if (mixedSummaryTotal) mixedSummaryTotal.textContent = '';
         if (incomeList) incomeList.innerHTML = '';
         if (expenseList) expenseList.innerHTML = '';
         if (departmentList) departmentList.innerHTML = '';
+        if (departmentTotal) departmentTotal.textContent = '';
+        if (mixedTicketList) mixedTicketList.innerHTML = '';
+        if (mixedTicketTotal) mixedTicketTotal.textContent = '';
         if (topProductsByDepartmentList) topProductsByDepartmentList.innerHTML = '';
         return;
     }
+
+    const formatCurrency = (value) => `$${Number(value || 0).toFixed(0)}`;
+    const formatSignedCurrency = (value, prefix = '') => `${prefix}${formatCurrency(value)}`;
 
     const fallbackVentasEfectivo = rawSummaryRows.reduce((acc, row) => {
         const method = String(row.metodo_pago || '').toLowerCase();
@@ -1046,39 +3201,151 @@ function renderCutFinancialSections(data = {}, options = {}) {
         if (method === 'mixto') return acc + (total / 2);
         return acc;
     }, 0);
+    const fallbackVentasTarjeta = rawSummaryRows.reduce((acc, row) => {
+        const method = String(row.metodo_pago || '').toLowerCase();
+        const total = Number(row.total || 0);
+        if (method === 'tarjeta') return acc + total;
+        if (method === 'mixto') return acc + (total / 2);
+        if (['dolares', 'transferencia', 'cheque', 'vale'].includes(method)) return acc + total;
+        return acc;
+    }, 0);
+
     const movementSummary = Array.isArray(movements.resumen) ? movements.resumen : [];
     const fallbackEntradas = movementSummary
-        .filter((row) => row.tipo === 'entrada')
+        .filter((row) => String(row.tipo || '').toLowerCase() === 'entrada')
         .reduce((acc, row) => acc + Number(row.total || 0), 0);
     const fallbackSalidas = movementSummary
-        .filter((row) => row.tipo === 'salida')
+        .filter((row) => String(row.tipo || '').toLowerCase() === 'salida')
         .reduce((acc, row) => acc + Number(row.total || 0), 0);
     const fallbackAbonos = movementSummary
-        .filter((row) => row.tipo === 'abono')
+        .filter((row) => String(row.tipo || '').toLowerCase() === 'abono')
+        .reduce((acc, row) => acc + Number(row.total || 0), 0);
+    const fallbackDevoluciones = movementSummary
+        .filter((row) => String(row.tipo || '').toLowerCase().includes('devol'))
         .reduce((acc, row) => acc + Number(row.total || 0), 0);
     const fallbackTotalVendido = Number(data.totales?.total || 0);
     const fallbackGanancia = departments.reduce((acc, row) => acc + Number(row.ganancia || 0), 0);
 
     const fondoCaja = Number(financial.fondo_caja ?? data.monto_inicial ?? 0);
     const ventasEfectivo = Number(financial.ventas_efectivo ?? fallbackVentasEfectivo);
+    const ventasTarjeta = Number(financial.ventas_tarjeta ?? fallbackVentasTarjeta);
     const abonosEfectivo = Number(financial.abonos_efectivo ?? fallbackAbonos);
     const entradasDinero = Number(financial.entradas_dinero ?? fallbackEntradas);
     const salidasDinero = Number(financial.salidas_dinero ?? fallbackSalidas);
+    const devolucionesVentas = Number(financial.devoluciones_ventas ?? financial.devoluciones ?? fallbackDevoluciones);
     const totalVendido = Number(financial.total_vendido ?? fallbackTotalVendido);
     const gananciaVentas = Number(financial.ganancia_ventas ?? fallbackGanancia);
+    const totalDepartamentos = departments.reduce((acc, row) => acc + Number(row.total_vendido || 0), 0);
     const dineroEnCaja = Number(
         financial.ventas_totales_dinero_en_caja
         ?? (fondoCaja + ventasEfectivo + abonosEfectivo + entradasDinero - salidasDinero)
     );
+    const mixedDetails = buildMixedSalesDetails(detailRows, mixedRowsFromServer);
+    let mixedTotals = {
+        count: Number(mixedDetails?.totals?.count || 0),
+        efectivo: Number(mixedDetails?.totals?.efectivo || 0),
+        tarjeta: Number(mixedDetails?.totals?.tarjeta || 0),
+        total: Number(mixedDetails?.totals?.total || 0),
+    };
+    let mixedRows = Array.isArray(mixedDetails?.rows) ? mixedDetails.rows : [];
+
+    const serverMixedSummary = data?.resumen_mixto || {};
+    const hasServerMixedSummary = [
+        'count',
+        'ventas_mixtas',
+        'efectivo',
+        'efectivo_mixto',
+        'tarjeta',
+        'tarjeta_mixto',
+        'total',
+        'total_mixto',
+    ].some((key) => serverMixedSummary?.[key] !== undefined && serverMixedSummary?.[key] !== null);
+    const serverMixedCount = Number(serverMixedSummary?.count ?? serverMixedSummary?.ventas_mixtas ?? 0);
+    const serverMixedEfectivo = Number(serverMixedSummary?.efectivo ?? serverMixedSummary?.efectivo_mixto ?? 0);
+    const serverMixedTarjeta = Number(serverMixedSummary?.tarjeta ?? serverMixedSummary?.tarjeta_mixto ?? 0);
+    const serverMixedTotal = Number(
+        serverMixedSummary?.total
+        ?? serverMixedSummary?.total_mixto
+        ?? (serverMixedEfectivo + serverMixedTarjeta)
+    );
+    const summaryMixedRow = rawSummaryRows.find((row) => String(row?.metodo_pago || '').trim().toLowerCase() === 'mixto') || null;
+    const summaryMixedCount = Number(summaryMixedRow?.transacciones || 0);
+    const summaryMixedTotal = Number(summaryMixedRow?.total || 0);
+    if (hasServerMixedSummary) {
+        mixedTotals = {
+            count: Math.max(0, serverMixedCount),
+            efectivo: Math.max(0, serverMixedEfectivo),
+            tarjeta: Math.max(0, serverMixedTarjeta),
+            total: Math.max(0, serverMixedTotal),
+        };
+    }
+    if (!hasServerMixedSummary && mixedTotals.count <= 0 && summaryMixedCount > 0) {
+        mixedTotals.count = Math.max(0, summaryMixedCount);
+        mixedTotals.total = Math.max(0, summaryMixedTotal);
+        if (mixedTotals.efectivo <= 0 && mixedTotals.tarjeta <= 0) {
+            const financialMixedTotal = Math.max(0, ventasEfectivo) + Math.max(0, ventasTarjeta);
+            if (financialMixedTotal > 0 && Math.abs(financialMixedTotal - mixedTotals.total) <= 1) {
+                mixedTotals.efectivo = Math.max(0, ventasEfectivo);
+                mixedTotals.tarjeta = Math.max(0, ventasTarjeta);
+                mixedTotals.total = financialMixedTotal;
+            } else if (mixedTotals.total > 0) {
+                const halfCash = Math.round(mixedTotals.total / 2);
+                mixedTotals.efectivo = halfCash;
+                mixedTotals.tarjeta = Math.max(0, mixedTotals.total - halfCash);
+            }
+        } else if (mixedTotals.total <= 0) {
+            mixedTotals.total = Math.max(0, Number(mixedTotals.efectivo || 0) + Number(mixedTotals.tarjeta || 0));
+        }
+    }
+    if (!hasServerMixedSummary && mixedTotals.count <= 0) {
+        const totalTx = Number(data?.totales?.transacciones || 0);
+        const cashSummary = rawSummaryRows
+            .filter((row) => String(row?.metodo_pago || '').trim().toLowerCase() === 'efectivo')
+            .reduce((acc, row) => {
+                acc.tx += Number(row?.transacciones || 0);
+                acc.total += Number(row?.total || 0);
+                return acc;
+            }, { tx: 0, total: 0 });
+        const cardSummary = rawSummaryRows
+            .filter((row) => String(row?.metodo_pago || '').trim().toLowerCase() === 'tarjeta')
+            .reduce((acc, row) => {
+                acc.tx += Number(row?.transacciones || 0);
+                acc.total += Number(row?.total || 0);
+                return acc;
+            }, { tx: 0, total: 0 });
+        const mixedLowerBound = Math.max(0, Number(cashSummary.tx || 0) + Number(cardSummary.tx || 0) - totalTx);
+        if (mixedLowerBound > 0) {
+            mixedTotals.count = mixedLowerBound;
+        }
+        if (totalTx > 0 && cashSummary.tx === totalTx && cardSummary.tx === totalTx) {
+            mixedTotals = {
+                count: totalTx,
+                efectivo: Number(cashSummary.total || 0),
+                tarjeta: Number(cardSummary.total || 0),
+                total: Number(cashSummary.total || 0) + Number(cardSummary.total || 0),
+            };
+            if (!mixedRows.length && totalTx === 1) {
+                mixedRows = [{
+                    saleId: 0,
+                    ticket: String(detailRows?.[0]?.numero_ticket || '-').trim() || '-',
+                    efectivo: Number(cashSummary.total || 0),
+                    tarjeta: Number(cardSummary.total || 0),
+                }];
+            }
+        }
+    }
+
+    if (salesKpi) salesKpi.textContent = formatCurrency(totalVendido);
+    if (profitKpi) profitKpi.textContent = formatCurrency(gananciaVentas);
 
     if (cashList) {
         cashList.innerHTML = '';
         [
-            `Fondo de caja (caja inicial): ${fondoCaja.toFixed(0)}`,
-            `Ventas en efectivo: ${ventasEfectivo.toFixed(0)}`,
-            `Abonos en efectivo: ${abonosEfectivo.toFixed(0)}`,
-            `Entrada de dinero: ${entradasDinero.toFixed(0)}`,
-            `Salida de dinero: ${salidasDinero.toFixed(0)}`,
+            `Fondo de caja: ${formatCurrency(fondoCaja)}`,
+            `Ventas en efectivo: ${formatCurrency(ventasEfectivo)}`,
+            `Abonos en efectivo: ${formatCurrency(abonosEfectivo)}`,
+            `Entradas de efectivo: ${formatSignedCurrency(entradasDinero, '+')}`,
+            `Salidas de efectivo: ${formatSignedCurrency(salidasDinero, '-')}`,
         ].forEach((text) => {
             const li = document.createElement('li');
             li.textContent = text;
@@ -1086,14 +3353,15 @@ function renderCutFinancialSections(data = {}, options = {}) {
         });
     }
     if (cashTotal) {
-        cashTotal.textContent = `Total (Ventas Totales / Dinero en caja): $${dineroEnCaja.toFixed(0)}`;
+        cashTotal.textContent = `Total en caja: ${formatCurrency(dineroEnCaja)}`;
     }
 
     if (profitList) {
         profitList.innerHTML = '';
         [
-            `Total vendido: $${totalVendido.toFixed(0)}`,
-            `Ganancia de productos vendidos: $${gananciaVentas.toFixed(0)}`,
+            `En efectivo: ${formatCurrency(ventasEfectivo)}`,
+            `Con tarjeta credito/debito: ${formatCurrency(ventasTarjeta)}`,
+            `Devoluciones: ${formatSignedCurrency(devolucionesVentas, '-')}`,
         ].forEach((text) => {
             const li = document.createElement('li');
             li.textContent = text;
@@ -1101,7 +3369,26 @@ function renderCutFinancialSections(data = {}, options = {}) {
         });
     }
     if (profitTotal) {
-        profitTotal.textContent = `Total (Ganancia / Ventas): $${gananciaVentas.toFixed(0)}`;
+        profitTotal.textContent = `Total ventas: ${formatCurrency(totalVendido)}`;
+    }
+    if (mixedSummaryList) {
+        console.log(`${mixedTotals.count }  venta(s)`);
+        console.log(`${mixedTotals.efectivo }  venta(s)`);
+        console.log(`${mixedTotals.tarjeta }  venta(s)`);
+
+        mixedSummaryList.innerHTML = '';
+        [
+            `Ventas mixtas: ${mixedTotals.count} venta(s)`,
+            `Efectivo (mixto): ${formatCurrency(mixedTotals.efectivo)}`,
+            `Tarjeta (mixto): ${formatCurrency(mixedTotals.tarjeta)}`,
+        ].forEach((text) => {
+            const li = document.createElement('li');
+            li.textContent = text;
+            mixedSummaryList.appendChild(li);
+        });
+    }
+    if (mixedSummaryTotal) {
+        mixedSummaryTotal.textContent = `Total mixto: ${formatCurrency(mixedTotals.total)}`;
     }
 
     if (incomeList) {
@@ -1109,12 +3396,19 @@ function renderCutFinancialSections(data = {}, options = {}) {
         const incomeRows = Array.isArray(movements.detalle_ingresos) ? movements.detalle_ingresos : [];
         if (incomeRows.length === 0) {
             const li = document.createElement('li');
-            li.textContent = 'Sin ingresos manuales registrados en el alcance seleccionado.';
+            li.textContent = 'Sin entradas registradas en el alcance seleccionado.';
             incomeList.appendChild(li);
         } else {
             incomeRows.forEach((row) => {
                 const li = document.createElement('li');
-                li.textContent = `${row.fecha || ''} | ${row.tipo || ''} | ${row.metodo || ''} | $${Number(row.monto || 0).toFixed(0)} ${row.descripcion ? `| ${row.descripcion}` : ''}`;
+                const detailParts = [
+                    row.fecha || '',
+                    row.tipo || '',
+                    row.metodo || '',
+                    formatCurrency(Number(row.monto || 0)),
+                ];
+                if (row.descripcion) detailParts.push(row.descripcion);
+                li.textContent = detailParts.join(' | ');
                 incomeList.appendChild(li);
             });
         }
@@ -1130,7 +3424,13 @@ function renderCutFinancialSections(data = {}, options = {}) {
         } else {
             expenseRows.forEach((row) => {
                 const li = document.createElement('li');
-                li.textContent = `${row.fecha || ''} | ${row.metodo || ''} | $${Number(row.monto || 0).toFixed(0)} ${row.descripcion ? `| ${row.descripcion}` : ''}`;
+                const detailParts = [
+                    row.fecha || '',
+                    row.metodo || '',
+                    formatCurrency(Number(row.monto || 0)),
+                ];
+                if (row.descripcion) detailParts.push(row.descripcion);
+                li.textContent = detailParts.join(' | ');
                 expenseList.appendChild(li);
             });
         }
@@ -1145,48 +3445,517 @@ function renderCutFinancialSections(data = {}, options = {}) {
         } else {
             departments.forEach((row) => {
                 const li = document.createElement('li');
-                li.textContent = `${row.departamento || 'Sin departamento'}: $${Number(row.total_vendido || 0).toFixed(0)}`;
+                li.textContent = `${row.departamento || 'Sin departamento'}: ${formatCurrency(Number(row.total_vendido || 0))}`;
                 departmentList.appendChild(li);
             });
         }
     }
-
-    if (topProductsByDepartmentList) {
-        topProductsByDepartmentList.innerHTML = '';
-        if (topProductsByDepartmentRows.length === 0) {
+    if (departmentTotal) {
+        departmentTotal.textContent = `Total ventas por departamento: ${formatCurrency(totalDepartamentos)}`;
+    }
+    if (mixedTicketList) {
+        mixedTicketList.innerHTML = '';
+        if (!mixedRows.length && mixedTotals.count > 0) {
             const li = document.createElement('li');
-            li.textContent = 'Sin ventas de productos por departamento en la sesion actual.';
-            topProductsByDepartmentList.appendChild(li);
+            li.textContent = 'Hay ventas mixtas en el resumen, pero no se pudo reconstruir el detalle por ticket.';
+            mixedTicketList.appendChild(li);
+        } else if (!mixedRows.length) {
+            const li = document.createElement('li');
+            li.textContent = 'Sin ventas mixtas para el alcance seleccionado.';
+            mixedTicketList.appendChild(li);
         } else {
-            const grouped = {};
-            topProductsByDepartmentRows.forEach((row) => {
-                const departmentName = String(row.departamento || 'Sin departamento').trim() || 'Sin departamento';
-                if (!grouped[departmentName]) {
-                    grouped[departmentName] = [];
-                }
-                grouped[departmentName].push({
-                    producto: String(row.producto || 'Producto').trim() || 'Producto',
-                    cantidad: Number(row.cantidad_vendida || 0),
-                });
+            mixedRows.forEach((row) => {
+                const ticketLabel = String(row.ticket || row.saleId || '-').trim();
+                const totalMixto = Number(row.total || 0) > 0
+                    ? Number(row.total || 0)
+                    : (Number(row.efectivo || 0) + Number(row.tarjeta || 0));
+                const li = document.createElement('li');
+                li.textContent = `Ticket ${ticketLabel}: efectivo ${formatCurrency(row.efectivo)} | tarjeta ${formatCurrency(row.tarjeta)} | total ${formatCurrency(totalMixto)}`;
+                mixedTicketList.appendChild(li);
             });
-
-            Object.keys(grouped)
-                .sort((a, b) => a.localeCompare(b, 'es'))
-                .forEach((departmentName) => {
-                    const topItems = grouped[departmentName]
-                        .sort((a, b) => {
-                            if (b.cantidad !== a.cantidad) return b.cantidad - a.cantidad;
-                            return a.producto.localeCompare(b.producto, 'es');
-                        })
-                        .slice(0, 3);
-                    if (!topItems.length) return;
-                    const li = document.createElement('li');
-                    li.textContent = `${departmentName}: ${topItems.map((item, idx) => `${idx + 1}. ${item.producto} (${item.cantidad.toFixed(0)})`).join(' | ')}`;
-                    topProductsByDepartmentList.appendChild(li);
-                });
         }
     }
+    if (mixedTicketTotal) {
+        mixedTicketTotal.textContent = `Tickets mixtos: ${mixedTotals.count} | Total: ${formatCurrency(mixedTotals.total)}`;
+    }
+    if (topProductsByDepartmentList) topProductsByDepartmentList.innerHTML = '';
 }
+
+function getCutCalculatorPopupElements() {
+    return {
+        container: document.getElementById('cut-view'),
+        popup: document.getElementById('cut-calculator-popup'),
+        display: document.getElementById('cut-calc-display'),
+        historyList: document.getElementById('cut-calc-history-list'),
+        dragHandle: document.getElementById('cut-calculator-drag-handle'),
+    };
+}
+
+function sanitizeCutCalculatorHistoryRows(rows) {
+    if (!Array.isArray(rows)) return [];
+    return rows
+        .map((row) => ({
+            expression: String(row?.expression || '').trim().slice(0, 80),
+            result: String(row?.result || '').trim().slice(0, 40),
+        }))
+        .filter((row) => row.expression && row.result)
+        .slice(0, CUT_CALCULATOR_HISTORY_LIMIT);
+}
+
+function loadCutCalculatorHistoryFromStorage() {
+    try {
+        const raw = localStorage.getItem(CUT_CALCULATOR_HISTORY_KEY);
+        if (!raw) return [];
+        const parsed = JSON.parse(raw);
+        return sanitizeCutCalculatorHistoryRows(parsed);
+    } catch (_) {
+        return [];
+    }
+}
+
+function saveCutCalculatorHistoryToStorage() {
+    try {
+        localStorage.setItem(CUT_CALCULATOR_HISTORY_KEY, JSON.stringify(cutCalculatorState.history.slice(0, CUT_CALCULATOR_HISTORY_LIMIT)));
+    } catch (_) {
+    }
+}
+
+function renderCutCalculatorHistory() {
+    const { historyList } = getCutCalculatorPopupElements();
+    if (!historyList) return;
+    historyList.innerHTML = '';
+    const rows = sanitizeCutCalculatorHistoryRows(cutCalculatorState.history);
+    cutCalculatorState.history = rows;
+
+    if (!rows.length) {
+        const li = document.createElement('li');
+        li.className = 'cut-calc-history-empty';
+        li.textContent = 'Sin cuentas recientes.';
+        historyList.appendChild(li);
+        return;
+    }
+
+    rows.forEach((row) => {
+        const li = document.createElement('li');
+        li.textContent = `${row.expression} = ${row.result}`;
+        historyList.appendChild(li);
+    });
+}
+
+function renderCutCalculatorDisplay() {
+    const { display } = getCutCalculatorPopupElements();
+    if (!display) return;
+    display.value = cutCalculatorState.expression || '0';
+}
+
+function showCutCalculatorError() {
+    const { display } = getCutCalculatorPopupElements();
+    if (!display) return;
+    display.value = 'Error';
+    if (cutCalculatorState.errorTimer) {
+        clearTimeout(cutCalculatorState.errorTimer);
+    }
+    cutCalculatorState.errorTimer = setTimeout(() => {
+        cutCalculatorState.errorTimer = null;
+        renderCutCalculatorDisplay();
+    }, 900);
+}
+
+function formatCutCalculatorResult(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return null;
+    const rounded = Math.round((numeric + Number.EPSILON) * 1000000) / 1000000;
+    return String(rounded);
+}
+
+function addCutCalculatorHistoryEntry(expression, resultText) {
+    const normalizedExpression = String(expression || '').trim().slice(0, 80);
+    const normalizedResult = String(resultText || '').trim().slice(0, 40);
+    if (!normalizedExpression || !normalizedResult) return;
+
+    const nextRows = [
+        { expression: normalizedExpression, result: normalizedResult },
+        ...cutCalculatorState.history.filter((row) => !(row.expression === normalizedExpression && row.result === normalizedResult)),
+    ].slice(0, CUT_CALCULATOR_HISTORY_LIMIT);
+
+    cutCalculatorState.history = nextRows;
+    saveCutCalculatorHistoryToStorage();
+    renderCutCalculatorHistory();
+}
+
+function evaluateCutCalculatorExpression(expression) {
+    const source = String(expression || '').trim();
+    if (!source) throw new Error('Expresion vacia');
+    if (!/^[0-9+\-*/().\s]+$/.test(source)) throw new Error('Expresion invalida');
+    if (!/[0-9]/.test(source)) throw new Error('Expresion invalida');
+    if (/[+\-*/.]$/.test(source)) throw new Error('Expresion incompleta');
+    const evaluator = new Function('"use strict"; return (' + source + ');');
+    const result = Number(evaluator());
+    if (!Number.isFinite(result)) throw new Error('Resultado invalido');
+    return result;
+}
+
+function appendCutCalculatorDigit(digitValue) {
+    const token = String(digitValue || '');
+    if (!/^\d$/.test(token)) return;
+
+    if (cutCalculatorState.justEvaluated) {
+        cutCalculatorState.expression = '';
+        cutCalculatorState.justEvaluated = false;
+    }
+
+    cutCalculatorState.expression += token;
+    renderCutCalculatorDisplay();
+}
+
+function appendCutCalculatorDecimal() {
+    if (cutCalculatorState.justEvaluated) {
+        cutCalculatorState.expression = '';
+        cutCalculatorState.justEvaluated = false;
+    }
+
+    const source = String(cutCalculatorState.expression || '');
+    const segment = source.split(/[+\-*/]/).pop() || '';
+    if (segment.includes('.')) return;
+
+    if (!source || /[+\-*/]$/.test(source)) {
+        cutCalculatorState.expression += '0.';
+    } else {
+        cutCalculatorState.expression += '.';
+    }
+    renderCutCalculatorDisplay();
+}
+
+function appendCutCalculatorOperator(operatorValue) {
+    const token = String(operatorValue || '');
+    if (!['+', '-', '*', '/'].includes(token)) return;
+
+    let source = String(cutCalculatorState.expression || '');
+    if (!source) {
+        if (token === '-') {
+            cutCalculatorState.expression = '-';
+            cutCalculatorState.justEvaluated = false;
+            renderCutCalculatorDisplay();
+        }
+        return;
+    }
+
+    if (cutCalculatorState.justEvaluated) {
+        cutCalculatorState.justEvaluated = false;
+    }
+
+    if (/[+\-*/]$/.test(source)) {
+        source = source.slice(0, -1);
+    }
+
+    cutCalculatorState.expression = `${source}${token}`;
+    renderCutCalculatorDisplay();
+}
+
+function runCutCalculatorEquals() {
+    const source = String(cutCalculatorState.expression || '').trim();
+    if (!source) return;
+
+    try {
+        const resultValue = evaluateCutCalculatorExpression(source);
+        const resultText = formatCutCalculatorResult(resultValue);
+        if (!resultText) {
+            showCutCalculatorError();
+            return;
+        }
+        const printableExpression = source.replace(/\*/g, 'x').replace(/\//g, '/');
+        addCutCalculatorHistoryEntry(printableExpression, resultText);
+        cutCalculatorState.expression = resultText;
+        cutCalculatorState.justEvaluated = true;
+        renderCutCalculatorDisplay();
+    } catch (_) {
+        cutCalculatorState.expression = '';
+        cutCalculatorState.justEvaluated = false;
+        showCutCalculatorError();
+    }
+}
+
+function handleCutCalculatorAction(action, value = '') {
+    const normalizedAction = String(action || '').trim().toLowerCase();
+    if (!normalizedAction) return;
+
+    if (normalizedAction === 'digit') {
+        appendCutCalculatorDigit(value);
+        return;
+    }
+    if (normalizedAction === 'decimal') {
+        appendCutCalculatorDecimal();
+        return;
+    }
+    if (normalizedAction === 'operator') {
+        appendCutCalculatorOperator(value);
+        return;
+    }
+    if (normalizedAction === 'clear') {
+        cutCalculatorState.expression = '';
+        cutCalculatorState.justEvaluated = false;
+        renderCutCalculatorDisplay();
+        return;
+    }
+    if (normalizedAction === 'backspace') {
+        if (cutCalculatorState.justEvaluated) {
+            cutCalculatorState.expression = '';
+            cutCalculatorState.justEvaluated = false;
+            renderCutCalculatorDisplay();
+            return;
+        }
+        cutCalculatorState.expression = String(cutCalculatorState.expression || '').slice(0, -1);
+        renderCutCalculatorDisplay();
+        return;
+    }
+    if (normalizedAction === 'equals') {
+        runCutCalculatorEquals();
+    }
+}
+
+function isEditableFieldElement(target) {
+    if (!target) return false;
+    if (target.isContentEditable) return true;
+    const tag = String(target.tagName || '').toLowerCase();
+    return tag === 'input' || tag === 'textarea' || tag === 'select';
+}
+
+function mapCutCalculatorKeyboardAction(event) {
+    if (!event) return null;
+    if (event.ctrlKey || event.metaKey || event.altKey) return null;
+
+    const key = String(event.key || '');
+    const code = String(event.code || '');
+    if (/^\d$/.test(key)) {
+        return { action: 'digit', value: key };
+    }
+    if (/^Numpad\d$/.test(code)) {
+        return { action: 'digit', value: code.replace('Numpad', '') };
+    }
+
+    if (key === '.' || key === ',' || code === 'NumpadDecimal') {
+        return { action: 'decimal' };
+    }
+    if (key === '+' || code === 'NumpadAdd') {
+        return { action: 'operator', value: '+' };
+    }
+    if (key === '-' || code === 'NumpadSubtract') {
+        return { action: 'operator', value: '-' };
+    }
+    if (key === '*' || key.toLowerCase() === 'x' || code === 'NumpadMultiply') {
+        return { action: 'operator', value: '*' };
+    }
+    if (key === '/' || code === 'NumpadDivide') {
+        return { action: 'operator', value: '/' };
+    }
+    if (key === 'Backspace') {
+        return { action: 'backspace' };
+    }
+    if (key === 'Delete') {
+        return { action: 'clear' };
+    }
+    if (key === 'Enter' || key === '=' || code === 'NumpadEnter') {
+        return { action: 'equals' };
+    }
+    if (key === 'Escape') {
+        return { action: 'close' };
+    }
+
+    return null;
+}
+
+function onCutCalculatorKeyDown(event) {
+    const { popup } = getCutCalculatorPopupElements();
+    if (!popup || popup.classList.contains('hidden')) return;
+
+    const target = event.target;
+    const focusInsideCalculator = Boolean(target && popup.contains(target));
+    if (!focusInsideCalculator && isEditableFieldElement(target)) {
+        return;
+    }
+
+    const mapped = mapCutCalculatorKeyboardAction(event);
+    if (!mapped) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    if (mapped.action === 'close') {
+        closeCutCalculatorPopup();
+        return;
+    }
+
+    handleCutCalculatorAction(mapped.action, mapped.value || '');
+}
+
+function clampCutCalculatorPosition(left, top, container, popup) {
+    const margin = 8;
+    const maxLeft = Math.max(margin, container.clientWidth - popup.offsetWidth - margin);
+    const maxTop = Math.max(margin, container.clientHeight - popup.offsetHeight - margin);
+    return {
+        left: Math.max(margin, Math.min(left, maxLeft)),
+        top: Math.max(margin, Math.min(top, maxTop)),
+    };
+}
+
+function placeCutCalculatorDefaultPosition() {
+    const { container, popup } = getCutCalculatorPopupElements();
+    if (!container || !popup) return;
+    const desiredLeft = container.clientWidth - popup.offsetWidth - 12;
+    const desiredTop = 112;
+    const clamped = clampCutCalculatorPosition(desiredLeft, desiredTop, container, popup);
+    popup.style.left = `${clamped.left}px`;
+    popup.style.top = `${clamped.top}px`;
+    popup.style.right = 'auto';
+}
+
+function keepCutCalculatorInsideContainer() {
+    const { container, popup } = getCutCalculatorPopupElements();
+    if (!container || !popup) return;
+    const currentLeft = Number.parseFloat(popup.style.left);
+    const currentTop = Number.parseFloat(popup.style.top);
+    if (!Number.isFinite(currentLeft) || !Number.isFinite(currentTop)) {
+        placeCutCalculatorDefaultPosition();
+        return;
+    }
+    const clamped = clampCutCalculatorPosition(currentLeft, currentTop, container, popup);
+    popup.style.left = `${clamped.left}px`;
+    popup.style.top = `${clamped.top}px`;
+    popup.style.right = 'auto';
+}
+
+function endCutCalculatorDrag(pointerId = null) {
+    const { popup } = getCutCalculatorPopupElements();
+    if (popup && pointerId !== null && popup.hasPointerCapture?.(pointerId)) {
+        try {
+            popup.releasePointerCapture(pointerId);
+        } catch (_) {
+        }
+    }
+    cutCalculatorState.dragPointerId = null;
+    document.removeEventListener('pointermove', onCutCalculatorDragMove);
+    document.removeEventListener('pointerup', onCutCalculatorDragEnd);
+    document.removeEventListener('pointercancel', onCutCalculatorDragEnd);
+}
+
+function onCutCalculatorDragMove(event) {
+    if (cutCalculatorState.dragPointerId === null || event.pointerId !== cutCalculatorState.dragPointerId) {
+        return;
+    }
+    const { container, popup } = getCutCalculatorPopupElements();
+    if (!container || !popup) return;
+
+    const containerRect = container.getBoundingClientRect();
+    const targetLeft = event.clientX - containerRect.left - cutCalculatorState.dragOffsetX;
+    const targetTop = event.clientY - containerRect.top - cutCalculatorState.dragOffsetY;
+    const clamped = clampCutCalculatorPosition(targetLeft, targetTop, container, popup);
+    popup.style.left = `${clamped.left}px`;
+    popup.style.top = `${clamped.top}px`;
+    popup.style.right = 'auto';
+}
+
+function onCutCalculatorDragEnd(event) {
+    if (cutCalculatorState.dragPointerId === null || event.pointerId !== cutCalculatorState.dragPointerId) {
+        return;
+    }
+    endCutCalculatorDrag(event.pointerId);
+}
+
+function startCutCalculatorDrag(event) {
+    if (event.button !== 0) return;
+    const { container, popup } = getCutCalculatorPopupElements();
+    if (!container || !popup || popup.classList.contains('hidden')) return;
+    event.preventDefault();
+
+    const popupRect = popup.getBoundingClientRect();
+    cutCalculatorState.dragPointerId = event.pointerId;
+    cutCalculatorState.dragOffsetX = event.clientX - popupRect.left;
+    cutCalculatorState.dragOffsetY = event.clientY - popupRect.top;
+    cutCalculatorState.manualPositioned = true;
+
+    popup.setPointerCapture?.(event.pointerId);
+    document.addEventListener('pointermove', onCutCalculatorDragMove);
+    document.addEventListener('pointerup', onCutCalculatorDragEnd);
+    document.addEventListener('pointercancel', onCutCalculatorDragEnd);
+}
+
+function closeCutCalculatorPopup(options = {}) {
+    const resetPosition = Boolean(options?.resetPosition);
+    const { popup } = getCutCalculatorPopupElements();
+    if (!popup) return;
+    popup.classList.add('hidden');
+    popup.setAttribute('aria-hidden', 'true');
+    endCutCalculatorDrag(cutCalculatorState.dragPointerId);
+    if (resetPosition) {
+        cutCalculatorState.manualPositioned = false;
+        popup.style.left = '';
+        popup.style.top = '';
+        popup.style.right = '';
+    }
+}
+
+function setupCutCalculatorPopup() {
+    const { popup, display, historyList, dragHandle } = getCutCalculatorPopupElements();
+    if (!popup || !display || !historyList || !dragHandle) return;
+    if (popup.dataset.cutCalculatorReady === '1') return;
+
+    popup.dataset.cutCalculatorReady = '1';
+    cutCalculatorState.history = loadCutCalculatorHistoryFromStorage();
+    renderCutCalculatorHistory();
+    renderCutCalculatorDisplay();
+
+    popup.addEventListener('click', (event) => {
+        const target = event.target?.closest?.('[data-cut-calc-action]');
+        if (!target) return;
+        const action = String(target.getAttribute('data-cut-calc-action') || '');
+        const value = String(target.getAttribute('data-cut-calc-value') || '');
+        handleCutCalculatorAction(action, value);
+    });
+
+    dragHandle.addEventListener('pointerdown', (event) => {
+        const closeButton = event.target?.closest?.('.cut-calc-close-btn');
+        if (closeButton) return;
+        startCutCalculatorDrag(event);
+    });
+
+    document.addEventListener('keydown', onCutCalculatorKeyDown, true);
+
+    window.addEventListener('resize', () => {
+        const { popup: currentPopup } = getCutCalculatorPopupElements();
+        if (!currentPopup || currentPopup.classList.contains('hidden')) return;
+        if (!cutCalculatorState.manualPositioned) {
+            placeCutCalculatorDefaultPosition();
+        } else {
+            keepCutCalculatorInsideContainer();
+        }
+    });
+}
+
+function toggleCutCalculatorPopup() {
+    setupCutCalculatorPopup();
+    const { popup } = getCutCalculatorPopupElements();
+    if (!popup) return;
+
+    if (popup.classList.contains('hidden')) {
+        popup.classList.remove('hidden');
+        popup.setAttribute('aria-hidden', 'false');
+        renderCutCalculatorDisplay();
+        renderCutCalculatorHistory();
+        requestAnimationFrame(() => {
+            if (!cutCalculatorState.manualPositioned) {
+                placeCutCalculatorDefaultPosition();
+            } else {
+                keepCutCalculatorInsideContainer();
+            }
+        });
+        return;
+    }
+
+    closeCutCalculatorPopup();
+}
+
+window.toggleCutCalculatorPopup = toggleCutCalculatorPopup;
+window.closeCutCalculatorPopup = closeCutCalculatorPopup;
 
 function resetCutViewToInitialState() {
     const cutSummary = document.getElementById('cut-summary');
@@ -1195,14 +3964,17 @@ function resetCutViewToInitialState() {
     const breakdownList = document.getElementById('cut-close-breakdown');
     const detailBody = document.getElementById('cut-close-detail-body');
     const closeBtn = document.getElementById('cut-close-shift-btn');
+    const printBtn = document.getElementById('cut-print-session-btn');
 
+    closeCutCalculatorPopup({ resetPosition: true });
     const today = cutCloseContext.currentDate || new Date().toISOString().slice(0, 10);
-    if (cutSummary) cutSummary.textContent = `Fecha ${today}`;
+    if (cutSummary) cutSummary.textContent = 'Sin datos cargados.';
     if (cutBreakdown) cutBreakdown.innerHTML = '';
     if (scopeInfo) scopeInfo.textContent = 'Selecciona una opcion para cargar el resumen de ventas.';
     if (breakdownList) breakdownList.innerHTML = '';
     if (detailBody) detailBody.innerHTML = '';
     if (closeBtn) closeBtn.disabled = true;
+    if (printBtn) printBtn.disabled = true;
 
     cutCloseContext = {
         scope: null,
@@ -1212,9 +3984,20 @@ function resetCutViewToInitialState() {
         sessionResumenLoaded: false,
         turnStatusLabel: '',
         currentDate: today,
+        sessionReportSnapshot: null,
+        historicalCutId: null,
     };
 
+    updateCutHeadline({
+        cashierName: getCurrentCutCashierLabel(),
+        dateIso: today,
+        startTime: '',
+        endTime: '',
+        statusText: '',
+    });
+    updateCutSessionContext({ visible: false });
     renderCutFinancialSections({}, { clearOnly: true });
+    refreshCutCloseButtonState();
 }
 
 window.resetCutViewToInitialState = resetCutViewToInitialState;
@@ -1247,11 +4030,25 @@ function parseMoneyInputValue(rawValue) {
     return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function roundClpAmount(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return 0;
+    return Math.round(numeric);
+}
+
+function getCartItemSubtotalAmount(item) {
+    const manualSubtotal = Number(item?.line_subtotal);
+    if (Number.isFinite(manualSubtotal) && manualSubtotal > 0) {
+        return roundClpAmount(manualSubtotal);
+    }
+    const unitPrice = Number(item?.precio_venta || 0);
+    const quantity = Number(item?.quantity || 0);
+    return roundClpAmount(unitPrice * quantity);
+}
+
 function getCartTotalAmount() {
     return cart.reduce((sum, item) => {
-        const unitPrice = Number(item.precio_venta || 0);
-        const quantity = Number(item.quantity || 0);
-        return sum + unitPrice * quantity;
+        return sum + getCartItemSubtotalAmount(item);
     }, 0);
 }
 
@@ -1321,38 +4118,47 @@ function resetPaymentInputs() {
 
 function validatePaymentCoverage(totalAmount, metodoPago) {
     if (!Number.isFinite(totalAmount) || totalAmount <= 0) {
-        return { ok: false, missingAmount: 0 };
+        return { ok: false, missingAmount: 0, reason: 'invalid_total' };
     }
     const strictCash = Boolean(Number(window.salePaymentSettings?.cash_strict_amount ?? 0));
 
     if (metodoPago === 'efectivo') {
         if (!strictCash) {
-            return { ok: true, missingAmount: 0 };
+            return { ok: true, missingAmount: 0, reason: '' };
         }
         const efectivo = parseMoneyInputValue(document.getElementById('efectivoEfectivo')?.value);
         const missingAmount = totalAmount - efectivo;
         return {
             ok: missingAmount <= 0,
             missingAmount: Math.max(0, missingAmount),
+            reason: missingAmount <= 0 ? '' : 'missing_amount',
         };
     }
 
     if (metodoPago === 'mixto') {
-        const efectivo = parseMoneyInputValue(document.getElementById('efectivoMixto')?.value);
+        const efectivoPagado = parseMoneyInputValue(document.getElementById('efectivoMixto')?.value);
         const tarjeta = parseMoneyInputValue(document.getElementById('tarjetaMixto')?.value);
-        const paidAmount = efectivo + tarjeta;
-        const missingAmount = totalAmount - paidAmount;
+        if (tarjeta > totalAmount) {
+            return {
+                ok: false,
+                missingAmount: 0,
+                reason: 'card_exceeds_total',
+            };
+        }
+        const efectivoRequerido = Math.max(0, roundClpAmount(totalAmount) - roundClpAmount(tarjeta));
+        const missingAmount = efectivoRequerido - efectivoPagado;
         return {
             ok: missingAmount <= 0,
             missingAmount: Math.max(0, missingAmount),
+            reason: missingAmount <= 0 ? '' : 'missing_cash_for_mixed',
         };
     }
 
-    return { ok: true, missingAmount: 0 };
+    return { ok: true, missingAmount: 0, reason: '' };
 }
 
 function buildPaymentAllocation(totalAmount, metodoPago) {
-    const amount = Number(totalAmount || 0);
+    const amount = roundClpAmount(totalAmount);
     if (!Number.isFinite(amount) || amount <= 0) {
         return { monto_efectivo: 0, monto_tarjeta: 0 };
     }
@@ -1364,51 +4170,468 @@ function buildPaymentAllocation(totalAmount, metodoPago) {
         return { monto_efectivo: 0, monto_tarjeta: amount };
     }
     if (metodoPago === 'mixto') {
-        let efectivo = parseMoneyInputValue(document.getElementById('efectivoMixto')?.value);
-        let tarjeta = parseMoneyInputValue(document.getElementById('tarjetaMixto')?.value);
-        const paid = efectivo + tarjeta;
-
-        if (paid <= 0) {
-            efectivo = amount / 2;
-            tarjeta = amount - efectivo;
-        } else if (Math.abs(paid - amount) > 0.01) {
-            const factor = amount / paid;
-            efectivo = efectivo * factor;
-            tarjeta = amount - efectivo;
-        }
+        const tarjetaIngresada = Math.max(0, roundClpAmount(parseMoneyInputValue(document.getElementById('tarjetaMixto')?.value)));
+        const tarjetaAplicada = Math.max(0, Math.min(amount, tarjetaIngresada));
+        const efectivoAplicado = Math.max(0, amount - tarjetaAplicada);
 
         return {
-            monto_efectivo: Number(efectivo.toFixed(2)),
-            monto_tarjeta: Number(tarjeta.toFixed(2)),
+            monto_efectivo: efectivoAplicado,
+            monto_tarjeta: tarjetaAplicada,
         };
     }
 
     return { monto_efectivo: 0, monto_tarjeta: 0 };
 }
 
-async function printSaleTicket(ventaId, includeDetails) {
-    const payload = {
-        venta_id: ventaId,
-    };
-    if (typeof includeDetails !== 'undefined') {
-        payload.include_details = includeDetails;
-    }
+const LOCAL_PRINT_BRIDGE_CANDIDATES = ['http://127.0.0.1:7357/'];
+let localPrintBridgeState = { base: null, checkedAt: 0 };
+const LOCAL_PRINT_BRIDGE_CACHE_MS = 180000;
 
-    const response = await fetch(API_URL+'api/print/sale-ticket', {
+function getLocalPrintBridgeCandidates() {
+    const custom = String(localStorage.getItem('local_print_bridge_url') || '').trim();
+    if (!custom) return [...LOCAL_PRINT_BRIDGE_CANDIDATES];
+    const normalized = custom.endsWith('/') ? custom : `${custom}/`;
+    return [normalized, ...LOCAL_PRINT_BRIDGE_CANDIDATES];
+}
+
+async function resolveLocalPrintBridgeBase(force = false) {
+    const now = Date.now();
+    const cacheIsFresh = (now - localPrintBridgeState.checkedAt) < LOCAL_PRINT_BRIDGE_CACHE_MS;
+    if (!force && cacheIsFresh) {
+        return localPrintBridgeState.base || null;
+    }
+    const candidates = getLocalPrintBridgeCandidates();
+    for (const base of candidates) {
+        try {
+            const response = await fetch(`${base}health`, { cache: 'no-store' });
+            if (!response.ok) continue;
+            localPrintBridgeState = { base, checkedAt: now };
+            return base;
+        } catch (_) {
+            // continue
+        }
+    }
+    localPrintBridgeState = { base: null, checkedAt: now };
+    return null;
+}
+
+function shouldForceLocalTicketPrinting() {
+    const raw = String(localStorage.getItem('force_local_ticket_print') || '').trim().toLowerCase();
+    if (raw === '0' || raw === 'false' || raw === 'no') {
+        return false;
+    }
+    return true;
+}
+
+function getLocalPrintBridgeRequiredMessage() {
+    return 'No se detecto la impresion local de esta caja. Abre iniciar_impresion_local.bat en este equipo y vuelve a intentar.';
+}
+
+function normalizeTicketPaperWidthMm(value, fallback = 58) {
+    const parsed = Number.parseInt(value, 10);
+    if (!Number.isInteger(parsed)) {
+        return Number(fallback || 58) >= 80 ? 80 : 58;
+    }
+    return parsed >= 80 ? 80 : 58;
+}
+
+function clampTicketFontSizePt(value, fallback = 6.5) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.max(4.5, Math.min(12, parsed));
+}
+
+function isTicketTitleLineForPrint(line = '', index = 0) {
+    const trimmed = String(line || '').trim();
+    if (!trimmed) return false;
+    if (/^[-=]{6,}$/.test(trimmed)) return false;
+    if (index === 0) return true;
+    return /^(DETALLE|TOTAL|ORIGINAL CLIENTE|CORTE DE TURNO|DINERO EN CAJA|ENTRADAS EFECTIVO|SALIDAS EFECTIVO|VENTAS POR DEPTO|VENTAS|RESUMEN|COMPROBANTE DE VENTA|COMPROBANTE|TICKET|TURNO\s*#\d+)$/i.test(trimmed);
+}
+
+function normalizeCutPrintLabelMapForBrowser(raw = {}) {
+    const defaults = {
+        title_cut: 'CORTE DE TURNO',
+        title_cash_box: 'DINERO EN CAJA',
+        title_entries: 'ENTRADAS EFECTIVO',
+        title_exits: 'SALIDAS EFECTIVO',
+        title_sales: 'VENTAS',
+        title_departments: 'VENTAS POR DEPTO',
+        title_report_footer: 'REPORTE DE CORTE',
+        label_shift_prefix: 'TURNO #',
+        label_generated_at: 'Realizado',
+        label_cashier: 'Cajero',
+        label_box: 'Caja',
+        label_schedule: 'Horario',
+        label_sales_total: 'Ventas totales',
+        label_base_fund: 'Fondo de caja',
+        label_cash_sales: 'Ventas en efectivo',
+        label_cash_payments: 'Abonos en efectivo',
+        label_cash_entries: 'Entradas',
+        label_cash_exits: 'Salidas',
+        label_cash_in_box: 'Efectivo en caja',
+        label_total_entries: 'Total entradas',
+        label_total_exits: 'Total salidas',
+        label_detail_title: 'Detalle y suma por item',
+        label_no_entries: 'SIN ENTRADAS DETALLADAS',
+        label_no_exits: 'SIN SALIDAS DETALLADAS',
+        label_hidden_detail: 'DETALLE OCULTO POR CONFIGURACION',
+        label_returns: 'Devoluciones',
+        label_total_sales_line: 'Total ventas',
+        label_no_departments: 'SIN VENTAS POR DEPARTAMENTO',
+        label_report_no_items: 'REPORTE CONFIGURADO SIN ITEMS',
+    };
+    const source = raw && typeof raw === 'object' ? raw : {};
+    const out = {};
+    Object.keys(defaults).forEach((key) => {
+        const value = String(source[key] ?? '').replace(/\s+/g, ' ').trim();
+        out[key] = value || defaults[key];
+    });
+    return out;
+}
+
+function normalizeCutPrintStyleMapForBrowser(raw = {}, labelMap = {}) {
+    const source = raw && typeof raw === 'object' ? raw : {};
+    const out = {};
+    Object.keys(labelMap).forEach((key) => {
+        const row = source[key] && typeof source[key] === 'object' ? source[key] : {};
+        const modeRaw = String(row.mode || '').trim().toLowerCase();
+        const mode = modeRaw === 'bold' || modeRaw === 'italic' ? modeRaw : 'normal';
+        const parsedSize = Number(row.size);
+        const size = Number.isFinite(parsedSize) ? Math.max(0.8, Math.min(1.8, Number(parsedSize.toFixed(2)))) : 1;
+        out[key] = { mode, size };
+    });
+    return out;
+}
+
+function buildCutPrintStyleRulesForBrowser(options = {}) {
+    const labels = normalizeCutPrintLabelMapForBrowser(options.cutPrintLabels || {});
+    const styles = normalizeCutPrintStyleMapForBrowser(options.cutPrintStyles || {}, labels);
+    const rules = [];
+    const addRule = (key, match, text) => {
+        const style = styles[key];
+        const ruleText = String(text || '').trim();
+        if (!style || !ruleText) return;
+        if (style.mode === 'normal' && Math.abs(Number(style.size || 1) - 1) < 0.001) return;
+        rules.push({
+            match: match === 'starts' ? 'starts' : 'exact',
+            text: ruleText,
+            mode: style.mode,
+            size: style.size,
+        });
+    };
+
+    addRule('title_cut', 'exact', labels.title_cut);
+    addRule('title_cash_box', 'exact', labels.title_cash_box);
+    addRule('title_entries', 'exact', labels.title_entries);
+    addRule('title_exits', 'exact', labels.title_exits);
+    addRule('title_sales', 'exact', labels.title_sales);
+    addRule('title_departments', 'exact', labels.title_departments);
+    addRule('title_report_footer', 'exact', labels.title_report_footer);
+    addRule('label_shift_prefix', 'starts', labels.label_shift_prefix);
+    addRule('label_generated_at', 'starts', labels.label_generated_at);
+    addRule('label_cashier', 'starts', labels.label_cashier);
+    addRule('label_box', 'starts', labels.label_box);
+    addRule('label_schedule', 'starts', labels.label_schedule);
+    addRule('label_sales_total', 'starts', labels.label_sales_total);
+    addRule('label_base_fund', 'starts', labels.label_base_fund);
+    addRule('label_cash_sales', 'starts', labels.label_cash_sales);
+    addRule('label_cash_payments', 'starts', labels.label_cash_payments);
+    addRule('label_cash_entries', 'starts', labels.label_cash_entries);
+    addRule('label_cash_exits', 'starts', labels.label_cash_exits);
+    addRule('label_cash_in_box', 'starts', labels.label_cash_in_box);
+    addRule('label_total_entries', 'starts', labels.label_total_entries);
+    addRule('label_total_exits', 'starts', labels.label_total_exits);
+    addRule('label_detail_title', 'exact', labels.label_detail_title);
+    addRule('label_no_entries', 'exact', labels.label_no_entries);
+    addRule('label_no_exits', 'exact', labels.label_no_exits);
+    addRule('label_hidden_detail', 'exact', labels.label_hidden_detail);
+    addRule('label_returns', 'starts', labels.label_returns);
+    addRule('label_total_sales_line', 'starts', labels.label_total_sales_line);
+    addRule('label_no_departments', 'exact', labels.label_no_departments);
+    addRule('label_report_no_items', 'exact', labels.label_report_no_items);
+    return rules;
+}
+
+function getCutCustomLineStyleForBrowser(line = '', rules = []) {
+    if (!Array.isArray(rules) || !rules.length) return null;
+    const trimmed = String(line || '').trim();
+    if (!trimmed) return null;
+    for (let i = 0; i < rules.length; i += 1) {
+        const rule = rules[i];
+        const text = String(rule?.text || '').trim();
+        if (!text) continue;
+        if (rule.match === 'starts') {
+            if (trimmed.toLowerCase().startsWith(text.toLowerCase())) return rule;
+            continue;
+        }
+        if (trimmed.toLowerCase() === text.toLowerCase()) return rule;
+    }
+    return null;
+}
+
+function renderTicketLinesHtml(ticketText = '', options = {}) {
+    const customCutStyleRules = buildCutPrintStyleRulesForBrowser(options);
+    const disableAutoTitleScale = Boolean(options.disableAutoTitleScale || options.cutPrintLabels || options.cutPrintStyles);
+    const lines = String(ticketText || '').replace(/\r\n/g, '\n').split('\n');
+    return lines.map((line, index) => {
+        const customStyleRule = getCutCustomLineStyleForBrowser(line, customCutStyleRules);
+        const isTitle = customStyleRule ? false : (!disableAutoTitleScale && isTicketTitleLineForPrint(line, index));
+        const safeLine = escapeHtml(line || ' ');
+        const customSizeRaw = Number(customStyleRule?.size || 1);
+        const customSize = Number.isFinite(customSizeRaw) ? Math.max(0.8, Math.min(1.8, customSizeRaw)) : 1;
+        const hasTrailingAmount = /[-+]?\s*\$\s*[0-9\.,]+\s*$/i.test(String(line || '').trim());
+        const effectiveCustomSize = hasTrailingAmount ? Math.min(1, customSize) : customSize;
+        const customStyleAttr = customStyleRule
+            ? ` style="font-weight:${customStyleRule.mode === 'bold' ? 700 : 400};font-style:${customStyleRule.mode === 'italic' ? 'italic' : 'normal'};font-size:${effectiveCustomSize.toFixed(2)}em;"`
+            : '';
+        return `<div class="ticket-line${isTitle ? ' ticket-line-title' : ''}"${customStyleAttr}>${safeLine}</div>`;
+    }).join('');
+}
+
+function buildBrowserTicketPrintHtml(ticketText = '', documentTitle = 'Ticket', options = {}) {
+    const paperWidthMm = normalizeTicketPaperWidthMm(options.paperWidthMm, 58);
+    const fontSizePt = clampTicketFontSizePt(options.fontSizePt, 6.5);
+    const ticketHtml = renderTicketLinesHtml(ticketText, options);
+    return `<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>${escapeHtml(documentTitle)}</title>
+  <style>
+    @page { size: ${paperWidthMm}mm auto; margin: 0.6mm 0.5mm; }
+    html, body { margin: 0; padding: 0; background: #fff; }
+    body { width: ${paperWidthMm}mm; font-family: Consolas, "Courier New", monospace; font-size: ${fontSizePt}pt; line-height: 1.18; color: #000; }
+    .ticket-content { width: 98%; margin: 0 auto; padding: 0; }
+    .ticket-line { width: 100%; white-space: pre; font-weight: 400; overflow: hidden; }
+    .ticket-line-title { font-weight: 800; font-size: 1.26em; letter-spacing: 0.2px; }
+  </style>
+</head>
+<body>
+  <div class="ticket-content">${ticketHtml}</div>
+</body>
+</html>`;
+}
+
+async function printTicketTextInBrowser(ticketText = '', documentTitle = 'Ticket', options = {}) {
+    if (!String(ticketText || '').trim()) {
+        throw new Error('No hay contenido para imprimir');
+    }
+    const printWindow = window.open('', '_blank', 'width=460,height=720');
+    if (!printWindow) {
+        throw new Error('El navegador bloqueo la ventana de impresion local. Habilita popups para este sitio.');
+    }
+    const html = buildBrowserTicketPrintHtml(ticketText, documentTitle, options);
+    printWindow.document.open();
+    printWindow.document.write(html);
+    printWindow.document.close();
+    printWindow.focus();
+    setTimeout(() => {
+        try {
+            printWindow.print();
+        } catch (_) {
+        }
+    }, 180);
+    return { success: true, mode: 'browser_local', printer: 'default_browser_printer' };
+}
+
+async function fetchPrintPayload(endpoint, payload, defaultMessage) {
+    const response = await fetch(API_URL + endpoint, {
         method: 'POST',
         headers: {
             ...withAuthHeaders({
                 'Content-Type': 'application/json',
             }),
         },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({ ...payload, return_payload: true }),
     });
-
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
-        throw new Error(data.message || 'No se pudo imprimir el comprobante');
+        throw new Error(data.message || defaultMessage);
+    }
+    if (!data?.ticket_text) {
+        throw new Error('No se pudo generar el texto del ticket para imprimir');
     }
     return data;
+}
+
+async function sendTicketToLocalBridge({ bridgeBase = '', printerName = '', text = '', printEngine = 'auto', fontSize = 6.5 }) {
+    const base = bridgeBase || await resolveLocalPrintBridgeBase();
+    if (!base) {
+        throw new Error('Bridge local no disponible');
+    }
+    const response = await fetch(`${base}api/print/ticket`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            printer_name: String(printerName || '').trim(),
+            text: String(text || ''),
+            print_engine: String(printEngine || 'auto'),
+            font_size: Number(fontSize || 6.5),
+        }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        throw new Error(data.message || 'No se pudo imprimir en el equipo local');
+    }
+    return data;
+}
+
+async function printTicketLocalFirst({
+    payloadData,
+    localSuccessMessage,
+    fallbackEndpoint,
+    fallbackPayload,
+    fallbackErrorMessage,
+}) {
+    const bridgeBase = await resolveLocalPrintBridgeBase(true);
+    const forceLocal = shouldForceLocalTicketPrinting();
+    let localBridgeError = null;
+
+    if (forceLocal) {
+        if (!bridgeBase) {
+            throw new Error(getLocalPrintBridgeRequiredMessage());
+        }
+        try {
+            const localData = await sendTicketToLocalBridge({
+                bridgeBase,
+                printerName: payloadData.printer || '',
+                text: payloadData.ticket_text,
+                printEngine: payloadData.print_engine || 'auto',
+                fontSize: payloadData.font_size || 6.5,
+            });
+            return {
+                message: localSuccessMessage,
+                printer: localData?.printer || payloadData.printer || null,
+                mode: 'local',
+            };
+        } catch (error) {
+            throw new Error(`No se pudo imprimir en la impresora local: ${error.message || 'Error de impresion local'}`);
+        }
+    }
+
+    if (bridgeBase) {
+        try {
+            const localData = await sendTicketToLocalBridge({
+                bridgeBase,
+                printerName: payloadData.printer || '',
+                text: payloadData.ticket_text,
+                printEngine: payloadData.print_engine || 'auto',
+                fontSize: payloadData.font_size || 6.5,
+            });
+            return {
+                message: localSuccessMessage,
+                printer: localData?.printer || payloadData.printer || null,
+                mode: 'local',
+            };
+        } catch (error) {
+            localBridgeError = error;
+        }
+    }
+
+    try {
+        await printTicketTextInBrowser(payloadData.ticket_text, localSuccessMessage, {
+            paperWidthMm: payloadData.paper_width_mm,
+            fontSizePt: payloadData.font_size,
+            cutPrintLabels: payloadData.cut_print_labels || null,
+            cutPrintStyles: payloadData.cut_print_styles || null,
+        });
+        return {
+            message: `${localSuccessMessage} (navegador local)` ,
+            printer: 'predeterminada del navegador',
+            mode: 'browser_local',
+        };
+    } catch (browserError) {
+        if (localBridgeError) {
+            throw new Error(`No se pudo imprimir localmente (bridge y navegador): ${browserError.message}`);
+        }
+    }
+
+    const response = await fetch(API_URL + fallbackEndpoint, {
+        method: 'POST',
+        headers: {
+            ...withAuthHeaders({
+                'Content-Type': 'application/json',
+            }),
+        },
+        body: JSON.stringify(fallbackPayload),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        throw new Error(data.message || fallbackErrorMessage);
+    }
+    return data;
+}
+
+async function printSaleTicket(ventaId, includeDetails) {
+    const cajaRaw = String(localStorage.getItem('n_caja') || localStorage.getItem('caja') || '').trim();
+    const payload = {
+        venta_id: ventaId,
+    };
+    if (/^\d+$/.test(cajaRaw)) {
+        payload.numero_caja = Number(cajaRaw);
+    }
+    if (typeof includeDetails !== 'undefined') {
+        payload.include_details = includeDetails;
+    }
+
+    const payloadData = await fetchPrintPayload('api/print/sale-ticket', payload, 'No se pudo generar el ticket para imprimir');
+    return printTicketLocalFirst({
+        payloadData,
+        localSuccessMessage: 'Ticket enviado a impresion local',
+        fallbackEndpoint: 'api/print/sale-ticket',
+        fallbackPayload: payload,
+        fallbackErrorMessage: 'No se pudo imprimir el comprobante',
+    });
+}
+
+async function printCutSessionTicket() {
+    const cajaRaw = String(localStorage.getItem('n_caja') || localStorage.getItem('caja') || '').trim();
+    const cajeroRaw = String(localStorage.getItem('id_user') || '').trim();
+    const payload = {};
+    if (/^\d+$/.test(cajaRaw)) {
+        payload.numero_caja = Number(cajaRaw);
+    }
+    if (/^\d+$/.test(cajeroRaw)) {
+        payload.cajero = Number(cajeroRaw);
+    }
+
+    const payloadData = await fetchPrintPayload('api/print/cut-session-ticket', payload, 'No se pudo generar el reporte de corte');
+    return printTicketLocalFirst({
+        payloadData,
+        localSuccessMessage: 'Reporte de corte enviado a impresion local',
+        fallbackEndpoint: 'api/print/cut-session-ticket',
+        fallbackPayload: payload,
+        fallbackErrorMessage: 'No se pudo imprimir el reporte de corte',
+    });
+}
+
+async function printCutById(cutId) {
+    const cajaRaw = String(localStorage.getItem('n_caja') || localStorage.getItem('caja') || '').trim();
+    const cajeroRaw = String(localStorage.getItem('id_user') || '').trim();
+    const parsedCutId = Number(cutId || 0);
+    if (!Number.isFinite(parsedCutId) || parsedCutId <= 0) {
+        throw new Error('Corte historico invalido para reimpresion');
+    }
+
+    const payload = { cut_id: parsedCutId };
+    if (/^\d+$/.test(cajaRaw)) {
+        payload.numero_caja = Number(cajaRaw);
+    }
+    if (/^\d+$/.test(cajeroRaw)) {
+        payload.cajero = Number(cajeroRaw);
+    }
+
+    const payloadData = await fetchPrintPayload('api/print/cut-session-ticket', payload, 'No se pudo generar el corte historico para imprimir');
+    return printTicketLocalFirst({
+        payloadData,
+        localSuccessMessage: 'Corte historico enviado a impresion local',
+        fallbackEndpoint: 'api/print/cut-session-ticket',
+        fallbackPayload: payload,
+        fallbackErrorMessage: 'No se pudo reimprimir el corte historico',
+    });
 }
 
 function withAuthHeaders(headers = {}) {
@@ -1444,21 +4667,31 @@ async function fetchShiftStatus() {
     if (!session) {
         return { estado: 'sin_turno' };
     }
-    const token = getSessionToken();
+    let token = getSessionToken();
     if (!token) {
-        return { estado: 'sesion_invalida' };
+        token = await refreshAccessTokenIfNeeded();
     }
+    if (!token) return { estado: 'sesion_invalida' };
+
     try {
         const { caja, cajero } = session;
         const query = new URLSearchParams({ caja, cajero });
-        const response = await fetch(API_URL + `api/turno/estado?${query.toString()}`, {
-            headers: { Authorization: `Bearer ${token}` },
-        });
-        const data = await response.json().catch(() => ({}));
+        const requestShiftStatus = async () => {
+            return fetch(API_URL + `api/turno/estado?${query.toString()}`, {
+                headers: withAuthHeaders(),
+            });
+        };
+
+        let response = await requestShiftStatus();
+        let data = await response.json().catch(() => ({}));
+        if (response.status === 401) {
+            const refreshed = await refreshAccessTokenIfNeeded();
+            if (!refreshed) return { estado: 'sesion_invalida' };
+            response = await requestShiftStatus();
+            data = await response.json().catch(() => ({}));
+        }
         if (!response.ok) {
-            if (response.status === 401) {
-                return { estado: 'sesion_invalida' };
-            }
+            if (response.status === 401) return { estado: 'sesion_invalida' };
             return { estado: 'error_validacion_turno' };
         }
         return data;
@@ -1496,7 +4729,7 @@ async function startShift(montoInicial) {
     return data;
 }
 
-async function ensureShiftStartedOnLoad() {
+async function ensureShiftStartedOnLoadImpl() {
     const salesAnchor = document.getElementById('barcode');
     if (!salesAnchor) return;
 
@@ -1531,6 +4764,16 @@ async function ensureShiftStartedOnLoad() {
                 setSalesEnabledByShift(true);
                 ensureLocalShiftSalesFlagInitialized();
                 await load_ticket();
+                scheduleShiftStatusRetry();
+                return;
+            }
+            if (localStatus.estado === 'sesion_invalida') {
+                shiftStarted = true;
+                applyShiftInitialAmountUI(localMontoInicial);
+                setSalesEnabledByShift(true);
+                ensureLocalShiftSalesFlagInitialized();
+                await load_ticket();
+                refreshAccessTokenIfNeeded().catch(() => {});
                 scheduleShiftStatusRetry();
                 return;
             }
@@ -1674,6 +4917,20 @@ async function ensureShiftStartedOnLoad() {
             }
         }
     }
+}
+
+async function ensureShiftStartedOnLoad() {
+    if (ensureShiftStartedInFlight) {
+        return ensureShiftStartedInFlight;
+    }
+    ensureShiftStartedInFlight = ensureShiftStartedOnLoadImpl()
+        .catch((error) => {
+            throw error;
+        })
+        .finally(() => {
+            ensureShiftStartedInFlight = null;
+        });
+    return ensureShiftStartedInFlight;
 }
 
 
@@ -1941,6 +5198,7 @@ function closeSalesCameraPermissionPopup() {
     if (!popup) return;
     popup.classList.add('hidden');
     popup.style.display = '';
+    focusBarcodeInputForNextScan();
 }
 window.closeSalesCameraPermissionPopup = closeSalesCameraPermissionPopup;
 
@@ -2006,6 +5264,7 @@ function closeSalesCameraScanPopup() {
     if (!popup) return;
     popup.classList.add('hidden');
     popup.style.display = '';
+    focusBarcodeInputForNextScan();
 }
 window.closeSalesCameraScanPopup = closeSalesCameraScanPopup;
 
@@ -2183,13 +5442,6 @@ async function resolveProductBySearchText(searchText) {
 }
 
 async function addToCart() {
-    if (!shiftStarted) {
-        await ensureShiftStartedOnLoad();
-        if (!shiftStarted) {
-            alert('Debes iniciar turno ingresando el monto inicial de caja.');
-            return;
-        }
-    }
     const barcodeInput = document.getElementById('barcode');
     const rawInput = String(barcodeInput?.value || '').trim();
     if (!rawInput) {
@@ -2200,6 +5452,21 @@ async function addToCart() {
     const barcode = isNameSearch ? '' : normalizeBarcodeByScannerSettings(rawInput);
     if (!isNameSearch && barcodeInput && barcodeInput.value !== barcode) {
         barcodeInput.value = barcode;
+    }
+    if (!isNameSearch && barcode === '0') {
+        clearSalesBarcodeSuggestions();
+        if (barcodeInput) {
+            barcodeInput.value = '';
+        }
+        openCommonProductPopup();
+        return;
+    }
+    if (!shiftStarted) {
+        await ensureShiftStartedOnLoad();
+        if (!shiftStarted) {
+            alert('Debes iniciar turno ingresando el monto inicial de caja.');
+            return;
+        }
     }
 
     try {
@@ -2224,6 +5491,14 @@ async function addToCart() {
             ...product,
             precio_venta: Number(product.precio_venta || 0),
         };
+        if (isBulkSaleProduct(normalizedProduct)) {
+            const opened = openBulkProductPopup(normalizedProduct);
+            if (opened) {
+                document.getElementById('barcode').value = '';
+                clearSalesBarcodeSuggestions();
+            }
+            return;
+        }
         const useInventory = Number(normalizedProduct.utiliza_inventario || 0) === 1;
         const currentStock = Number(normalizedProduct.cantidad_actual || 0);
         const existingProduct = cart.find(item => item.id_producto === normalizedProduct.id_producto);
@@ -2254,8 +5529,11 @@ async function addToCart() {
 
         if (existingProduct) {
             existingProduct.quantity += 1;
+            existingProduct.line_subtotal = 0;
+            selectedCartIndex = cart.indexOf(existingProduct);
         } else {
-            cart.push({ ...normalizedProduct, quantity: 1 });
+            cart.push({ ...normalizedProduct, quantity: 1, formato_venta: resolveProductSaleFormat(normalizedProduct) });
+            selectedCartIndex = cart.length - 1;
         }
 
         updateCartUI();
@@ -2293,17 +5571,18 @@ function updateCartUI() {
         const row = document.createElement('tr');
         const unitPrice = Number(item.precio_venta || 0);
         const quantity = Number(item.quantity || 0);
-        const stock = Number(item.cantidad_actual || 0);
-        const useInventory = Number(item.utiliza_inventario || 0) === 1;
-        const existencia = useInventory ? stock.toFixed(0) : '-';
+        const isBulk = isBulkSaleProduct(item);
+        const quantityLabel = isBulk ? formatGramQuantityFromKg(quantity) : quantity.toFixed(0);
+        const unitPriceLabel = isBulk ? `$${unitPrice.toFixed(0)} /kg` : `$${unitPrice.toFixed(0)}`;
+        const lineAmount = getCartItemSubtotalAmount(item);
+        const lineAmountLabel = `$${lineAmount.toFixed(0)}`;
 
         row.innerHTML = `
-            <td>${item.codigo_barras}</td>
+            <td>${item.codigo_barras || 'COMUN'}</td>
             <td>${item.descripcion}</td>
-            <td style="text-align: center;">$${unitPrice.toFixed(0)}</td>
-            <td style="text-align: center;">${quantity}</td>
-            <td style="text-align: right;">$${(unitPrice * quantity).toFixed(0)}</td>
-            <td style="text-align: center;">${existencia}</td>
+            <td style="text-align: center;">${unitPriceLabel}</td>
+            <td style="text-align: center;">${quantityLabel}</td>
+            <td style="text-align: right;">${lineAmountLabel}</td>
         `;
         row.style.cursor = 'pointer';
         if (index === selectedCartIndex) {
@@ -2316,12 +5595,27 @@ function updateCartUI() {
         cartTable.appendChild(row);
     });
 
+    const carritoContainer = document.querySelector('#sales .carrito');
+    if (carritoContainer && cartTable.children.length > 0) {
+        const preferredIndex = Number.isInteger(selectedCartIndex) && selectedCartIndex >= 0
+            ? selectedCartIndex
+            : (cartTable.children.length - 1);
+        const targetRow = cartTable.children[preferredIndex];
+        if (targetRow) {
+            const rowTop = targetRow.offsetTop;
+            const rowBottom = rowTop + targetRow.offsetHeight;
+            const viewTop = carritoContainer.scrollTop;
+            const viewBottom = viewTop + carritoContainer.clientHeight;
+            if (rowTop < viewTop) {
+                carritoContainer.scrollTop = Math.max(0, rowTop - 8);
+            } else if (rowBottom > viewBottom) {
+                carritoContainer.scrollTop = Math.max(0, rowBottom - carritoContainer.clientHeight + 8);
+            }
+        }
+    }
+
     // Actualizar el total
-    const totalAmount = cart.reduce((sum, item) => {
-        const unitPrice = Number(item.precio_venta || 0);
-        const quantity = Number(item.quantity || 0);
-        return sum + unitPrice * quantity;
-    }, 0);
+    const totalAmount = getCartTotalAmount();
 
     document.getElementById('total-amount').textContent = "$ "+totalAmount.toFixed(0);
     document.getElementById('montoAPagar').textContent = "$ "+totalAmount.toFixed(0);
@@ -2339,11 +5633,13 @@ function updateCartUI() {
         window.refreshFinalizeButtonState();
     }
     updateSalesSessionStrip();
+    renderPendingTicketsInlineStrip();
     persistCartState();
 }
 
 function removeSelectedCartItem() {
     if (!hasUserPermission('ventas_eliminar_articulo')) {
+        alert('No tienes permiso para eliminar articulos de la venta.');
         return;
     }
     if (!Array.isArray(cart) || cart.length === 0) {
@@ -2376,8 +5672,10 @@ async function adjustSelectedCartQuantityByDelta(delta) {
 
     const item = cart[selectedCartIndex];
     if (!item) return;
+    const isBulk = isBulkSaleProduct(item);
+    const effectiveStep = isBulk ? (step > 0 ? 0.1 : -0.1) : step;
     const currentQty = Number(item.quantity || 0);
-    const nextQty = currentQty + step;
+    const nextQty = Number((currentQty + effectiveStep).toFixed(isBulk ? 3 : 0));
 
     if (nextQty <= 0) {
         cart.splice(selectedCartIndex, 1);
@@ -2396,18 +5694,20 @@ async function adjustSelectedCartQuantityByDelta(delta) {
     const useInventory = Number(item.utiliza_inventario || 0) === 1;
     const currentStock = Number(item.cantidad_actual || 0);
     if (useInventory && nextQty > currentStock) {
+        const stockLabel = isBulk ? formatKgQuantity(currentStock) : currentStock.toFixed(0);
         if (typeof window.appAlert === 'function') {
-            await window.appAlert(`No puedes agregar más unidades. Stock disponible: ${currentStock.toFixed(0)}.`, 'warning', {
+            await window.appAlert(`No puedes agregar más unidades. Stock disponible: ${stockLabel}.`, 'warning', {
                 title: 'Stock insuficiente',
                 okText: 'Entendido',
             });
         } else {
-            alert(`No puedes agregar más unidades. Stock disponible: ${currentStock.toFixed(0)}.`);
+            alert(`No puedes agregar más unidades. Stock disponible: ${stockLabel}.`);
         }
         return;
     }
 
     item.quantity = nextQty;
+    item.line_subtotal = 0;
     updateCartUI();
 }
 
@@ -2415,13 +5715,14 @@ function setupCartQuantityKeyboardShortcuts() {
     document.addEventListener('keydown', async (event) => {
         const target = event.target;
         const tag = String(target?.tagName || '').toLowerCase();
+        const isBarcodeInput = String(target?.id || '') === 'barcode';
         const isTypingContext = Boolean(
             target?.isContentEditable ||
             tag === 'input' ||
             tag === 'textarea' ||
             tag === 'select'
         );
-        if (isTypingContext) return;
+        if (isTypingContext && !isBarcodeInput) return;
         if (document.getElementById('mm-alert-overlay')?.classList.contains('show')) return;
         if (document.getElementById('sales')?.classList.contains('hidden')) return;
 
@@ -2492,10 +5793,151 @@ function handleSalesChargePopupShortcuts(event) {
     return false;
 }
 
+function isPopupElementVisible(popupEl) {
+    if (!popupEl) return false;
+    if (popupEl.classList.contains('hidden')) return false;
+    const computed = window.getComputedStyle(popupEl);
+    if (!computed) return false;
+    if (computed.display === 'none') return false;
+    if (computed.visibility === 'hidden') return false;
+    return true;
+}
+
+function closePopupById(popupId) {
+    const id = String(popupId || '');
+    if (!id) return false;
+
+    switch (id) {
+    case 'miPopUp':
+        if (typeof cerrarPopUp === 'function') {
+            cerrarPopUp('miPopUp');
+            return true;
+        }
+        break;
+    case 'pendingTicketsPopUp':
+        if (typeof closePendingTicketsPopup === 'function') {
+            closePendingTicketsPopup();
+            return true;
+        }
+        break;
+    case 'commonProductPopUp':
+        if (typeof closeCommonProductPopup === 'function') {
+            closeCommonProductPopup();
+            return true;
+        }
+        break;
+    case 'bulkProductPopUp':
+        if (typeof closeBulkProductPopup === 'function') {
+            closeBulkProductPopup();
+            return true;
+        }
+        break;
+    case 'searchProductPopUp':
+        if (typeof closeSearchProductPopup === 'function') {
+            closeSearchProductPopup();
+            return true;
+        }
+        break;
+    case 'cashEntryPopUp':
+        if (typeof closeCashEntryPopup === 'function') {
+            closeCashEntryPopup();
+            return true;
+        }
+        break;
+    case 'cashExitPopUp':
+        if (typeof closeCashExitPopup === 'function') {
+            closeCashExitPopup();
+            return true;
+        }
+        break;
+    case 'priceCheckPopUp':
+        if (typeof closePriceCheckPopup === 'function') {
+            closePriceCheckPopup();
+            return true;
+        }
+        break;
+    case 'salesHistoryPopUp':
+        if (typeof closeSalesSessionHistoryPopup === 'function') {
+            closeSalesSessionHistoryPopup();
+            return true;
+        }
+        break;
+    case 'salesCameraScanPopUp':
+        if (typeof closeSalesCameraScanPopup === 'function') {
+            closeSalesCameraScanPopup();
+            return true;
+        }
+        break;
+    case 'salesCameraPermissionPopUp':
+        if (typeof closeSalesCameraPermissionPopup === 'function') {
+            closeSalesCameraPermissionPopup();
+            return true;
+        }
+        break;
+    case 'embedded-popup-overlay':
+        if (typeof closeEmbeddedPopup === 'function') {
+            closeEmbeddedPopup();
+            return true;
+        }
+        break;
+    default:
+        break;
+    }
+
+    if (typeof cerrarPopUp === 'function') {
+        try {
+            cerrarPopUp(id);
+            return true;
+        } catch (_) {
+        }
+    }
+
+    const popup = document.getElementById(id);
+    if (!popup) return false;
+    popup.classList.add('hidden');
+    popup.style.display = '';
+    return true;
+}
+
+function closeTopMostVisiblePopup() {
+    const candidates = Array.from(document.querySelectorAll('#embedded-popup-overlay, [id$="PopUp"], [id$="Popup"]'))
+        .filter((el) => isPopupElementVisible(el));
+    if (!candidates.length) return false;
+
+    let selected = null;
+    candidates.forEach((el, index) => {
+        const computed = window.getComputedStyle(el);
+        const zIndex = Number.parseInt(String(computed?.zIndex || ''), 10);
+        const zScore = Number.isFinite(zIndex) ? zIndex : 0;
+        if (!selected || zScore > selected.zScore || (zScore === selected.zScore && index > selected.index)) {
+            selected = { el, zScore, index };
+        }
+    });
+    if (!selected?.el?.id) return false;
+    return closePopupById(selected.el.id);
+}
+
 function setupSystemFunctionKeyShortcuts() {
     document.addEventListener('keydown', async (event) => {
         if (handleSalesChargePopupShortcuts(event)) return;
+        const key = String(event.key || '').toLowerCase();
+        const hasModifier = Boolean(event.ctrlKey || event.metaKey || event.altKey);
+        if ((key === 'f5' || key === 'f6') && hasModifier) {
+            // Permitir combinaciones del navegador como Ctrl+F5 / Cmd+R.
+            return;
+        }
+        if (key === 'f5' || key === 'f6') {
+            // Reservar F5/F6 para atajos POS y evitar acciones nativas del navegador.
+            event.preventDefault();
+            if (event.repeat) return;
+        }
         if (document.getElementById('mm-alert-overlay')?.classList.contains('show')) return;
+        if (key === 'escape') {
+            if (closeTopMostVisiblePopup()) {
+                event.preventDefault();
+                return;
+            }
+        }
         const target = event.target;
         const tag = String(target?.tagName || '').toLowerCase();
         const isTypingContext = Boolean(
@@ -2504,7 +5946,6 @@ function setupSystemFunctionKeyShortcuts() {
             tag === 'textarea' ||
             tag === 'select'
         );
-        const key = String(event.key || '').toLowerCase();
         if (key === 'f1') {
             event.preventDefault();
             showSection('sales');
@@ -2515,6 +5956,16 @@ function setupSystemFunctionKeyShortcuts() {
             showSection('product');
             return;
         }
+        if (key === 'f3') {
+            event.preventDefault();
+            showSection('inventory');
+            return;
+        }
+        if (key === 'f4') {
+            event.preventDefault();
+            showSection('shopping');
+            return;
+        }
         if (key === 'f12') {
             event.preventDefault();
             await triggerChargeSaleShortcut();
@@ -2522,6 +5973,16 @@ function setupSystemFunctionKeyShortcuts() {
         }
 
         if (document.getElementById('sales')?.classList.contains('hidden')) return;
+        if (key === 'f5') {
+            if (typeof leaveCurrentTicketAsPending === 'function') {
+                await leaveCurrentTicketAsPending();
+            }
+            return;
+        }
+        if (key === 'f6') {
+            if (typeof openPendingTicketsPopup === 'function') openPendingTicketsPopup();
+            return;
+        }
         if (isTypingContext) return;
 
         if (key === 'f10') {
@@ -2548,7 +6009,7 @@ function setupSystemFunctionKeyShortcuts() {
             event.preventDefault();
             if (typeof removeSelectedCartItem === 'function') removeSelectedCartItem();
         }
-    });
+    }, true);
 }
 
 // Finalizar la venta
@@ -2608,14 +6069,20 @@ async function finalizeSale(printReceipt = true) {
     clearPaymentWarning();
     const paymentCheck = validatePaymentCoverage(totalAmount, metodo_pago);
     if (!paymentCheck.ok) {
-        showPaymentWarning(`No se puede finalizar: faltan ${paymentCheck.missingAmount.toFixed(0)} por cobrar.`);
+        if (paymentCheck.reason === 'card_exceeds_total') {
+            showPaymentWarning('No se puede finalizar: en pago mixto la tarjeta no puede superar el total de la venta.');
+        } else {
+            showPaymentWarning(`No se puede finalizar: faltan ${paymentCheck.missingAmount.toFixed(0)} por cobrar en efectivo.`);
+        }
         isFinalizingSale = false;
         if (finalizeBtn) finalizeBtn.disabled = false;
         if (finalizeNoReceiptBtn) finalizeNoReceiptBtn.disabled = false;
         return;
     }
 
-    let num_tic = (parseInt(num_ticket.textContent) + 1);
+    const currentTicketNumber = Number.parseInt(num_ticket.textContent, 10) || 1;
+    const storedTicketCounter = Number(getStoredTicketCounter() || 0);
+    let num_tic = Math.max(currentTicketNumber + 1, storedTicketCounter || 0);
 
     try {
         const response = await fetch(API_URL+'api/sales', {
@@ -2630,6 +6097,20 @@ async function finalizeSale(printReceipt = true) {
 
         if (response.ok) {
             const data = await response.json();
+            const saleChange = calculateSaleChangeAmount(totalAmount, metodo_pago);
+            const lastTicketInfo = {
+                id_venta: Number(data?.venta_id || 0),
+                numero_ticket: Number(data?.numero_ticket || 0),
+                folio_ticket: String(data?.folio_ticket || data?.numero_ticket || '').trim(),
+                metodo_pago: metodo_pago,
+                total: Number(totalAmount || 0),
+                vuelto: Number(saleChange || 0),
+                vuelto_text: formatSalesTicketMoney(saleChange),
+                updated_at: new Date().toISOString(),
+            };
+            persistLastSalesTicketInfo(lastTicketInfo);
+            setLastSalesTicketInfoCard(lastTicketInfo);
+
             const serverNextTicket = Number(data?.next_ticket);
             const nextTicket = Number.isFinite(serverNextTicket) && serverNextTicket > 0
                 ? Math.floor(serverNextTicket)
@@ -2651,6 +6132,15 @@ async function finalizeSale(printReceipt = true) {
                     await printSaleTicket(data.venta_id);
                 } catch (printError) {
                     console.error('Error al imprimir ticket:', printError);
+                    if (typeof appAlert === 'function') {
+                        await appAlert(
+                            printError.message || 'La venta se guardo, pero no se pudo imprimir el ticket en esta caja.',
+                            'warning',
+                            { title: 'Impresion' }
+                        );
+                    } else {
+                        alert(printError.message || 'La venta se guardo, pero no se pudo imprimir el ticket en esta caja.');
+                    }
                 }
             }
         } else {
@@ -2674,11 +6164,17 @@ function openCommonProductPopup() {
     const nameInput = document.getElementById('common-product-name');
     const priceInput = document.getElementById('common-product-price');
     const qtyInput = document.getElementById('common-product-qty');
-    if (nameInput) nameInput.value = '';
+    if (nameInput) nameInput.value = 'Producto Comun';
     if (priceInput) priceInput.value = '';
     if (qtyInput) qtyInput.value = '1';
     popup.classList.remove('hidden');
     popup.style.display = 'flex';
+    if (priceInput) {
+        setTimeout(() => {
+            priceInput.focus();
+            priceInput.select?.();
+        }, 0);
+    }
 }
 
 function closeCommonProductPopup() {
@@ -2686,7 +6182,15 @@ function closeCommonProductPopup() {
     if (!popup) return;
     popup.classList.add('hidden');
     popup.style.display = '';
+    focusBarcodeInputForNextScan();
 }
+
+function handleCommonProductPopupKeydown(event) {
+    if (!event || event.key !== 'Enter') return;
+    event.preventDefault();
+    addCommonProductToCart();
+}
+window.handleCommonProductPopupKeydown = handleCommonProductPopupKeydown;
 
 async function addCommonProductToCart() {
     if (!shiftStarted) {
@@ -2723,11 +6227,229 @@ async function addCommonProductToCart() {
         descripcion: name,
         precio_venta: unitPrice,
         quantity: qty,
+        line_subtotal: roundClpAmount(unitPrice * qty),
         is_common: true,
     });
+    selectedCartIndex = cart.length - 1;
 
     updateCartUI();
     closeCommonProductPopup();
+}
+
+function openBulkProductPopup(product) {
+    const popup = document.getElementById('bulkProductPopUp');
+    if (!popup) return false;
+    const pricePerKg = Number(product?.precio_venta || 0);
+    if (!Number.isFinite(pricePerKg) || pricePerKg <= 0) {
+        alert('El producto granel no tiene un precio por kilo valido.');
+        return false;
+    }
+
+    bulkProductPopupContext = {
+        product: {
+            ...product,
+            precio_venta: pricePerKg,
+            formato_venta: resolveProductSaleFormat(product),
+        },
+    };
+    bulkProductLastEditedField = 'total';
+
+    const nameEl = document.getElementById('bulk-product-name');
+    const priceEl = document.getElementById('bulk-product-price-kg');
+    const stockEl = document.getElementById('bulk-product-stock');
+    const gramsInput = document.getElementById('bulk-product-grams');
+    const totalInput = document.getElementById('bulk-product-total');
+    const kgInput = document.getElementById('bulk-product-kg');
+
+    if (nameEl) nameEl.textContent = normalizeText(product?.descripcion || 'Producto granel');
+    if (priceEl) priceEl.textContent = `$${pricePerKg.toFixed(0)} / kg`;
+    if (stockEl) {
+        const useInventory = Number(product?.utiliza_inventario || 0) === 1;
+        const currentStock = Number(product?.cantidad_actual || 0);
+        stockEl.textContent = useInventory
+            ? `Stock disponible: ${formatKgQuantity(currentStock)}`
+            : 'Stock: no controla inventario';
+    }
+    if (gramsInput) gramsInput.value = '';
+    if (totalInput) totalInput.value = '';
+    if (kgInput) kgInput.value = '';
+
+    popup.classList.remove('hidden');
+    popup.style.display = 'flex';
+    if (totalInput) {
+        totalInput.focus();
+        totalInput.select?.();
+    } else if (gramsInput) {
+        gramsInput.focus();
+    }
+    return true;
+}
+
+function closeBulkProductPopup() {
+    const popup = document.getElementById('bulkProductPopUp');
+    if (!popup) return;
+    popup.classList.add('hidden');
+    popup.style.display = '';
+    bulkProductPopupContext = null;
+    bulkProductLastEditedField = null;
+    focusBarcodeInputForNextScan();
+}
+
+function recalculateBulkPopupFromGrams() {
+    const gramsInput = document.getElementById('bulk-product-grams');
+    const totalInput = document.getElementById('bulk-product-total');
+    const kgInput = document.getElementById('bulk-product-kg');
+    const pricePerKg = Number(bulkProductPopupContext?.product?.precio_venta || 0);
+    if (!gramsInput || !totalInput || !kgInput || !Number.isFinite(pricePerKg) || pricePerKg <= 0) return;
+
+    const grams = parseWeightInputToGrams(gramsInput.value);
+    if (!Number.isFinite(grams) || grams <= 0) {
+        kgInput.value = '';
+        if (!String(totalInput.value || '').trim()) {
+            totalInput.value = '';
+        }
+        return;
+    }
+
+    const quantityKg = grams / 1000;
+    const computedTotal = Math.round(quantityKg * pricePerKg);
+    kgInput.value = quantityKg.toFixed(3);
+    totalInput.value = computedTotal.toString();
+}
+
+function recalculateBulkPopupFromTotal() {
+    const gramsInput = document.getElementById('bulk-product-grams');
+    const totalInput = document.getElementById('bulk-product-total');
+    const kgInput = document.getElementById('bulk-product-kg');
+    const pricePerKg = Number(bulkProductPopupContext?.product?.precio_venta || 0);
+    if (!gramsInput || !totalInput || !kgInput || !Number.isFinite(pricePerKg) || pricePerKg <= 0) return;
+
+    const totalAmount = parseMoneyInputValue(totalInput.value);
+    if (!Number.isFinite(totalAmount) || totalAmount <= 0) {
+        kgInput.value = '';
+        if (!String(gramsInput.value || '').trim()) {
+            gramsInput.value = '';
+        }
+        return;
+    }
+
+    const quantityKg = totalAmount / pricePerKg;
+    const grams = quantityKg * 1000;
+    kgInput.value = quantityKg.toFixed(3);
+    gramsInput.value = Math.round(grams).toString();
+}
+
+async function confirmBulkProductToCart() {
+    const context = bulkProductPopupContext;
+    if (!context?.product) {
+        closeBulkProductPopup();
+        return;
+    }
+
+    const gramsInput = document.getElementById('bulk-product-grams');
+    const totalInput = document.getElementById('bulk-product-total');
+    const gramsValue = parseWeightInputToGrams(gramsInput?.value || '');
+    const totalValue = parseMoneyInputValue(totalInput?.value || '');
+    const pricePerKg = Number(context.product.precio_venta || 0);
+
+    if (!Number.isFinite(pricePerKg) || pricePerKg <= 0) {
+        alert('Precio por kilo invalido para este producto.');
+        return;
+    }
+
+    let quantityKg = 0;
+    if (bulkProductLastEditedField === 'total' && totalValue > 0) {
+        quantityKg = totalValue / pricePerKg;
+    } else if (gramsValue > 0) {
+        quantityKg = gramsValue / 1000;
+    } else if (totalValue > 0) {
+        quantityKg = totalValue / pricePerKg;
+    }
+
+    quantityKg = Number(quantityKg.toFixed(3));
+    if (!Number.isFinite(quantityKg) || quantityKg <= 0) {
+        alert('Ingresa gramos o monto total valido para agregar el producto granel.');
+        return;
+    }
+
+    const totalAmountClp = roundClpAmount(totalValue);
+    const addedSubtotal = (bulkProductLastEditedField === 'total' && totalAmountClp > 0)
+        ? totalAmountClp
+        : roundClpAmount(pricePerKg * quantityKg);
+
+    const productId = Number(context.product.id_producto || 0);
+    const useInventory = Number(context.product.utiliza_inventario || 0) === 1;
+    const currentStock = Number(context.product.cantidad_actual || 0);
+    const existingProduct = cart.find((item) => Number(item.id_producto) === productId);
+    const nextQty = (Number(existingProduct?.quantity || 0) || 0) + quantityKg;
+
+    if (useInventory && (!Number.isFinite(currentStock) || currentStock <= 0)) {
+        alert('Este producto no tiene stock o existencia disponible.');
+        return;
+    }
+    if (useInventory && (nextQty - currentStock) > 0.000001) {
+        alert(`No puedes agregar más. Stock disponible: ${formatKgQuantity(currentStock)}.`);
+        return;
+    }
+
+    if (existingProduct) {
+        const currentSubtotal = getCartItemSubtotalAmount(existingProduct);
+        existingProduct.quantity = Number((Number(existingProduct.quantity || 0) + quantityKg).toFixed(3));
+        existingProduct.line_subtotal = currentSubtotal + addedSubtotal;
+        selectedCartIndex = cart.indexOf(existingProduct);
+    } else {
+        cart.push({
+            id_producto: productId,
+            codigo_barras: context.product.codigo_barras || '',
+            descripcion: context.product.descripcion || '',
+            precio_venta: pricePerKg,
+            utiliza_inventario: useInventory ? 1 : 0,
+            cantidad_actual: currentStock,
+            quantity: quantityKg,
+            line_subtotal: addedSubtotal,
+            formato_venta: 'granel',
+        });
+        selectedCartIndex = cart.length - 1;
+    }
+
+    updateCartUI();
+    closeBulkProductPopup();
+}
+
+function setupBulkProductPopup() {
+    const gramsInput = document.getElementById('bulk-product-grams');
+    const totalInput = document.getElementById('bulk-product-total');
+    const kgInput = document.getElementById('bulk-product-kg');
+    const popup = document.getElementById('bulkProductPopUp');
+    if (!popup || !gramsInput || !totalInput) return;
+
+    gramsInput.addEventListener('input', () => {
+        bulkProductLastEditedField = 'grams';
+        recalculateBulkPopupFromGrams();
+    });
+
+    totalInput.addEventListener('input', () => {
+        bulkProductLastEditedField = 'total';
+        recalculateBulkPopupFromTotal();
+    });
+
+    totalInput.addEventListener('focus', () => {
+        bulkProductLastEditedField = 'total';
+    });
+
+    totalInput.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter') return;
+        event.preventDefault();
+        confirmBulkProductToCart();
+    });
+
+    popup.addEventListener('focusin', (event) => {
+        if (!isPopupElementVisible(popup)) return;
+        const target = event.target;
+        if (target !== gramsInput && target !== kgInput) return;
+        totalInput.focus({ preventScroll: true });
+        totalInput.select?.();
+    });
 }
 
 function openSearchProductPopup() {
@@ -2752,6 +6474,7 @@ function closeSearchProductPopup() {
     if (!popup) return;
     popup.classList.add('hidden');
     popup.style.display = '';
+    focusBarcodeInputForNextScan();
 }
 
 function openCashEntryPopup() {
@@ -2775,6 +6498,7 @@ function closeCashEntryPopup() {
     if (!popup) return;
     popup.classList.add('hidden');
     popup.style.display = '';
+    focusBarcodeInputForNextScan();
 }
 
 function updateCashEntryDescriptionVisibility() {
@@ -2807,6 +6531,7 @@ function closeCashExitPopup() {
     if (!popup) return;
     popup.classList.add('hidden');
     popup.style.display = '';
+    focusBarcodeInputForNextScan();
 }
 
 function openPriceCheckPopup() {
@@ -2828,6 +6553,7 @@ function closePriceCheckPopup() {
     if (!popup) return;
     popup.classList.add('hidden');
     popup.style.display = '';
+    focusBarcodeInputForNextScan();
 }
 
 async function fetchSalesSessionHistory(limit = 400) {
@@ -2850,24 +6576,159 @@ async function fetchSalesSessionHistory(limit = 400) {
     return data;
 }
 
+function getSalesLastTicketStorageKey() {
+    const caja = String(localStorage.getItem('n_caja') || localStorage.getItem('caja') || '').trim();
+    const cajero = String(localStorage.getItem('id_user') || '').trim();
+    if (!caja || !cajero) return null;
+    return `sales_last_ticket_${caja}_${cajero}`;
+}
+
+function normalizeSalesPaymentMethodLabel(methodRaw = '') {
+    const method = String(methodRaw || '').trim().toLowerCase();
+    if (!method) return '-';
+    const labels = {
+        efectivo: 'Efectivo',
+        tarjeta: 'Tarjeta',
+        mixto: 'Efectivo + Tarjeta',
+        dolares: 'Dolares',
+        transferencia: 'Transferencia',
+        cheque: 'Cheque',
+        vale: 'Vale',
+        credito: 'Credito',
+    };
+    return labels[method] || (method.charAt(0).toUpperCase() + method.slice(1));
+}
+
+function formatSalesTicketMoney(value) {
+    const amount = Number(value || 0);
+    return `$${Number.isFinite(amount) ? amount.toFixed(0) : '0'}`;
+}
+
+function readLastSalesTicketInfo() {
+    const key = getSalesLastTicketStorageKey();
+    if (!key) return null;
+    try {
+        const raw = localStorage.getItem(key);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object') return null;
+        return parsed;
+    } catch (_) {
+        return null;
+    }
+}
+
+function persistLastSalesTicketInfo(info) {
+    const key = getSalesLastTicketStorageKey();
+    if (!key || !info) return;
+    try {
+        localStorage.setItem(key, JSON.stringify(info));
+    } catch (_) {
+    }
+}
+
+function setLastSalesTicketInfoCard(info = null) {
+    const folioEl = document.getElementById('sales-last-ticket-folio');
+    const methodEl = document.getElementById('sales-last-ticket-method');
+    const amountEl = document.getElementById('sales-last-ticket-amount');
+    const changeEl = document.getElementById('sales-last-ticket-change');
+    if (!folioEl || !methodEl || !amountEl || !changeEl) return;
+
+    if (!info) {
+        folioEl.textContent = '-';
+        methodEl.textContent = '-';
+        amountEl.textContent = '$0';
+        changeEl.textContent = '$0';
+        return;
+    }
+
+    folioEl.textContent = String(info.folio_ticket || info.numero_ticket || info.id_venta || '-');
+    methodEl.textContent = normalizeSalesPaymentMethodLabel(info.metodo_pago);
+    amountEl.textContent = formatSalesTicketMoney(info.total);
+    if (typeof info.vuelto_text === 'string' && info.vuelto_text.trim()) {
+        changeEl.textContent = info.vuelto_text.trim();
+    } else {
+        changeEl.textContent = formatSalesTicketMoney(info.vuelto || 0);
+    }
+}
+
+async function refreshLastSalesTicketInfoCard() {
+    const localInfo = readLastSalesTicketInfo();
+    if (localInfo) {
+        setLastSalesTicketInfoCard(localInfo);
+    } else {
+        setLastSalesTicketInfoCard(null);
+    }
+
+    try {
+        const data = await fetchSalesSessionHistory(1);
+        const rows = Array.isArray(data?.ventas) ? data.ventas : [];
+        if (!rows.length) return;
+        const row = rows[0];
+        const mergedInfo = {
+            id_venta: Number(row.id_venta || 0),
+            numero_ticket: Number(row.numero_ticket || 0),
+            folio_ticket: String(row.folio_ticket || row.numero_ticket || '').trim(),
+            metodo_pago: String(row.metodo_pago || '').trim(),
+            total: Number(row.total || 0),
+            vuelto: Number(localInfo?.id_venta || 0) === Number(row.id_venta || 0)
+                ? Number(localInfo?.vuelto || 0)
+                : 0,
+            vuelto_text: Number(localInfo?.id_venta || 0) === Number(row.id_venta || 0)
+                ? (localInfo?.vuelto_text || formatSalesTicketMoney(localInfo?.vuelto || 0))
+                : 'N/D',
+            updated_at: localInfo?.updated_at || new Date().toISOString(),
+        };
+        persistLastSalesTicketInfo(mergedInfo);
+        setLastSalesTicketInfoCard(mergedInfo);
+    } catch (_) {
+    }
+}
+
+function calculateSaleChangeAmount(totalAmount, metodoPago) {
+    const total = Number(totalAmount || 0);
+    if (!Number.isFinite(total) || total <= 0) return 0;
+    const method = String(metodoPago || '').trim().toLowerCase();
+    if (method === 'efectivo') {
+        const paid = parseMoneyInputValue(document.getElementById('efectivoEfectivo')?.value);
+        return Math.max(0, paid - total);
+    }
+    if (method === 'mixto') {
+        const efectivoPagado = parseMoneyInputValue(document.getElementById('efectivoMixto')?.value);
+        const tarjeta = parseMoneyInputValue(document.getElementById('tarjetaMixto')?.value);
+        if (tarjeta > total) return 0;
+        const efectivoRequerido = Math.max(0, roundClpAmount(total) - roundClpAmount(tarjeta));
+        return Math.max(0, efectivoPagado - efectivoRequerido);
+    }
+    return 0;
+}
+
 async function reprintLastSaleTicketOrInvoice() {
+    const notifyReprint = async (message, type = 'warning') => {
+        if (typeof window.appAlert === 'function') {
+            await window.appAlert(message, type, { title: 'Reimpresión' });
+            return;
+        }
+        alert(message);
+    };
+
     try {
         const data = await fetchSalesSessionHistory(1);
         const rows = Array.isArray(data?.ventas) ? data.ventas : [];
         if (!rows.length) {
-            await appAlert('No hay ventas en la sesión para reimprimir.', 'warning', { title: 'Reimpresión' });
+            await notifyReprint('No hay ventas en la sesión para reimprimir.', 'warning');
             return;
         }
         const ventaId = Number(rows[0]?.id_venta || 0);
         if (!ventaId) {
-            await appAlert('No se pudo identificar la última venta para reimprimir.', 'error', { title: 'Reimpresión' });
+            await notifyReprint('No se pudo identificar la última venta para reimprimir.', 'error');
             return;
         }
-        await printSaleTicket(ventaId, true);
-        await appAlert(`Reimpresión enviada: venta #${rows[0]?.folio_ticket || rows[0]?.numero_ticket || ventaId}.`, 'success', { title: 'Reimpresión' });
+        await printSaleTicket(ventaId);
+        await notifyReprint(`Reimpresión enviada: venta #${rows[0]?.folio_ticket || rows[0]?.numero_ticket || ventaId}.`, 'success');
     } catch (error) {
         console.error('Error al reimprimir última venta:', error);
-        await appAlert(error.message || 'No se pudo reimprimir la última venta.', 'error', { title: 'Reimpresión' });
+        await notifyReprint(error.message || 'No se pudo reimprimir la última venta.', 'error');
     }
 }
 
@@ -2876,11 +6737,7 @@ function closeSalesSessionHistoryPopup() {
     if (!popup) return;
     popup.classList.add('hidden');
     popup.style.display = '';
-    const barcodeInput = document.getElementById('barcode');
-    if (barcodeInput) {
-        barcodeInput.focus();
-        barcodeInput.select?.();
-    }
+    focusBarcodeInputForNextScan();
 }
 
 async function openSalesSessionHistoryPopup() {
@@ -2915,7 +6772,7 @@ async function openSalesSessionHistoryPopup() {
                     <td>${escapeHtml(normalizeText(row.folio_ticket || row.numero_ticket || String(row.id_venta || '-')))}</td>
                     <td style="text-align:center;">${escapeHtml(String(row.caja_id ?? '-'))}</td>
                     <td>${escapeHtml(normalizeText(row.cajero_nombre || '-'))}</td>
-                    <td>${escapeHtml(normalizeText(row.metodo_pago || '-'))}</td>
+                    <td>${escapeHtml(normalizeText(normalizeSalesPaymentMethodLabel(row.metodo_pago || '-')))}</td>
                     <td style="text-align:right;">${total.toFixed(0)}</td>
                 </tr>
             `;
@@ -3195,6 +7052,11 @@ async function addSelectedSearchedProductToCart() {
         alert('Producto no válido.');
         return;
     }
+    if (isBulkSaleProduct(selected)) {
+        closeSearchProductPopup();
+        openBulkProductPopup(selected);
+        return;
+    }
     const useInventory = Number(selected.utiliza_inventario || 0) === 1;
     const currentStock = Number(selected.cantidad_actual || 0);
 
@@ -3225,6 +7087,8 @@ async function addSelectedSearchedProductToCart() {
 
     if (existingProduct) {
         existingProduct.quantity = Number(existingProduct.quantity || 0) + 1;
+        existingProduct.line_subtotal = 0;
+        selectedCartIndex = cart.indexOf(existingProduct);
     } else {
         cart.push({
             id_producto: Number(selected.id_producto),
@@ -3233,8 +7097,10 @@ async function addSelectedSearchedProductToCart() {
             precio_venta: Number(selected.precio_venta || 0),
             utiliza_inventario: useInventory ? 1 : 0,
             cantidad_actual: currentStock,
+            formato_venta: resolveProductSaleFormat(selected),
             quantity: 1,
         });
+        selectedCartIndex = cart.length - 1;
     }
 
     updateCartUI();
@@ -3311,11 +7177,65 @@ function setInventoryFeedback(message, type = 'info') {
     if (type === 'warning') box.classList.add('feedback-warning');
 }
 
+function setInventoryAdjustFeedback(message, type = 'info') {
+    const box = document.getElementById('inventory-adjust-feedback');
+    if (!box) return;
+    box.textContent = String(message || '');
+    box.classList.remove('feedback-error', 'feedback-ok', 'feedback-warning');
+    if (type === 'error') box.classList.add('feedback-error');
+    if (type === 'ok') box.classList.add('feedback-ok');
+    if (type === 'warning') box.classList.add('feedback-warning');
+}
+
+function setInventoryMovementsFeedback(message, type = 'info') {
+    const box = document.getElementById('inventory-mov-feedback');
+    if (!box) return;
+    box.textContent = String(message || '');
+    box.classList.remove('feedback-error', 'feedback-ok', 'feedback-warning');
+    if (type === 'error') box.classList.add('feedback-error');
+    if (type === 'ok') box.classList.add('feedback-ok');
+    if (type === 'warning') box.classList.add('feedback-warning');
+}
+
 function setInventoryPanelsVisibility(visible) {
     const panels = document.getElementById('inventory-edit-panels');
     const actions = document.getElementById('inventory-footer-actions');
     if (panels) panels.classList.toggle('hidden', !visible);
     if (actions) actions.classList.toggle('hidden', !visible);
+}
+
+function setInventoryAdjustPanelsVisibility(visible) {
+    const panels = document.getElementById('inventory-adjust-panels');
+    const actions = document.getElementById('inventory-adjust-footer-actions');
+    if (panels) panels.classList.toggle('hidden', !visible);
+    if (actions) actions.classList.toggle('hidden', !visible);
+}
+
+function setInventoryScanInputLocked(inputId, locked, options = {}) {
+    const input = document.getElementById(inputId);
+    if (!input) return;
+    const shouldLock = Boolean(locked);
+    input.disabled = shouldLock;
+    if (!shouldLock && options.clear) {
+        input.value = '';
+    }
+    if (!shouldLock && options.focus) {
+        setTimeout(() => {
+            try {
+                input.focus();
+                if (options.select) input.select();
+            } catch (_) {
+            }
+        }, 0);
+    }
+}
+
+function setInventoryNewScanInputLocked(locked, options = {}) {
+    setInventoryScanInputLocked('inventory-code-input', locked, options);
+}
+
+function setInventoryAdjustScanInputLocked(locked, options = {}) {
+    setInventoryScanInputLocked('inventory-adjust-code-input', locked, options);
 }
 
 function clearInventoryProductDetails() {
@@ -3338,6 +7258,75 @@ function clearInventoryProductDetails() {
     setInventoryPanelsVisibility(false);
 }
 
+function clearInventoryAdjustProductDetails() {
+    selectedInventoryAdjustProduct = null;
+    const map = {
+        'inventory-adjust-stock-current': '',
+        'inventory-adjust-qty': '',
+        'inventory-adjust-new-stock': '',
+        'inventory-adjust-note': '',
+    };
+    Object.entries(map).forEach(([id, value]) => {
+        const el = document.getElementById(id);
+        if (el) el.value = value;
+    });
+    const btn = document.getElementById('inventory-adjust-save-btn');
+    if (btn) btn.disabled = true;
+    setInventoryAdjustPanelsVisibility(false);
+}
+
+function fillInventoryAdjustProductDetails(product) {
+    const data = product || {};
+    const setValue = (id, value) => {
+        const el = document.getElementById(id);
+        if (el) el.value = String(value ?? '');
+    };
+    setValue('inventory-adjust-stock-current', Number(data.cantidad_actual || 0).toFixed(0));
+    setValue('inventory-adjust-note', '');
+    // Permite calcular en ambos sentidos: ajuste -> nueva existencia y nueva existencia -> ajuste.
+    const qtyInput = document.getElementById('inventory-adjust-qty');
+    const newStockInput = document.getElementById('inventory-adjust-new-stock');
+    if (qtyInput) {
+        qtyInput.oninput = updateInventoryAdjustNewStock;
+    }
+    if (newStockInput) {
+        newStockInput.oninput = updateInventoryAdjustQtyFromNewStock;
+    }
+    updateInventoryAdjustNewStock(); // inicial
+}
+
+function updateInventoryAdjustNewStock() {
+    const current = Number(document.getElementById('inventory-adjust-stock-current')?.value || 0);
+    const adjust = Number(document.getElementById('inventory-adjust-qty')?.value || 0);
+    const newStock = current + adjust;
+    const newStockEl = document.getElementById('inventory-adjust-new-stock');
+    if (newStockEl) {
+        newStockEl.value = Number.isFinite(newStock) ? newStock.toFixed(0) : '';
+    }
+}
+
+function updateInventoryAdjustQtyFromNewStock() {
+    const current = Number(document.getElementById('inventory-adjust-stock-current')?.value || 0);
+    const newStockInput = document.getElementById('inventory-adjust-new-stock');
+    const qtyInput = document.getElementById('inventory-adjust-qty');
+    if (!newStockInput || !qtyInput) return;
+
+    const rawTarget = String(newStockInput.value ?? '').replace(',', '.').trim();
+    if (!rawTarget) {
+        qtyInput.value = '';
+        return;
+    }
+
+    const target = Number(rawTarget);
+    if (!Number.isFinite(target)) {
+        qtyInput.value = '';
+        return;
+    }
+
+    const adjust = target - current;
+    qtyInput.value = Number.isFinite(adjust) ? adjust.toFixed(0) : '';
+}
+
 function fillInventoryProductDetails(product) {
     const data = product || {};
     const setValue = (id, value) => {
@@ -3355,16 +7344,214 @@ function fillInventoryProductDetails(product) {
 function clearInventoryView() {
     const codeInput = document.getElementById('inventory-code-input');
     if (codeInput) codeInput.value = '';
+    setInventoryNewScanInputLocked(false);
     clearInventoryProductDetails();
     setInventoryFeedback('Escanea un producto para consultar inventario.', 'info');
 }
 
+function clearInventoryAdjustView() {
+    const codeInput = document.getElementById('inventory-adjust-code-input');
+    if (codeInput) codeInput.value = '';
+    setInventoryAdjustScanInputLocked(false);
+    clearInventoryAdjustProductDetails();
+    setInventoryAdjustFeedback('Escanea un producto para ajustar inventario.', 'info');
+}
+
 function cancelInventoryEdition() {
     clearInventoryView();
+    setInventoryNewScanInputLocked(false, { focus: true });
+}
+
+function cancelInventoryAdjustEdition() {
+    clearInventoryAdjustView();
+    setInventoryAdjustScanInputLocked(false, { focus: true });
+}
+
+function formatInventoryQtyValue(value) {
+    const qty = Number(value || 0);
+    if (!Number.isFinite(qty)) return '0';
+    return qty.toFixed(3).replace(/\.?0+$/, '');
+}
+
+function formatInventoryQtyDelta(value) {
+    const qty = Number(value || 0);
+    if (!Number.isFinite(qty) || Math.abs(qty) < 0.000001) return '0';
+    const sign = qty > 0 ? '+' : '-';
+    return `${sign}${formatInventoryQtyValue(Math.abs(qty))}`;
+}
+
+function normalizeInventoryMovementTypeLabel(value) {
+    const type = String(value || '').trim().toLowerCase();
+    if (type === 'venta') return 'Salida por venta';
+    if (type === 'modificacion') return 'Ingreso (modificacion)';
+    if (type === 'ajuste') return 'Ajuste';
+    if (type === 'top_sold') return 'Producto mas vendido';
+    if (!type) return 'Ajuste';
+    return type.charAt(0).toUpperCase() + type.slice(1);
+}
+
+function fillInventoryMovementsTable(rows) {
+    const body = document.getElementById('inventory-movements-body');
+    if (!body) return;
+    body.innerHTML = '';
+    const list = Array.isArray(rows) ? rows : [];
+    if (!list.length) {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 10;
+        td.style.textAlign = 'center';
+        td.textContent = 'Sin movimientos para mostrar.';
+        tr.appendChild(td);
+        body.appendChild(tr);
+        return;
+    }
+
+    list.forEach((row) => {
+        const moveType = String(row.tipo_movimiento || '').trim().toLowerCase();
+        const isTopSold = moveType === 'top_sold';
+        const previousQty = Number(row.cantidad_anterior);
+        const deltaQty = isTopSold
+            ? (Number(row.cantidad_vendida || 0) * -1)
+            : Number(row.cambio_cantidad);
+        const newQty = Number(row.cantidad_nueva);
+        const note = isTopSold
+            ? `Cantidad vendida: ${formatInventoryQtyValue(row.cantidad_vendida)} | Total: $${formatMoney(row.total_vendido || 0)}`
+            : String(row.especificacion || '-');
+        const previousQtyText = Number.isFinite(previousQty) && !isTopSold ? formatInventoryQtyValue(previousQty) : '-';
+        const deltaQtyText = Number.isFinite(deltaQty) ? formatInventoryQtyDelta(deltaQty) : '-';
+        const newQtyText = Number.isFinite(newQty) && !isTopSold ? formatInventoryQtyValue(newQty) : '-';
+        const tr = document.createElement('tr');
+        const cells = [
+            isTopSold ? '-' : String(row.fecha || ''),
+            row.caja_id ? `Caja ${row.caja_id}` : '-',
+            String(row.codigo_barras || ''),
+            String(row.producto_descripcion || ''),
+            normalizeInventoryMovementTypeLabel(moveType),
+            previousQtyText,
+            deltaQtyText,
+            newQtyText,
+            note,
+            isTopSold ? '-' : String(row.usuario_nombre || '-'),
+        ];
+        cells.forEach((value) => {
+            const td = document.createElement('td');
+            td.textContent = value;
+            tr.appendChild(td);
+        });
+        body.appendChild(tr);
+    });
+}
+
+async function loadInventoryMovementBoxes() {
+    const select = document.getElementById('inventory-mov-caja');
+    if (!select) return;
+    const previous = String(select.value || 'all');
+
+    try {
+        const response = await fetch(API_URL + 'api/getCajas', {
+            headers: withAuthHeaders(),
+        });
+        const payload = await response.json().catch(() => []);
+        const rows = Array.isArray(payload) ? payload : [];
+
+        select.innerHTML = '';
+        const allOption = document.createElement('option');
+        allOption.value = 'all';
+        allOption.textContent = 'Todas';
+        select.appendChild(allOption);
+
+        rows.forEach((row) => {
+            const caja = Number(row.n_caja || 0);
+            const cajaActiva = Number(row.estado ?? 0) === 1;
+            const sucursalActiva = Number(row.sucursal_activa ?? 1) === 1;
+            if (!Number.isFinite(caja) || caja <= 0 || !cajaActiva || !sucursalActiva) return;
+            const option = document.createElement('option');
+            option.value = String(caja);
+            option.textContent = `Caja ${caja}`;
+            select.appendChild(option);
+        });
+
+        if (select.querySelector(`option[value="${previous}"]`)) {
+            select.value = previous;
+        } else {
+            select.value = 'all';
+        }
+    } catch (_) {
+        if (!select.querySelector('option[value="all"]')) {
+            select.innerHTML = '<option value="all">Todas</option>';
+        }
+        select.value = 'all';
+    }
+}
+
+function clearInventoryMovementsView() {
+    const fromInput = document.getElementById('inventory-mov-from');
+    const toInput = document.getElementById('inventory-mov-to');
+    const today = new Date().toISOString().slice(0, 10);
+    if (fromInput) fromInput.value = today;
+    if (toInput) toInput.value = today;
+    const cajaSelect = document.getElementById('inventory-mov-caja');
+    if (cajaSelect) cajaSelect.value = 'all';
+    const typeSelect = document.getElementById('inventory-mov-type');
+    if (typeSelect) typeSelect.value = 'all';
+    fillInventoryMovementsTable([]);
+    setInventoryMovementsFeedback('Selecciona filtros y consulta movimientos.', 'info');
+}
+
+async function loadInventoryMovements() {
+    const from = String(document.getElementById('inventory-mov-from')?.value || '').trim();
+    const to = String(document.getElementById('inventory-mov-to')?.value || '').trim();
+    const caja = String(document.getElementById('inventory-mov-caja')?.value || 'all').trim() || 'all';
+    const movementType = String(document.getElementById('inventory-mov-type')?.value || 'all').trim() || 'all';
+
+    if (!from || !to) {
+        setInventoryMovementsFeedback('Debes seleccionar fecha desde y hasta.', 'warning');
+        return;
+    }
+    if (from > to) {
+        setInventoryMovementsFeedback('La fecha desde no puede ser mayor que la fecha hasta.', 'warning');
+        return;
+    }
+
+    try {
+        const params = new URLSearchParams({ from, to, caja, movement_type: movementType });
+        const response = await fetch(API_URL + `api/inventory/movements?${params.toString()}`, {
+            headers: withAuthHeaders(),
+        });
+        const data = await response.json().catch(() => []);
+        if (!response.ok) {
+            setInventoryMovementsFeedback(data.message || data.error || 'No se pudieron cargar movimientos.', 'error');
+            fillInventoryMovementsTable([]);
+            return;
+        }
+        fillInventoryMovementsTable(data);
+        const count = Array.isArray(data) ? data.length : 0;
+        const suffix = movementType === 'top_sold' ? 'producto(s) encontrado(s).' : 'movimiento(s) encontrado(s).';
+        setInventoryMovementsFeedback(`${count} ${suffix}`, 'ok');
+    } catch (error) {
+        console.error('Error loadInventoryMovements:', error);
+        setInventoryMovementsFeedback('No se pudieron cargar movimientos.', 'error');
+        fillInventoryMovementsTable([]);
+    }
 }
 
 function fillInventorySearchDatalist(rows) {
     const list = document.getElementById('inventory-search-options');
+    if (!list) return;
+    list.innerHTML = '';
+    (Array.isArray(rows) ? rows : []).forEach((row) => {
+        const code = normalizeText(row.codigo_barras || '');
+        const desc = normalizeText(row.descripcion || '');
+        if (!code && !desc) return;
+        const option = document.createElement('option');
+        option.value = code || desc;
+        option.label = code && desc ? `${code} - ${desc}` : (desc || code);
+        list.appendChild(option);
+    });
+}
+
+function fillInventoryAdjustSearchDatalist(rows) {
+    const list = document.getElementById('inventory-adjust-search-options');
     if (!list) return;
     list.innerHTML = '';
     (Array.isArray(rows) ? rows : []).forEach((row) => {
@@ -3386,6 +7573,16 @@ async function inventorySearchSuggest(value) {
     }
     const rows = await searchProductsForInput(query);
     fillInventorySearchDatalist(rows);
+}
+
+async function inventoryAdjustSearchSuggest(value) {
+    const query = normalizeText(value);
+    if (query.length < 2) {
+        fillInventoryAdjustSearchDatalist([]);
+        return;
+    }
+    const rows = await searchProductsForInput(query);
+    fillInventoryAdjustSearchDatalist(rows);
 }
 
 async function findInventoryProductByInput(inputValue) {
@@ -3446,11 +7643,61 @@ async function loadInventoryProductByCode() {
         const saveBtn = document.getElementById('inventory-save-btn');
         if (saveBtn) saveBtn.disabled = false;
         selectedInventoryProduct = product;
+        setInventoryNewScanInputLocked(true);
         setInventoryFeedback(`Producto cargado: ${normalizeText(product.descripcion || '')}.`, 'ok');
     } catch (error) {
         console.error('Error loadInventoryProductByCode:', error);
         clearInventoryProductDetails();
         setInventoryFeedback('No se pudo consultar el producto.', 'error');
+    }
+}
+
+async function loadInventoryAdjustProductByCode() {
+    const codeInput = document.getElementById('inventory-adjust-code-input');
+    const rawValue = String(codeInput?.value || '').trim();
+    const normalizedValue = normalizeBarcodeByScannerSettings(rawValue) || normalizeText(rawValue);
+    if (!normalizedValue) {
+        setInventoryAdjustFeedback('Ingresa, escanea o busca un producto para ajustar.', 'warning');
+        return;
+    }
+    if (codeInput) codeInput.value = normalizedValue;
+
+    try {
+        const product = await findInventoryProductByInput(normalizedValue);
+        if (!product) {
+            clearInventoryAdjustProductDetails();
+            setInventoryAdjustFeedback('Producto no encontrado.', 'error');
+            return;
+        }
+
+        const useInventory = Number(product.utiliza_inventario || 0) === 1;
+        if (!useInventory) {
+            clearInventoryAdjustProductDetails();
+            setInventoryAdjustFeedback(`El producto "${normalizeText(product.descripcion || 'Sin nombre')}" no tiene habilitada la opcion de inventario.`, 'warning');
+            if (codeInput) {
+                codeInput.value = '';
+                setTimeout(() => {
+                    try {
+                        codeInput.focus();
+                        codeInput.select();
+                    } catch (_) {
+                    }
+                }, 0);
+            }
+            return;
+        }
+
+        fillInventoryAdjustProductDetails(product);
+        setInventoryAdjustPanelsVisibility(true);
+        const saveBtn = document.getElementById('inventory-adjust-save-btn');
+        if (saveBtn) saveBtn.disabled = false;
+        selectedInventoryAdjustProduct = product;
+        setInventoryAdjustScanInputLocked(true);
+        setInventoryAdjustFeedback(`Producto cargado: ${normalizeText(product.descripcion || '')}.`, 'ok');
+    } catch (error) {
+        console.error('Error loadInventoryAdjustProductByCode:', error);
+        clearInventoryAdjustProductDetails();
+        setInventoryAdjustFeedback('No se pudo consultar el producto.', 'error');
     }
 }
 
@@ -3461,6 +7708,8 @@ async function saveInventoryChanges() {
     }
     const stockCurrent = Number(String(document.getElementById('inventory-stock-current')?.value || '0').replace(',', '.'));
     const restockQty = Number(String(document.getElementById('inventory-restock-qty')?.value || '0').replace(',', '.'));
+    const movementNote = 'Ingreso de mercaderia';
+    const cajaId = toPositiveIntOrNull(getActiveCajaCajero()?.caja);
     if (!Number.isFinite(stockCurrent) || stockCurrent < 0) {
         setInventoryFeedback('Existencia actual invalida.', 'error');
         return;
@@ -3511,12 +7760,25 @@ async function saveInventoryChanges() {
     };
 
     try {
-        const response = await fetch(API_URL + `api/productos/${encodeURIComponent(code)}`, {
+        const response = await fetch(API_URL + `api/productos/${encodeURIComponent(code)}/inventory`, {
             method: 'PUT',
             headers: withAuthHeaders({
                 'Content-Type': 'application/json',
             }),
-            body: JSON.stringify(payload),
+            body: JSON.stringify({
+                cantidad_actual: newQty,
+                cantidad_minima: minStock,
+                cantidad_maxima: maxStock,
+                utiliza_inventario: 1,
+
+                // opcionales (para mantener consistencia con la pantalla de inventario)
+                costo: cost,
+                ganancia: profit,
+                precio_venta: salePrice,
+                movement_type: 'modificacion',
+                especificacion: movementNote,
+                caja_id: cajaId,
+            }),
         });
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {
@@ -3525,8 +7787,7 @@ async function saveInventoryChanges() {
         }
 
         clearInventoryProductDetails();
-        const codeInput = document.getElementById('inventory-code-input');
-        if (codeInput) codeInput.value = '';
+        setInventoryNewScanInputLocked(false, { clear: true, focus: true });
         setInventoryFeedback(`Cambios guardados. Nuevo stock: ${Number(newQty).toFixed(0)}.`, 'ok');
     } catch (error) {
         console.error('Error saveInventoryChanges:', error);
@@ -3534,15 +7795,120 @@ async function saveInventoryChanges() {
     }
 }
 
+async function saveInventoryAdjustChanges() {
+    if (!selectedInventoryAdjustProduct) {
+        setInventoryAdjustFeedback('Primero carga un producto con inventario habilitado.', 'warning');
+        return;
+    }
+    const stockCurrent = Number(String(document.getElementById('inventory-adjust-stock-current')?.value || '0').replace(',', '.'));
+    const adjustQty = Number(String(document.getElementById('inventory-adjust-qty')?.value || '0').replace(',', '.'));
+    const movementNote = normalizeText(document.getElementById('inventory-adjust-note')?.value || '');
+    const cajaId = toPositiveIntOrNull(getActiveCajaCajero()?.caja);
+    if (!Number.isFinite(stockCurrent) || stockCurrent < 0) {
+        setInventoryAdjustFeedback('Existencia actual invalida.', 'error');
+        return;
+    }
+    if (!Number.isFinite(adjustQty)) {
+        setInventoryAdjustFeedback('La cantidad de ajuste debe ser un numero valido.', 'warning');
+        return;
+    }
+
+    const code = normalizeText(selectedInventoryAdjustProduct.codigo_barras || '');
+    if (!code) {
+        setInventoryAdjustFeedback('Codigo de producto invalido para ajustar inventario.', 'error');
+        return;
+    }
+
+    const newQty = stockCurrent + adjustQty;
+    if (newQty < 0) {
+        setInventoryAdjustFeedback('La nueva existencia no puede ser negativa.', 'warning');
+        return;
+    }
+
+    try {
+        const response = await fetch(API_URL + `api/productos/${encodeURIComponent(code)}/inventory`, {
+            method: 'PUT',
+            headers: withAuthHeaders({
+                'Content-Type': 'application/json',
+            }),
+            body: JSON.stringify({
+                cantidad_actual: newQty,
+                movement_type: 'ajuste',
+                especificacion: movementNote || null,
+                caja_id: cajaId,
+            }),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            setInventoryAdjustFeedback(data.error || data.message || 'No se pudo aplicar el ajuste.', 'error');
+            return;
+        }
+
+        clearInventoryAdjustProductDetails();
+        setInventoryAdjustScanInputLocked(false, { clear: true, focus: true });
+        setInventoryAdjustFeedback(`Ajuste guardado. Nuevo stock: ${Number(newQty).toFixed(0)}.`, 'ok');
+    } catch (error) {
+        console.error('Error saveInventoryAdjustChanges:', error);
+        setInventoryAdjustFeedback('Error de conexion al ajustar inventario.', 'error');
+    }
+}
+
 function prepareInventoryView() {
+    // Ocultar contenidos y mostrar botones
+    document.getElementById('inventory-nuevo-content').classList.add('hidden');
+    document.getElementById('inventory-ajustar-content').classList.add('hidden');
+    document.getElementById('inventory-movimientos-content')?.classList.add('hidden');
+    // Mostrar botones
+    const nuevoBtn = document.getElementById('inventory-nuevo-btn');
+    const ajustarBtn = document.getElementById('inventory-ajustar-btn');
+    const movimientosBtn = document.getElementById('inventory-movimientos-btn');
+    if (nuevoBtn) nuevoBtn.style.display = 'inline-block';
+    if (ajustarBtn) ajustarBtn.style.display = 'inline-block';
+    if (movimientosBtn) movimientosBtn.style.display = 'inline-block';
+}
+
+function showInventoryNuevo() {
+    document.getElementById('inventory-nuevo-content').classList.remove('hidden');
+    document.getElementById('inventory-ajustar-content').classList.add('hidden');
+    document.getElementById('inventory-movimientos-content')?.classList.add('hidden');
+    setInventoryNewScanInputLocked(false);
+    // Preparar vista
     const codeInput = document.getElementById('inventory-code-input');
-    if (!codeInput) return;
-    if (scannerRuntimeSettings.scanner_auto_focus) {
+    if (codeInput && scannerRuntimeSettings.scanner_auto_focus) {
         setTimeout(() => codeInput.focus(), 0);
     }
-    if (!selectedInventoryProduct) {
-        setInventoryFeedback('Escanea un producto para consultar inventario.', 'info');
+    setInventoryFeedback('Escanea un producto para agregar mercancía.', 'info');
+}
+
+function showInventoryAjustar() {
+    document.getElementById('inventory-ajustar-content').classList.remove('hidden');
+    document.getElementById('inventory-nuevo-content').classList.add('hidden');
+    document.getElementById('inventory-movimientos-content')?.classList.add('hidden');
+    setInventoryAdjustScanInputLocked(false);
+    // Preparar vista
+    const codeInput = document.getElementById('inventory-adjust-code-input');
+    if (codeInput && scannerRuntimeSettings.scanner_auto_focus) {
+        setTimeout(() => codeInput.focus(), 0);
     }
+    setInventoryAdjustFeedback('Escanea un producto para ajustar inventario.', 'info');
+}
+
+async function showInventoryMovimientos() {
+    document.getElementById('inventory-movimientos-content')?.classList.remove('hidden');
+    document.getElementById('inventory-nuevo-content').classList.add('hidden');
+    document.getElementById('inventory-ajustar-content').classList.add('hidden');
+
+    await loadInventoryMovementBoxes();
+
+    const fromInput = document.getElementById('inventory-mov-from');
+    const toInput = document.getElementById('inventory-mov-to');
+    const typeSelect = document.getElementById('inventory-mov-type');
+    const today = new Date().toISOString().slice(0, 10);
+    if (fromInput && !fromInput.value) fromInput.value = today;
+    if (toInput && !toInput.value) toInput.value = today;
+    if (typeSelect && !typeSelect.value) typeSelect.value = 'all';
+
+    await loadInventoryMovements();
 }
 
 async function loadProductSupplierOptions() {
@@ -4404,6 +8770,242 @@ function openPrintWindow(html) {
     }, 300);
 }
 
+function formatCutReceiptDateTime(value = null) {
+    const date = value ? new Date(value) : new Date();
+    if (Number.isNaN(date.getTime())) return '--/--/---- --:--';
+    const months = ['ENE', 'FEB', 'MAR', 'ABR', 'MAY', 'JUN', 'JUL', 'AGO', 'SEP', 'OCT', 'NOV', 'DIC'];
+    const day = String(date.getDate()).padStart(2, '0');
+    const month = months[date.getMonth()] || '---';
+    const year = date.getFullYear();
+    const hour24 = date.getHours();
+    const hour12 = ((hour24 + 11) % 12) + 1;
+    const minute = String(date.getMinutes()).padStart(2, '0');
+    const suffix = hour24 >= 12 ? 'PM' : 'AM';
+    return `${day}/${month}/${year} ${hour12}:${minute} ${suffix}`;
+}
+
+function normalizeCutReceiptPaymentLabel(methodRaw = '') {
+    const method = String(methodRaw || '').trim().toLowerCase();
+    const labels = {
+        efectivo: 'EN EFECTIVO',
+        tarjeta: 'CON TARJETA',
+        credito: 'A CREDITO',
+        vale: 'CON VALES',
+        transferencia: 'TRANSFERENCIA',
+        cheque: 'CHEQUE',
+        dolares: 'DOLARES',
+        mixto: 'EFECTIVO + TARJETA',
+    };
+    if (labels[method]) return labels[method];
+    if (!method) return 'OTRO';
+    return method.toUpperCase();
+}
+
+function buildCutSessionReceiptHtml(snapshot = {}, options = {}) {
+    const data = snapshot?.data && typeof snapshot.data === 'object' ? snapshot.data : {};
+    const business = options?.business || {};
+    const cashierName = String(options?.cashierName || getCurrentCutCashierLabel()).trim() || 'CAJERO';
+    const cajaLabel = String(options?.cajaLabel || '').trim() || '-';
+    const detailRows = Array.isArray(data.detalle) ? data.detalle : [];
+    const summaryRows = Array.isArray(data.resumen) ? data.resumen : [];
+    const movementSummaryRows = Array.isArray(data?.movimientos?.resumen) ? data.movimientos.resumen : [];
+    const movementIncomeRows = Array.isArray(data?.movimientos?.detalle_ingresos) ? data.movimientos.detalle_ingresos : [];
+    const movementExpenseRows = Array.isArray(data?.movimientos?.detalle_salidas) ? data.movimientos.detalle_salidas : [];
+    const departmentRows = Array.isArray(data.departamentos) ? data.departamentos : [];
+    const financial = data.resumen_financiero || {};
+
+    const money = (value) => `$${formatMoney(value)}`;
+    const lineHtml = (label, value, isBold = false) => `
+      <div class="line${isBold ? ' strong' : ''}">
+        <span>${escapeHtml(label)}</span>
+        <span>${escapeHtml(value)}</span>
+      </div>
+    `;
+
+    const fallbackVentasEfectivo = summaryRows.reduce((acc, row) => {
+        const method = String(row.metodo_pago || '').toLowerCase();
+        const total = Number(row.total || 0);
+        if (method === 'efectivo') return acc + total;
+        if (method === 'mixto') return acc + (total / 2);
+        return acc;
+    }, 0);
+    const fallbackEntradas = movementSummaryRows
+        .filter((row) => String(row.tipo || '').toLowerCase() === 'entrada')
+        .reduce((acc, row) => acc + Number(row.total || 0), 0);
+    const fallbackSalidas = movementSummaryRows
+        .filter((row) => String(row.tipo || '').toLowerCase() === 'salida')
+        .reduce((acc, row) => acc + Number(row.total || 0), 0);
+    const fallbackAbonos = movementSummaryRows
+        .filter((row) => String(row.tipo || '').toLowerCase() === 'abono')
+        .reduce((acc, row) => acc + Number(row.total || 0), 0);
+
+    const fondoCaja = Number(financial.fondo_caja ?? data.monto_inicial ?? 0);
+    const ventasEfectivo = Number(financial.ventas_efectivo ?? fallbackVentasEfectivo);
+    const abonosEfectivo = Number(financial.abonos_efectivo ?? fallbackAbonos);
+    const entradasDinero = Number(financial.entradas_dinero ?? fallbackEntradas);
+    const salidasDinero = Number(financial.salidas_dinero ?? fallbackSalidas);
+    const efectivoEnCaja = Number(
+        financial.ventas_totales_dinero_en_caja
+        ?? (fondoCaja + ventasEfectivo + abonosEfectivo + entradasDinero - salidasDinero)
+    );
+    const devolucionesVentas = Number(financial.devoluciones_ventas ?? financial.devoluciones ?? 0);
+    const totalVentas = Number(data.totales?.total ?? financial.total_vendido ?? 0);
+    const totalTransacciones = Number(data.totales?.transacciones || detailRows.length || 0);
+    const totalEntradas = movementIncomeRows
+        .filter((row) => String(row.tipo || '').toLowerCase() === 'entrada')
+        .reduce((acc, row) => acc + Number(row.monto || 0), 0);
+    const totalSalidas = movementExpenseRows.reduce((acc, row) => acc + Number(row.monto || 0), 0);
+
+    const methodTotals = new Map();
+    summaryRows.forEach((row) => {
+        const key = String(row.metodo_pago || '').trim().toLowerCase();
+        if (!key) return;
+        methodTotals.set(key, (methodTotals.get(key) || 0) + Number(row.total || 0));
+    });
+
+    const preferredMethodOrder = ['efectivo', 'tarjeta', 'credito', 'vale', 'transferencia', 'cheque', 'dolares', 'mixto'];
+    const methodRows = [];
+    preferredMethodOrder.forEach((key) => {
+        let value = Number(methodTotals.get(key) || 0);
+        if (key === 'efectivo') value = ventasEfectivo;
+        if (key === 'mixto' && value <= 0) return;
+        if (key === 'credito' && !methodTotals.has(key)) value = 0;
+        methodRows.push({
+            key,
+            label: normalizeCutReceiptPaymentLabel(key),
+            value,
+        });
+        methodTotals.delete(key);
+    });
+    methodTotals.forEach((value, key) => {
+        methodRows.push({
+            key,
+            label: normalizeCutReceiptPaymentLabel(key),
+            value: Number(value || 0),
+        });
+    });
+
+    const departmentRowsWithSales = departmentRows
+        .map((row) => ({
+            label: String(row.departamento || 'SIN DEPARTAMENTO').trim().toUpperCase(),
+            total: Number(row.total_vendido || 0),
+        }))
+        .filter((row) => row.total > 0);
+
+    const businessName = String(business.nombre || 'MINIMARKET').trim() || 'MINIMARKET';
+    const businessType = String(business.tipo || '').trim();
+    const dateIso = String(data.fecha || cutCloseContext.currentDate || new Date().toISOString().slice(0, 10)).trim();
+    const dateLabel = formatCutDateForHeader(dateIso).toUpperCase();
+    const generatedAtLabel = formatCutReceiptDateTime(snapshot?.loadedAt || new Date());
+    const turnoId = Number(data.turno_id || 0);
+    const shiftRangeLabel = buildCutHistoryTimeRange(data.hora_apertura || '', data.hora_cierre || '');
+
+    return `<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>Corte de turno</title>
+  <style>
+    @page { size: 80mm auto; margin: 3mm; }
+    html, body { margin: 0; padding: 0; background: #fff; color: #000; }
+    body { font-family: "Courier New", Consolas, monospace; font-size: 12px; line-height: 1.22; }
+    .receipt { width: 74mm; margin: 0 auto; }
+    .center { text-align: center; }
+    .brand { font-size: 34px; font-weight: 700; text-transform: uppercase; line-height: 1.05; }
+    .subtitle { font-size: 13px; margin-top: 2px; text-transform: uppercase; font-weight: 700; }
+    .main-title { font-size: 36px; margin: 8px 0 2px; text-transform: uppercase; font-weight: 700; }
+    .meta { margin: 2px 0; font-size: 11px; text-transform: uppercase; }
+    .spacer { height: 4px; }
+    .separator { border-top: 1px dashed #000; margin: 6px 0; }
+    .section-title { text-align: center; font-size: 16px; font-weight: 700; text-transform: uppercase; margin: 8px 0 4px; }
+    .line { display: flex; justify-content: space-between; gap: 10px; margin: 1px 0; align-items: flex-start; }
+    .line span:last-child { text-align: right; white-space: nowrap; }
+    .strong { font-weight: 700; }
+    .footer { margin-top: 8px; text-align: center; font-size: 10px; color: #222; }
+  </style>
+</head>
+<body>
+  <div class="receipt">
+    <div class="center brand">${escapeHtml(businessName)}</div>
+    ${businessType ? `<div class="center subtitle">${escapeHtml(businessType)}</div>` : ''}
+    <div class="center main-title">CORTE DE TURNO</div>
+    <div class="center subtitle">TURNO #${escapeHtml(String(turnoId || '-'))}</div>
+    <div class="meta">REALIZADO: ${escapeHtml(generatedAtLabel)}</div>
+    <div class="meta">CAJERO: ${escapeHtml(cashierName.toUpperCase())}</div>
+    <div class="meta">CAJA: ${escapeHtml(String(cajaLabel).toUpperCase())}</div>
+    <div class="meta">FECHA: ${escapeHtml(dateLabel)}</div>
+    <div class="meta">HORARIO: ${escapeHtml(shiftRangeLabel.toUpperCase())}</div>
+    <div class="spacer"></div>
+    ${lineHtml('VENTAS TOTALES', money(totalVentas), true)}
+    <div class="meta">${escapeHtml(String(totalTransacciones))} VENTAS EN EL TURNO</div>
+
+    <div class="section-title">== DINERO EN CAJA ==</div>
+    ${lineHtml('FONDO DE CAJA', money(fondoCaja))}
+    ${lineHtml('VENTAS EN EFECTIVO', money(ventasEfectivo))}
+    ${lineHtml('ABONOS EN EFECTIVO', `+ ${money(abonosEfectivo)}`)}
+    ${lineHtml('ENTRADAS', `+ ${money(entradasDinero)}`)}
+    ${lineHtml('SALIDAS', `- ${money(salidasDinero)}`)}
+    <div class="separator"></div>
+    ${lineHtml('EFECTIVO EN CAJA', money(efectivoEnCaja), true)}
+
+    <div class="section-title">== ENTRADAS EFECTIVO ==</div>
+    ${lineHtml('TOTAL ENTRADAS', money(totalEntradas), true)}
+
+    <div class="section-title">== SALIDAS EFECTIVO ==</div>
+    ${lineHtml('TOTAL SALIDAS', money(totalSalidas), true)}
+
+    <div class="section-title">== VENTAS ==</div>
+    ${methodRows.map((row) => lineHtml(row.label, money(row.value))).join('')}
+    ${lineHtml('DEVOLUCIONES', `- ${money(devolucionesVentas)}`)}
+    <div class="separator"></div>
+    ${lineHtml('TOTAL VENTAS', money(totalVentas), true)}
+
+    <div class="section-title">== VENTAS POR DEPTO ==</div>
+    ${
+        departmentRowsWithSales.length
+            ? departmentRowsWithSales.map((row) => lineHtml(row.label, money(row.total))).join('')
+            : lineHtml('SIN VENTAS POR DEPARTAMENTO', money(0))
+    }
+
+    <div class="footer">Reporte generado desde corte de turno</div>
+  </div>
+</body>
+</html>`;
+}
+
+async function printCurrentCutSessionReport() {
+    if (!hasUserPermission('corte_turno')) {
+        return;
+    }
+    const historicalCutId = Number(cutCloseContext.historicalCutId || 0);
+    if (!cutCloseContext.sessionResumenLoaded && historicalCutId <= 0) {
+        alert('Primero carga el resumen de sesion o abre un corte historico para imprimir.');
+        return;
+    }
+    let snapshot = cutCloseContext.sessionReportSnapshot;
+    if (historicalCutId <= 0 && (!snapshot || !snapshot.data)) {
+        const loaded = await loadCutSummaryForClose('session', { silent: true });
+        snapshot = cutCloseContext.sessionReportSnapshot;
+        if (!loaded || !snapshot || !snapshot.data) {
+            alert('No se pudo cargar la informacion del corte para imprimir.');
+            return;
+        }
+    }
+
+    try {
+        if (historicalCutId > 0) {
+            await printCutById(historicalCutId);
+        } else {
+            await printCutSessionTicket();
+        }
+    } catch (error) {
+        console.error('Error printing cut report:', error);
+        alert(error.message || 'Error al imprimir el reporte de corte.');
+    }
+}
+
+window.printCurrentCutSessionReport = printCurrentCutSessionReport;
+
 async function exportSalesPdf() {
     const filters = getReportFilterValues();
     if (filters.desde > filters.hasta) {
@@ -4583,6 +9185,7 @@ async function loadReports(filters = null) {
 }
 
 async function loadCurrentCut() {
+    setupCutCalculatorPopup();
     if (!hasUserPermission('corte_turno') && !hasUserPermission('corte_dia') && !hasUserPermission('corte_todos_turnos')) {
         return;
     }
@@ -4612,8 +9215,17 @@ async function loadCurrentCut() {
         const closeStatus = data.cerrado ? ' (turno cerrado)' : ' (turno abierto)';
         cutCloseContext.turnStatusLabel = closeStatus;
         cutCloseContext.currentDate = data.fecha || new Date().toISOString().slice(0, 10);
-        cutSummary.innerHTML = `Fecha ${cutCloseContext.currentDate}`;
+        cutSummary.textContent = 'Sin resumen cargado. Usa "Hacer corte de cajero" o "Hacer corte del dia".';
+        updateCutHeadline({
+            cashierName: getCurrentCutCashierLabel(),
+            dateIso: cutCloseContext.currentDate,
+            startTime: data?.cierre?.hora_apertura || '',
+            endTime: data?.cierre?.hora_cierre || '',
+            statusText: data.cerrado ? 'Turno cerrado' : 'Turno abierto',
+        });
+        updateCutSessionContext({ visible: false });
         cutBreakdown.innerHTML = '';
+        renderCutFinancialSections({}, { clearOnly: true });
         const scopeInfo = document.getElementById('cut-close-scope-info');
         const breakdownList = document.getElementById('cut-close-breakdown');
         const detailBody = document.getElementById('cut-close-detail-body');
@@ -4623,13 +9235,25 @@ async function loadCurrentCut() {
         cutCloseContext.scope = null;
         cutCloseContext.resumenLoaded = false;
         cutCloseContext.sessionResumenLoaded = false;
+        cutCloseContext.esperadoEfectivo = 0;
         cutCloseContext.esperadoTarjeta = 0;
+        cutCloseContext.sessionReportSnapshot = null;
+        cutCloseContext.historicalCutId = null;
         refreshCutCloseButtonState();
     } catch (error) {
         const today = new Date().toISOString().slice(0, 10);
         cutCloseContext.currentDate = today;
-        cutSummary.innerHTML = `Fecha ${today}`;
+        cutSummary.textContent = 'Sin resumen cargado. Usa "Hacer corte de cajero" o "Hacer corte del dia".';
+        updateCutHeadline({
+            cashierName: getCurrentCutCashierLabel(),
+            dateIso: today,
+            startTime: '',
+            endTime: '',
+            statusText: '',
+        });
+        updateCutSessionContext({ visible: false });
         cutBreakdown.innerHTML = '';
+        renderCutFinancialSections({}, { clearOnly: true });
         const scopeInfo = document.getElementById('cut-close-scope-info');
         const breakdownList = document.getElementById('cut-close-breakdown');
         const detailBody = document.getElementById('cut-close-detail-body');
@@ -4639,7 +9263,10 @@ async function loadCurrentCut() {
         cutCloseContext.scope = null;
         cutCloseContext.resumenLoaded = false;
         cutCloseContext.sessionResumenLoaded = false;
+        cutCloseContext.esperadoEfectivo = 0;
         cutCloseContext.esperadoTarjeta = 0;
+        cutCloseContext.sessionReportSnapshot = null;
+        cutCloseContext.historicalCutId = null;
         refreshCutCloseButtonState();
         console.error('Error loading cut:', error);
     }
@@ -4689,6 +9316,7 @@ async function loadCutSummaryForClose(scope = 'session', options = {}) {
         const paymentSettings = await fetchPaymentSettingsForCut();
         const departmentRows = await fetchCutDepartmentBreakdown(scope);
         data.departamentos = departmentRows;
+        cutCloseContext.scope = scope;
         const scopeLabel = scope === 'session' ? 'sesion actual' : 'dia completo';
         renderCutEnabledPaymentBreakdown(data.resumen || [], paymentSettings, scopeLabel);
         if (scope === 'session') {
@@ -4711,7 +9339,7 @@ async function loadCutSummaryForClose(scope = 'session', options = {}) {
             tr.innerHTML = `
                 <td>${row.fecha || ''}</td>
                 <td>${row.numero_ticket || ''}</td>
-                <td>${row.metodo_pago || ''}</td>
+                <td>${normalizeSalesPaymentMethodLabel(row.metodo_pago || '')}</td>
                 <td style="text-align:right;">${Number(row.total || 0).toFixed(0)}</td>
             `;
             detailBody.appendChild(tr);
@@ -4722,15 +9350,61 @@ async function loadCutSummaryForClose(scope = 'session', options = {}) {
             detailBody.appendChild(tr);
         }
 
+        const nextCurrentDate = cutCloseContext.currentDate || data.fecha || new Date().toISOString().slice(0, 10);
+        const summaryFinancial = data?.resumen_financiero || {};
+        const expectedCashFromFinancial = Number(
+            summaryFinancial.ventas_totales_dinero_en_caja
+            ?? (
+                Number(summaryFinancial.fondo_caja ?? data.monto_inicial ?? 0)
+                + Number(summaryFinancial.ventas_efectivo ?? 0)
+                + Number(summaryFinancial.abonos_efectivo ?? 0)
+                + Number(summaryFinancial.entradas_dinero ?? 0)
+                - Number(summaryFinancial.salidas_dinero ?? 0)
+            )
+        );
+        const expectedCashFromApi = Number(data.esperado_efectivo || 0);
+        const resolvedExpectedCash = Number.isFinite(expectedCashFromFinancial)
+            ? expectedCashFromFinancial
+            : (Number.isFinite(expectedCashFromApi) ? expectedCashFromApi : 0);
+        const expectedCardFromFinancial = Number(summaryFinancial.ventas_tarjeta ?? 0);
+        const expectedCardFromApi = Number(data.esperado_tarjeta || 0);
+        const resolvedExpectedCard = Number.isFinite(expectedCardFromFinancial)
+            ? expectedCardFromFinancial
+            : (Number.isFinite(expectedCardFromApi) ? expectedCardFromApi : 0);
+
         cutCloseContext = {
             scope,
-            esperadoEfectivo: Number(data.esperado_efectivo || 0),
-            esperadoTarjeta: Number(data.esperado_tarjeta || data.resumen_financiero?.ventas_tarjeta || 0),
+            esperadoEfectivo: resolvedExpectedCash,
+            esperadoTarjeta: resolvedExpectedCard,
             resumenLoaded: true,
             sessionResumenLoaded: scope === 'session' ? true : cutCloseContext.sessionResumenLoaded,
             turnStatusLabel: cutCloseContext.turnStatusLabel || '',
-            currentDate: cutCloseContext.currentDate || data.fecha || new Date().toISOString().slice(0, 10),
+            currentDate: nextCurrentDate,
+            sessionReportSnapshot: scope === 'session'
+                ? {
+                    data,
+                    paymentSettings,
+                    loadedAt: new Date().toISOString(),
+                }
+                : cutCloseContext.sessionReportSnapshot,
+            historicalCutId: null,
         };
+        updateCutHeadline({
+            cashierName: getCurrentCutCashierLabel(),
+            dateIso: nextCurrentDate,
+            startTime: data.hora_apertura || '',
+            endTime: data.hora_cierre || '',
+            statusText: scope === 'session' ? 'Sesion actual' : 'Dia completo',
+        });
+        if (scope === 'session') {
+            updateCutSessionContext({
+                visible: true,
+                cashierName: getCurrentCutCashierLabel(),
+                dateIso: nextCurrentDate,
+            });
+        } else {
+            updateCutSessionContext({ visible: false });
+        }
         refreshCutCloseButtonState();
         refreshCloseShiftDifference();
         return true;
@@ -4808,6 +9482,77 @@ function applyCloseShiftModeUI(mode) {
     }
 }
 
+function isElementVisibleForCloseShiftFlow(element) {
+    if (!element) return false;
+    if (element.offsetParent !== null) return true;
+    const computed = window.getComputedStyle(element);
+    return computed.display !== 'none' && computed.visibility !== 'hidden';
+}
+
+function focusCloseShiftDeclaredInputs() {
+    const declaredInput = document.getElementById('cut-declared-amount');
+    const declaredCardInput = document.getElementById('cut-declared-card-amount');
+    const declaredRow = document.getElementById('cut-declared-row');
+    const declaredCardRow = document.getElementById('cut-declared-card-row');
+
+    if (
+        declaredInput &&
+        isElementVisibleForCloseShiftFlow(declaredRow || declaredInput) &&
+        !declaredInput.readOnly &&
+        !declaredInput.disabled
+    ) {
+        try {
+            declaredInput.focus({ preventScroll: true });
+            declaredInput.select?.();
+            return;
+        } catch (_) {
+            return;
+        }
+    }
+
+    if (
+        declaredCardInput &&
+        isElementVisibleForCloseShiftFlow(declaredCardRow || declaredCardInput) &&
+        !declaredCardInput.readOnly &&
+        !declaredCardInput.disabled
+    ) {
+        try {
+            declaredCardInput.focus({ preventScroll: true });
+            declaredCardInput.select?.();
+        } catch (_) {
+        }
+    }
+}
+
+function setupCloseShiftDialogInputFlow() {
+    if (window.__cutCloseShiftInputFlowInit) return;
+    window.__cutCloseShiftInputFlowInit = true;
+
+    const declaredInput = document.getElementById('cut-declared-amount');
+    if (!declaredInput) return;
+
+    declaredInput.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter') return;
+        event.preventDefault();
+        event.stopPropagation();
+
+        const declaredCardInput = document.getElementById('cut-declared-card-amount');
+        const declaredCardRow = document.getElementById('cut-declared-card-row');
+        if (
+            declaredCardInput &&
+            isElementVisibleForCloseShiftFlow(declaredCardRow || declaredCardInput) &&
+            !declaredCardInput.readOnly &&
+            !declaredCardInput.disabled
+        ) {
+            try {
+                declaredCardInput.focus({ preventScroll: true });
+                declaredCardInput.select?.();
+            } catch (_) {
+            }
+        }
+    });
+}
+
 async function openCloseShiftDialog() {
     if (!hasUserPermission('corte_turno')) {
         return;
@@ -4822,6 +9567,10 @@ async function openCloseShiftDialog() {
     overlay.classList.remove('hidden');
     overlay.style.display = 'flex';
     applyCloseShiftModeUI(cutSettings.mode);
+    setupCloseShiftDialogInputFlow();
+    setTimeout(() => {
+        focusCloseShiftDeclaredInputs();
+    }, 0);
 }
 
 function closeCloseShiftDialog() {
@@ -4948,29 +9697,53 @@ async function closeCurrentShift(declaredOverride = null, declaredCardOverride =
             localStorage.removeItem(shiftSalesKey);
         }
         setSalesEnabledByShift(false);
-        cutCloseContext = { scope: null, esperadoEfectivo: 0, esperadoTarjeta: 0, resumenLoaded: false, sessionResumenLoaded: false };
+        cutCloseContext = {
+            scope: null,
+            esperadoEfectivo: 0,
+            esperadoTarjeta: 0,
+            resumenLoaded: false,
+            sessionResumenLoaded: false,
+            turnStatusLabel: '',
+            currentDate: new Date().toISOString().slice(0, 10),
+            sessionReportSnapshot: null,
+            historicalCutId: null,
+        };
         refreshCutCloseButtonState();
         const scopeInfo = document.getElementById('cut-close-scope-info');
         const breakdownList = document.getElementById('cut-close-breakdown');
         const detailBody = document.getElementById('cut-close-detail-body');
+        const salesKpi = document.getElementById('cut-kpi-sales-total');
+        const profitKpi = document.getElementById('cut-kpi-profit-total');
         const cashList = document.getElementById('cut-cash-detail-list');
         const cashTotal = document.getElementById('cut-cash-total');
         const profitList = document.getElementById('cut-profit-detail-list');
         const profitTotal = document.getElementById('cut-profit-total');
+        const mixedSummaryList = document.getElementById('cut-mixed-summary-list');
+        const mixedSummaryTotal = document.getElementById('cut-mixed-summary-total');
         const incomeList = document.getElementById('cut-session-income-list');
         const expenseList = document.getElementById('cut-session-expense-list');
         const departmentList = document.getElementById('cut-department-list');
+        const departmentTotal = document.getElementById('cut-department-total');
+        const mixedTicketList = document.getElementById('cut-mixed-ticket-list');
+        const mixedTicketTotal = document.getElementById('cut-mixed-ticket-total');
         const topProductsByDepartmentList = document.getElementById('cut-top-products-by-department');
         if (scopeInfo) scopeInfo.textContent = 'Selecciona una opcion para cargar el resumen de ventas.';
         if (breakdownList) breakdownList.innerHTML = '';
         if (detailBody) detailBody.innerHTML = '';
+        if (salesKpi) salesKpi.textContent = '$0';
+        if (profitKpi) profitKpi.textContent = '$0';
         if (cashList) cashList.innerHTML = '';
         if (cashTotal) cashTotal.textContent = '';
         if (profitList) profitList.innerHTML = '';
         if (profitTotal) profitTotal.textContent = '';
+        if (mixedSummaryList) mixedSummaryList.innerHTML = '';
+        if (mixedSummaryTotal) mixedSummaryTotal.textContent = '';
         if (incomeList) incomeList.innerHTML = '';
         if (expenseList) expenseList.innerHTML = '';
         if (departmentList) departmentList.innerHTML = '';
+        if (departmentTotal) departmentTotal.textContent = '';
+        if (mixedTicketList) mixedTicketList.innerHTML = '';
+        if (mixedTicketTotal) mixedTicketTotal.textContent = '';
         if (topProductsByDepartmentList) topProductsByDepartmentList.innerHTML = '';
         try {
             await deleteConnectedUser();
@@ -5030,19 +9803,98 @@ function mostrarPopUp(popUp) {
     window.reloadSalePaymentSettings();
   }
   clearPaymentWarning();
-  document.getElementById(popUp).classList.remove("hidden");
+  const popupElement = document.getElementById(popUp);
+  if (!popupElement) return;
+  popupElement.classList.remove("hidden");
+  if (popUp === 'miPopUp' && typeof window.prefillSaleCashPaymentFromTotal === 'function') {
+    window.prefillSaleCashPaymentFromTotal({ select: false });
+  }
+  if (popUp === 'miPopUp' && typeof window.focusSalePaymentTabsForKeyboard === 'function') {
+    window.focusSalePaymentTabsForKeyboard();
+  }
 }
 
-function focusBarcodeInputForNextScan() {
+function isEditableElementForScannerFocus(element) {
+    const target = element || document.activeElement;
+    if (!target) return false;
+    if (target.isContentEditable) return true;
+    const tag = String(target.tagName || '').toLowerCase();
+    return tag === 'input' || tag === 'textarea' || tag === 'select';
+}
+
+function isSalesSectionVisibleForScanner() {
+    const salesSection = document.getElementById('sales');
+    if (!salesSection) return false;
+    return !salesSection.classList.contains('hidden');
+}
+
+function isAnyBlockingPopupVisibleForScanner() {
+    const candidates = Array.from(document.querySelectorAll('#mm-alert-overlay, #embedded-popup-overlay, [id$="PopUp"], [id$="Popup"], #cut-history-popup, #cut-close-popup, #cut-rebuild-popup, #cut-rebuild-cuts-popup'));
+    return candidates.some((el) => {
+        if (!el) return false;
+        if (el.id === 'sales-barcode-suggestions') return false;
+        return isPopupElementVisible(el);
+    });
+}
+
+function focusBarcodeInputForNextScan(options = {}) {
+    const select = options?.select !== false;
+    const force = Boolean(options?.force);
+    const delay = Number.isFinite(Number(options?.delay)) ? Number(options.delay) : 0;
     const barcodeInput = document.getElementById('barcode');
     if (!barcodeInput) return;
-    setTimeout(() => {
+
+    const runFocus = () => {
+        if (!force) {
+            if (!isSalesSectionVisibleForScanner()) return;
+            if (isAnyBlockingPopupVisibleForScanner()) return;
+            const activeEl = document.activeElement;
+            if (activeEl && activeEl !== barcodeInput && isEditableElementForScannerFocus(activeEl)) return;
+        }
+        if (barcodeInput.disabled) return;
         try {
-            barcodeInput.focus();
-            barcodeInput.select();
+            barcodeInput.focus({ preventScroll: true });
+            if (select) {
+                barcodeInput.select?.();
+            }
         } catch (_) {
         }
-    }, 0);
+    };
+
+    setTimeout(runFocus, Math.max(0, delay));
+}
+window.focusBarcodeInputForNextScan = focusBarcodeInputForNextScan;
+
+function setupSalesScannerStickyFocus() {
+    if (window.__salesScannerStickyFocusInit) return;
+    window.__salesScannerStickyFocusInit = true;
+
+    const queueFocus = () => {
+        focusBarcodeInputForNextScan({ select: false, delay: 0 });
+    };
+
+    document.addEventListener('click', (event) => {
+        if (!isSalesSectionVisibleForScanner()) return;
+        const target = event.target;
+        if (!target) return;
+        if (isEditableElementForScannerFocus(target)) return;
+        if (target.closest?.('#mm-alert-overlay, #embedded-popup-overlay, [id$="PopUp"], [id$="Popup"], #cut-history-popup, #cut-close-popup, #cut-rebuild-popup, #cut-rebuild-cuts-popup')) return;
+        queueFocus();
+    }, true);
+
+    document.addEventListener('keyup', (event) => {
+        if (!isSalesSectionVisibleForScanner()) return;
+        if (isAnyBlockingPopupVisibleForScanner()) return;
+        const key = String(event.key || '').toLowerCase();
+        if (['shift', 'control', 'alt', 'meta', 'capslock', 'tab'].includes(key)) return;
+        const target = event.target;
+        if (target && isEditableElementForScannerFocus(target)) return;
+        queueFocus();
+    }, true);
+
+    window.addEventListener('focus', () => {
+        queueFocus();
+    });
 }
 
 //-------------oculta los popup de la vista de configuracion de una ventana abierta
@@ -5050,9 +9902,7 @@ function cerrarPopUp(popUp) {
     //console.log("cerrar popup");
   clearPaymentWarning();
   document.getElementById(popUp).classList.add("hidden");
-  if (popUp === 'miPopUp') {
-      focusBarcodeInputForNextScan();
-  }
+  focusBarcodeInputForNextScan();
 }
 
 function mostrarMensaje(mensaje) {
@@ -5159,9 +10009,34 @@ let selectedProductForDelete = null;
 let selectedCatalogProductCode = '';
 let catalogRowsCache = [];
 let selectedPromotionProductIds = new Set();
+let promotionProductsCatalogCache = null;
+let promotionProductsLoadPromise = null;
+let promotionProductsSelectHydrated = false;
 let selectedInventoryProduct = null;
+let selectedInventoryAdjustProduct = null;
 let shoppingOrderState = { order: null, items: [] };
 let shoppingReceiveState = { selectedOrderId: null, selectedOrder: null, pendingOrders: [], items: [] };
+
+function isSessionAdminSiaUser() {
+    const byLogin = String(localStorage.getItem('user') || '').trim().toLowerCase();
+    if (byLogin === 'admin_sia') return true;
+    try {
+        const raw = localStorage.getItem('user_profile');
+        if (!raw) return false;
+        const parsed = JSON.parse(raw);
+        const byProfileLogin = String(parsed?.username_login || '').trim().toLowerCase();
+        return byProfileLogin === 'admin_sia';
+    } catch (_) {
+        return false;
+    }
+}
+
+function applyAdminSiaOnlyProductsActionsVisibility() {
+    const canView = isSessionAdminSiaUser();
+    document.querySelectorAll('button[data-admin-sia-only="1"], a[data-admin-sia-only="1"], [role="button"][data-admin-sia-only="1"]').forEach((control) => {
+        control.classList.toggle('hidden', !canView);
+    });
+}
 
 function parseLocalBoolFlexible(key) {
     const raw = String(localStorage.getItem(key) || '').trim().toLowerCase();
@@ -5257,6 +10132,48 @@ function toPositiveIntOrNull(value) {
     if (!Number.isFinite(n)) return null;
     const parsed = Math.trunc(n);
     return parsed > 0 ? parsed : null;
+}
+
+function normalizeSaleFormatValue(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (!normalized) return '';
+    if (['unidad', 'unidades', 'botella', 'botellas'].includes(normalized)) return 'unidad';
+    if (['granel', 'kilo', 'kilos', 'kg', 'kilogramo', 'kilogramos'].includes(normalized)) return 'granel';
+    if (['pack', 'paquete', 'paquetes'].includes(normalized)) return 'pack';
+    return normalized;
+}
+
+function resolveProductSaleFormat(product) {
+    const byName = normalizeSaleFormatValue(product?.formato_venta || '');
+    if (byName) return byName;
+    return 'unidad';
+}
+
+function isBulkSaleProduct(product) {
+    return resolveProductSaleFormat(product) === 'granel';
+}
+
+function parseWeightInputToGrams(value) {
+    const normalized = String(value ?? '')
+        .replace(',', '.')
+        .replace(/[^0-9.\-]/g, '')
+        .trim();
+    if (!normalized) return 0;
+    const parsed = Number(normalized);
+    return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function formatKgQuantity(value) {
+    const qty = Number(value || 0);
+    if (!Number.isFinite(qty) || qty <= 0) return '0 kg';
+    return `${qty.toFixed(3)} kg`;
+}
+
+function formatGramQuantityFromKg(value) {
+    const qty = Number(value || 0);
+    if (!Number.isFinite(qty) || qty <= 0) return '0 g';
+    const grams = Math.round(qty * 1000);
+    return `${grams.toLocaleString('es-CL')} g`;
 }
 
 function calculateSalePriceFromCost(costValue, profitPercentValue) {
@@ -5435,35 +10352,85 @@ async function loadProductSupplierOptions() {
     });
 }
 
-async function loadPromotionProductsSelect() {
-    const select = document.getElementById('promo-products');
-    if (!select) return;
-    try {
+function isPromotionSectionVisible() {
+    const section = document.getElementById('promo');
+    return Boolean(section && !section.classList.contains('hidden') && section.offsetParent !== null);
+}
+
+function invalidatePromotionProductsCache(options = {}) {
+    const refreshIfVisible = Boolean(options.refreshIfVisible);
+    promotionProductsCatalogCache = null;
+    promotionProductsSelectHydrated = false;
+    if (refreshIfVisible && isPromotionSectionVisible()) {
+        loadPromotionProductsSelect({ forceReload: true }).catch(() => {});
+    }
+}
+
+async function fetchPromotionProductsCatalog(forceReload = false) {
+    if (!forceReload && Array.isArray(promotionProductsCatalogCache)) {
+        return promotionProductsCatalogCache;
+    }
+    if (!forceReload && promotionProductsLoadPromise) {
+        return promotionProductsLoadPromise;
+    }
+
+    promotionProductsLoadPromise = (async () => {
         const response = await fetch(API_URL + 'api/productos', {
             headers: withAuthHeaders(),
         });
         const rows = await response.json().catch(() => []);
         const list = Array.isArray(rows) ? rows : [];
+        promotionProductsCatalogCache = list;
+        return list;
+    })().finally(() => {
+        promotionProductsLoadPromise = null;
+    });
+
+    return promotionProductsLoadPromise;
+}
+
+async function loadPromotionProductsSelect(options = {}) {
+    const select = document.getElementById('promo-products');
+    if (!select) return;
+
+    const normalizedOptions = (typeof options === 'boolean')
+        ? { forceReload: options }
+        : (options || {});
+    const forceReload = Boolean(normalizedOptions.forceReload);
+
+    if (promotionProductsSelectHydrated && !forceReload) {
+        renderPromotionSelectedProducts();
+        return;
+    }
+
+    if (!promotionProductsSelectHydrated || forceReload) {
+        select.innerHTML = '<option value="">Cargando productos...</option>';
+    }
+
+    try {
+        const list = await fetchPromotionProductsCatalog(forceReload);
         const previous = String(select.value || '');
-        select.innerHTML = '<option value="">Selecciona un producto para agregar</option>';
+        const optionsHtml = ['<option value="">Selecciona un producto para agregar</option>'];
+
         list.forEach((row) => {
             const id = Number(row.id_producto || 0);
             const code = normalizeText(row.codigo_barras);
             const desc = normalizeText(row.descripcion);
             if (!id || !desc) return;
-            const option = document.createElement('option');
-            option.value = String(id);
-            option.textContent = `${code ? `${code} - ` : ''}${desc}`;
-            select.appendChild(option);
+            const label = `${code ? `${code} - ` : ''}${desc}`;
+            optionsHtml.push(`<option value="${id}">${escapeHtml(label)}</option>`);
         });
+
+        select.innerHTML = optionsHtml.join('');
         if (previous && select.querySelector(`option[value="${previous}"]`)) {
             select.value = previous;
         } else {
             select.value = '';
         }
+        promotionProductsSelectHydrated = true;
         renderPromotionSelectedProducts();
     } catch (_) {
-        select.innerHTML = '';
+        select.innerHTML = '<option value="">No se pudieron cargar productos</option>';
     }
 }
 
@@ -5608,21 +10575,14 @@ async function loadPromotions() {
 function fillModifyFormFromProduct(product) {
     selectedProductForModify = product || null;
     if (!product) return;
+    document.getElementById('product-edit-code').value = normalizeText(product.codigo_barras);
     document.getElementById('product-edit-name').value = normalizeText(product.descripcion);
     document.getElementById('product-edit-price').value = Number(product.precio_venta || 0);
     document.getElementById('product-edit-cost').value = Number(product.costo || 0);
     const configuredDefaultProfit = getConfiguredDefaultProfitPercent();
     const currentProfit = Number(product.ganancia);
     document.getElementById('product-edit-profit').value = Number.isFinite(currentProfit) ? currentProfit : configuredDefaultProfit;
-    const formatById = (() => {
-        const id = Number(product.id_formato || 0);
-        if (id === 1) return 'unidad';
-        if (id === 2) return 'granel';
-        if (id === 3) return 'pack';
-        return '';
-    })();
-    const formatNameRaw = normalizeText(product.formato_venta || formatById || '').toLowerCase();
-    const formatName = (formatNameRaw === 'botellas') ? 'unidad' : formatNameRaw;
+    const formatName = resolveProductSaleFormat(product);
     const editUnidad = document.getElementById('radio-edit-unidad');
     const editKilo = document.getElementById('radio-edit-kilo');
     const editPack = document.getElementById('radio-edit-pack');
@@ -5710,6 +10670,7 @@ function clearProductModifyForm() {
         searchInput.value = '';
         searchInput.disabled = false;
     }
+    document.getElementById('product-edit-code').value = '';
     document.getElementById('product-edit-name').value = '';
     document.getElementById('product-edit-price').value = '';
     document.getElementById('product-edit-cost').value = '';
@@ -5768,6 +10729,7 @@ function showSectioninventario(sectionId) {
     root.querySelectorAll('.product-section').forEach((section) => section.classList.add('hidden'));
     const target = document.getElementById(sectionId);
     if (target) target.classList.remove('hidden');
+    applyAdminSiaOnlyProductsActionsVisibility();
 
     if (sectionId === 'add') {
         applyDefaultProfitToProductForms();
@@ -5803,7 +10765,11 @@ function showSectioninventario(sectionId) {
         focusFirstInputInProductSection(sectionId);
     }
     if (sectionId === 'promo') {
-        loadPromotionProductsSelect();
+        const select = document.getElementById('promo-products');
+        if (select && !promotionProductsSelectHydrated) {
+            select.innerHTML = '<option value="">Cargando productos...</option>';
+        }
+        loadPromotionProductsSelect().catch(() => {});
         loadPromotions();
         focusFirstInputInProductSection(sectionId);
     }
@@ -5928,13 +10894,13 @@ async function addProduct() {
         codigo_barras: normalizeText(document.getElementById('product-code').value),
         descripcion: normalizeText(document.getElementById('product-name').value),
         formato_venta: document.querySelector('input[name="formato_venta"]:checked')?.value || 'unidad',
-        costo: toIntOrNull(document.getElementById('product-costo').value),
+        costo: toDecimalOrNull(document.getElementById('product-costo').value, 2),
         ganancia: toDecimalOrNull(document.getElementById('product-ganancia').value, 2) ?? 0,
-        precio_venta: toIntOrNull(document.getElementById('product-price').value),
+        precio_venta: toDecimalOrNull(document.getElementById('product-price').value, 2),
         utiliza_inventario: document.getElementById('product-use-inventory').checked ? 1 : 0,
-        cantidad_actual: toIntOrNull(document.getElementById('product-quantity').value) ?? 0,
-        cantidad_minima: toIntOrNull(document.getElementById('product-quantity-min').value) ?? 0,
-        cantidad_maxima: toIntOrNull(document.getElementById('product-quantity-max').value) ?? 0,
+        cantidad_actual: toDecimalOrNull(document.getElementById('product-quantity').value, 3) ?? 0,
+        cantidad_minima: toDecimalOrNull(document.getElementById('product-quantity-min').value, 3) ?? 0,
+        cantidad_maxima: toDecimalOrNull(document.getElementById('product-quantity-max').value, 3) ?? 0,
         departamento: normalizeText(document.getElementById('product-department-add').value),
         supplier_id: toPositiveIntOrNull(document.getElementById('product-supplier')?.value),
         exento_iva: document.getElementById('product-tax-exempt')?.checked ? 1 : 0,
@@ -5965,7 +10931,7 @@ async function addProduct() {
         }
         clearProductAddForm();
         setAddProductFeedback('Producto guardado correctamente.', 'ok');
-        await loadPromotionProductsSelect();
+        invalidatePromotionProductsCache({ refreshIfVisible: true });
         await loadCatalogTable();
     } catch (error) {
         console.error('Error addProduct:', error);
@@ -5995,10 +10961,15 @@ async function saveModifiedProduct() {
         alert('Debes cargar un producto primero.');
         return;
     }
+    const editedCodeInput = document.getElementById('product-edit-code');
+    const editedCodeRaw = normalizeText(editedCodeInput?.value || '');
+    const editedCode = normalizeBarcodeByScannerSettings(editedCodeRaw) || editedCodeRaw;
+    if (editedCodeInput) editedCodeInput.value = editedCode;
     const payload = {
+        codigo_barras: editedCode,
         descripcion: normalizeText(document.getElementById('product-edit-name').value),
-        precio_venta: toIntOrNull(document.getElementById('product-edit-price').value),
-        costo: toIntOrNull(document.getElementById('product-edit-cost').value),
+        precio_venta: toDecimalOrNull(document.getElementById('product-edit-price').value, 2),
+        costo: toDecimalOrNull(document.getElementById('product-edit-cost').value, 2),
         ganancia: toDecimalOrNull(document.getElementById('product-edit-profit').value, 2) ?? 0,
         formato_venta: document.querySelector('input[name="formato_venta_edit"]:checked')?.value || 'unidad',
         cantidad_actual: selectedProductForModify ? Number(selectedProductForModify.cantidad_actual || 0) : 0,
@@ -6010,7 +10981,7 @@ async function saveModifiedProduct() {
         exento_iva: document.getElementById('product-edit-tax-exempt')?.checked ? 1 : 0,
     };
 
-    if (!payload.descripcion || payload.precio_venta === null || payload.costo === null || !payload.departamento) {
+    if (!payload.codigo_barras || !payload.descripcion || payload.precio_venta === null || payload.costo === null || !payload.departamento) {
         alert('Completa los campos obligatorios para guardar cambios.');
         return;
     }
@@ -6030,6 +11001,7 @@ async function saveModifiedProduct() {
         }
         alert('Producto actualizado correctamente.');
         clearProductModifyForm();
+        invalidatePromotionProductsCache({ refreshIfVisible: true });
         await loadCatalogTable();
     } catch (error) {
         console.error('Error saveModifiedProduct:', error);
@@ -6096,6 +11068,7 @@ async function deleteLoadedProduct() {
         }
         alert('Producto eliminado correctamente.');
         clearProductDeleteSelection();
+        invalidatePromotionProductsCache({ refreshIfVisible: true });
         await loadCatalogTable();
     } catch (error) {
         console.error('Error deleteLoadedProduct:', error);
@@ -6243,14 +11216,16 @@ async function importProductsFile() {
         }
         if (status) status.textContent = `Importación completada. Creados: ${Number(data.inserted || 0)}.`;
         await loadCatalogTable();
-        await loadPromotionProductsSelect();
+        invalidatePromotionProductsCache({ refreshIfVisible: true });
     } catch (error) {
         if (status) status.textContent = error.message || 'No se pudo importar.';
     }
 }
 
 async function exportProductsFile(format) {
-    const normalized = format === 'json' ? 'json' : 'csv';
+    const normalized = format === 'json'
+        ? 'json'
+        : (format === 'xlsx' ? 'xlsx' : 'csv');
     try {
         const response = await fetch(API_URL + `api/productos/export.${normalized}`, {
             headers: withAuthHeaders(),
@@ -6271,6 +11246,135 @@ async function exportProductsFile(format) {
         window.URL.revokeObjectURL(url);
     } catch (error) {
         alert(error.message || 'No se pudo exportar.');
+    }
+}
+
+async function exportProductsDetailedPdf() {
+    if (!isSessionAdminSiaUser()) {
+        alert('Esta exportacion esta disponible solo para admin_sia.');
+        return;
+    }
+
+    const toNumber = (value) => {
+        const amount = Number(value);
+        return Number.isFinite(amount) ? amount : 0;
+    };
+    const formatQuantity = (value) => {
+        const amount = toNumber(value);
+        return Number.isInteger(amount)
+            ? amount.toLocaleString('es-CL', { maximumFractionDigits: 0 })
+            : amount.toLocaleString('es-CL', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    };
+    const formatPercent = (value) => `${toNumber(value).toLocaleString('es-CL', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`;
+
+    try {
+        const business = await getBusinessDisplayInfo();
+        const response = await fetch(API_URL + 'api/productos', {
+            headers: withAuthHeaders(),
+        });
+        const payload = await response.json().catch(() => []);
+        if (!response.ok) {
+            throw new Error(payload.message || payload.error || 'No se pudo generar el listado PDF.');
+        }
+
+        const rawRows = Array.isArray(payload) ? payload : [];
+        if (!rawRows.length) {
+            alert('No hay productos para exportar.');
+            return;
+        }
+
+        const rows = rawRows
+            .map((row) => {
+                const costo = toNumber(row.costo);
+                const venta = toNumber(row.precio_venta);
+                const utilidadUnit = venta - costo;
+                const stock = toNumber(row.cantidad_actual);
+                const stockMin = toNumber(row.cantidad_minima);
+                const stockMax = toNumber(row.cantidad_maxima);
+                const marginRaw = row.ganancia;
+                const marginParsed = Number(marginRaw);
+                const marginFallback = costo > 0 ? ((venta - costo) / costo) * 100 : 0;
+                const marginPercent = (marginRaw === null || marginRaw === '' || !Number.isFinite(marginParsed))
+                    ? marginFallback
+                    : marginParsed;
+                const inventoryEnabled = Number(row.utiliza_inventario || 0) === 1;
+                const exentoIva = Number(row.exento_iva || 0) === 1;
+
+                return {
+                    codigo: normalizeText(row.codigo_barras || '-'),
+                    nombre: normalizeText(row.descripcion || ''),
+                    departamento: normalizeText(row.departamento || 'Sin departamento'),
+                    formato: normalizeText(row.formato_venta || '-'),
+                    costo,
+                    venta,
+                    utilidadUnit,
+                    marginPercent,
+                    stock,
+                    stockMin,
+                    stockMax,
+                    inventoryEnabled,
+                    exentoIva,
+                    proveedor: normalizeText(row.supplier_name || 'Sin proveedor'),
+                };
+            })
+            .sort((a, b) => {
+                const byDepartment = a.departamento.localeCompare(b.departamento, 'es', { sensitivity: 'base' });
+                if (byDepartment !== 0) return byDepartment;
+                return a.nombre.localeCompare(b.nombre, 'es', { sensitivity: 'base' });
+            });
+
+        const printableRows = rows.map((row) => [
+            row.codigo,
+            row.nombre,
+            row.departamento,
+            row.formato,
+            `$${formatMoney(row.costo)}`,
+            `$${formatMoney(row.venta)}`,
+            formatPercent(row.marginPercent),
+            `$${formatMoney(row.utilidadUnit)}`,
+            formatQuantity(row.stock),
+            formatQuantity(row.stockMin),
+            formatQuantity(row.stockMax),
+            row.inventoryEnabled ? 'Si' : 'No',
+            row.exentoIva ? 'Exento' : 'Afecto',
+            row.proveedor,
+        ]);
+
+        const totalStock = rows.reduce((acc, row) => acc + row.stock, 0);
+        const totalCostStock = rows.reduce((acc, row) => acc + (row.costo * row.stock), 0);
+        const totalSaleStock = rows.reduce((acc, row) => acc + (row.venta * row.stock), 0);
+        const totalProfitStock = totalSaleStock - totalCostStock;
+        const avgMargin = rows.length
+            ? rows.reduce((acc, row) => acc + row.marginPercent, 0) / rows.length
+            : 0;
+        const inventoryEnabledCount = rows.filter((row) => row.inventoryEnabled).length;
+        const exentoIvaCount = rows.filter((row) => row.exentoIva).length;
+        const currentUser = normalizeText(localStorage.getItem('user') || '').toLowerCase() || 'desconocido';
+
+        const html = buildPrintableHtml(
+            'Listado detallado de productos',
+            ['Codigo', 'Nombre', 'Departamento', 'Formato', 'Costo', 'Venta', 'Margen %', 'Utilidad/U', 'Stock', 'Min', 'Max', 'Inventario', 'IVA', 'Proveedor'],
+            printableRows,
+            {
+                business,
+                filtersText: `Ordenado por departamento y nombre | Usuario: ${currentUser}`,
+                summary: [
+                    { label: 'Productos', value: String(rows.length) },
+                    { label: 'Con inventario', value: String(inventoryEnabledCount) },
+                    { label: 'Stock total', value: formatQuantity(totalStock) },
+                    { label: 'Margen promedio', value: formatPercent(avgMargin) },
+                    { label: 'Costo stock', value: `$${formatMoney(totalCostStock)}` },
+                    { label: 'Venta stock', value: `$${formatMoney(totalSaleStock)}` },
+                    { label: 'Utilidad potencial', value: `$${formatMoney(totalProfitStock)}` },
+                    { label: 'Exentos IVA', value: String(exentoIvaCount) },
+                ],
+                signatures: ['Responsable de inventario', 'Administrador SIA'],
+            }
+        );
+        openPrintWindow(html);
+    } catch (error) {
+        console.error('Error exporting products detailed pdf:', error);
+        alert(error.message || 'No se pudo exportar el listado de productos en PDF.');
     }
 }
 
@@ -7545,57 +12649,95 @@ function setupPromotionSelectorUI() {
     renderPromotionSelectedProducts();
 }
 
+function isLoginBootstrapPage() {
+    return Boolean(document.getElementById('login-form')) && !document.getElementById('barcode');
+}
+
+function scheduleIdleTask(task, fallbackDelay = 200) {
+    const runTask = () => {
+        try {
+            task();
+        } catch (_) {
+        }
+    };
+    if (typeof window.requestIdleCallback === 'function') {
+        window.requestIdleCallback(() => runTask(), { timeout: 1200 });
+        return;
+    }
+    window.setTimeout(runTask, fallbackDelay);
+}
+
+async function warmupProductFormsData() {
+    await Promise.allSettled([
+        loadDepartmentOptions('product-department-add'),
+        loadDepartmentOptions('product-department-edit'),
+        loadProductSupplierOptions(),
+        syncProfitConfigFromServer(),
+    ]);
+    applyDefaultProfitToProductForms();
+}
+
 /* Mostrar la informaciÃ³n en la consola*/
 
-document.addEventListener('DOMContentLoaded', async () => {
+document.addEventListener('DOMContentLoaded', () => {
+    if (isLoginBootstrapPage()) {
+        return;
+    }
     setupFrontendErrorReporting();
+    setupSessionKeepAlive();
     applyUserPermissionsToUI();
-    await fetchScannerRuntimeSettings();
-    await ensureShiftStartedOnLoad();
+    applyAdminSiaOnlyProductsActionsVisibility();
+    setSalesEnabledByShift(false);
     setupProductSearchAutocomplete();
     setupAddProductCodeGuard();
     setupDepartmentNameUppercase();
-    await loadDepartmentOptions('product-department-add');
-    await loadDepartmentOptions('product-department-edit');
-    await loadProductSupplierOptions();
-    await loadPromotionProductsSelect();
     setupPromotionSelectorUI();
     setupCartQuantityKeyboardShortcuts();
     setupSystemFunctionKeyShortcuts();
+    setupSalesScannerStickyFocus();
     setupProductPriceAutoCalc();
     setupProductDescriptionTitleCase();
     setupAddInventoryToggle();
-    await syncProfitConfigFromServer();
+    setupBulkProductPopup();
     applyDefaultProfitToProductForms();
     restoreCartState();
     updateCartUI();
     updateSalesSessionStrip();
+    refreshLastSalesTicketInfoCard().catch(() => {});
     setupSalesMobileCameraPermissionHook();
     setupSalesCameraScanButtonVisibility();
-    if (scannerRuntimeSettings.scanner_auto_focus) {
-        document.getElementById('barcode')?.focus();
-    }
     if (document.getElementById('inventory-code-input')) {
         clearInventoryView();
     }
+
+    fetchScannerRuntimeSettings()
+        .catch(() => {})
+        .finally(() => {
+            focusBarcodeInputForNextScan({ force: true, select: false });
+        });
+
+    ensureShiftStartedOnLoad().catch((error) => {
+        console.error('Error ensureShiftStartedOnLoad:', error);
+    });
+
+    scheduleIdleTask(() => {
+        warmupProductFormsData().catch(() => {});
+    });
 });
 
-window.addEventListener('resize', setupSalesCameraScanButtonVisibility);
-window.addEventListener('orientationchange', setupSalesCameraScanButtonVisibility);
+if (!isLoginBootstrapPage()) {
+    window.addEventListener('resize', setupSalesCameraScanButtonVisibility);
+    window.addEventListener('orientationchange', setupSalesCameraScanButtonVisibility);
 
-window.addEventListener('focus', refreshSuppliersOnProductContext);
-window.addEventListener('minimarket:suppliers-updated', refreshSuppliersOnProductContext);
-window.addEventListener('message', (event) => {
-    try {
-        if (event.origin !== window.location.origin) return;
-        if (event?.data?.type !== 'minimarket:suppliers-updated') return;
-        refreshSuppliersOnProductContext();
-    } catch (_) {
-    }
-});
+    window.addEventListener('focus', refreshSuppliersOnProductContext);
+    window.addEventListener('minimarket:suppliers-updated', refreshSuppliersOnProductContext);
+    window.addEventListener('message', (event) => {
+        try {
+            if (event.origin !== window.location.origin) return;
+            if (event?.data?.type !== 'minimarket:suppliers-updated') return;
+            refreshSuppliersOnProductContext();
+        } catch (_) {
+        }
+    });
+}
             
-
-
-
-
-

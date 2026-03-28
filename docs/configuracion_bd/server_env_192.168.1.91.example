@@ -1,0 +1,17 @@
+NODE_ENV=development
+PORT=3001
+DB_HOST=192.168.1.91
+DB_USER=minimarket_app
+DB_PASSWORD="MiniM4rket#2026"
+DB_NAME=minimarket
+DB_PORT=3306
+JWT_SECRET=minimarket_local_fixed_secret_20260219
+JWT_EXPIRES_IN=24h
+JWT_REFRESH_EXPIRES_IN=7d
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_SECURE=0
+SMTP_USER=siatalca@gmail.com
+SMTP_PASS=njewzrfyjrbwprav
+SMTP_FROM=siatalca@gmail.com
+DTE_CERT_SECRET=minimarket_dte_cert_secret_2026_local

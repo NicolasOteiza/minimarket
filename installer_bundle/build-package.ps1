@@ -1,3 +1,7 @@
+param(
+  [switch]$RefreshOfflineInstallers
+)
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
@@ -6,6 +10,11 @@ $projectRoot = Split-Path -Parent $bundleRoot
 $payloadDir = Join-Path $bundleRoot "payload"
 $payloadZip = Join-Path $payloadDir "minimarket-app.zip"
 $tempCopy = Join-Path $env:TEMP "minimarket_pack_$(Get-Date -Format yyyyMMdd_HHmmss)"
+
+if ($RefreshOfflineInstallers) {
+  Write-Host "Actualizando instaladores offline (Node/XAMPP)..." -ForegroundColor Cyan
+  powershell -ExecutionPolicy Bypass -File (Join-Path $bundleRoot "scripts\fetch-offline-installers.ps1")
+}
 
 Write-Host "Generando payload de aplicacion..." -ForegroundColor Cyan
 
@@ -30,4 +39,3 @@ Compress-Archive -Path (Join-Path $tempCopy "*") -DestinationPath $payloadZip -C
 Remove-Item $tempCopy -Recurse -Force
 
 Write-Host "Payload creado: $payloadZip" -ForegroundColor Green
-

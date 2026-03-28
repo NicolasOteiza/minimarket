@@ -31,6 +31,7 @@ const publicRoutes = [
   { method: 'POST', path: '/api/login' },
   { method: 'POST', path: '/api/auth/refresh' },
   { method: 'POST', path: '/api/auth/logout' },
+  { method: 'POST', path: '/api/auth/verify-admin' },
   { method: 'GET', path: '/api/getInfo' },
   { method: 'GET', path: '/api/getCajas' },
   { method: 'POST', path: '/api/addInfo' },
@@ -92,14 +93,20 @@ function issueAccessToken(userId, name) {
   );
 }
 
-async function createRefreshSession({ userId, cajaId = null, turnoId = null, deviceHash = null }) {
+async function createRefreshSession({
+  userId,
+  cajaId = null,
+  sucursalId = null,
+  turnoId = null,
+  deviceHash = null,
+}) {
   const rawToken = crypto.randomBytes(48).toString('hex');
   const tokenHash = hashRefreshToken(rawToken);
   const expiresAt = new Date(Date.now() + (REFRESH_TOKEN_TTL_SECONDS * 1000));
   await db.query(
-    `INSERT INTO user_auth_sessions (user_id, token_hash, caja_id, turno_id, device_hash, expires_at, last_used_at)
-     VALUES (?, ?, ?, ?, ?, ?, NOW())`,
-    [userId, tokenHash, cajaId, turnoId, deviceHash || null, expiresAt]
+    `INSERT INTO user_auth_sessions (user_id, token_hash, caja_id, sucursal_id, turno_id, device_hash, expires_at, last_used_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, NOW())`,
+    [userId, tokenHash, cajaId, sucursalId, turnoId, deviceHash || null, expiresAt]
   );
   return { refreshToken: rawToken, refreshExpiresAt: expiresAt };
 }
@@ -114,11 +121,34 @@ function toNumber(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function toPositiveAmount(value, fallback = 0) {
+  const parsed = toNumber(value);
+  if (parsed === null) return fallback;
+  return Math.abs(parsed);
+}
+
+function sumMovementAmounts(rows = [], options = {}) {
+  const expectedType = String(options?.type || '').trim().toLowerCase();
+  const expectedMethod = String(options?.method || '').trim().toLowerCase();
+  const amountField = String(options?.field || 'total');
+  if (!expectedType) return 0;
+  return (Array.isArray(rows) ? rows : [])
+    .filter((row) => String(row?.tipo || '').trim().toLowerCase() === expectedType)
+    .filter((row) => !expectedMethod || String(row?.metodo || '').trim().toLowerCase() === expectedMethod)
+    .reduce((acc, row) => acc + toPositiveAmount(row?.[amountField], 0), 0);
+}
+
 function roundToDecimals(value, decimals = 2) {
   const num = toNumber(value);
   if (num === null) return null;
   const factor = 10 ** Math.max(0, Number(decimals) || 0);
   return Math.round(num * factor) / factor;
+}
+
+function toClpAmount(value, fallback = 0) {
+  const num = toNumber(value);
+  if (num === null) return fallback;
+  return Math.round(num);
 }
 
 function toBool(value) {
@@ -139,8 +169,119 @@ function normalizeSaleFormatName(value) {
   const raw = toText(value, 50);
   if (!raw) return null;
   const normalized = raw.toLowerCase();
-  if (normalized === 'botellas') return 'unidad';
+  if (['unidad', 'unidades', 'botella', 'botellas'].includes(normalized)) return 'unidad';
+  if (['granel', 'kilo', 'kilos', 'kg', 'kilogramo', 'kilogramos'].includes(normalized)) return 'granel';
+  if (['pack', 'paquete', 'paquetes'].includes(normalized)) return 'pack';
   return normalized;
+}
+
+function getSaleFormatCandidates(formatName) {
+  const normalized = normalizeSaleFormatName(formatName);
+  if (!normalized) return [];
+  if (normalized === 'unidad') return ['unidad', 'unidades', 'botella', 'botellas'];
+  if (normalized === 'granel') return ['granel', 'kilo', 'kilos', 'kg', 'kilogramo', 'kilogramos'];
+  if (normalized === 'pack') return ['pack', 'paquete', 'paquetes'];
+  return [normalized];
+}
+
+function getCanonicalSaleFormatName(formatName) {
+  const normalized = normalizeSaleFormatName(formatName);
+  if (['unidad', 'granel', 'pack'].includes(normalized)) return normalized;
+  return null;
+}
+
+async function resolveSaleFormatId(executor, formatName) {
+  const candidates = getSaleFormatCandidates(formatName);
+  if (!candidates.length) return null;
+
+  for (const candidate of candidates) {
+    const [rows] = await executor.query(
+      'SELECT id_formato FROM formato_venta WHERE LOWER(descripcion) = ? LIMIT 1',
+      [candidate]
+    );
+    if (rows.length) {
+      return Number(rows[0].id_formato || 0) || null;
+    }
+  }
+
+  const normalized = normalizeSaleFormatName(formatName);
+  if (normalized === 'granel') {
+    const [rows] = await executor.query(
+      `SELECT id_formato
+       FROM formato_venta
+       WHERE LOWER(descripcion) LIKE '%granel%'
+          OR LOWER(descripcion) LIKE '%kilo%'
+          OR LOWER(descripcion) LIKE '%kg%'
+       ORDER BY id_formato ASC
+       LIMIT 1`
+    );
+    if (rows.length) {
+      return Number(rows[0].id_formato || 0) || null;
+    }
+  }
+
+  if (normalized === 'unidad') {
+    const [rows] = await executor.query(
+      `SELECT id_formato
+       FROM formato_venta
+       WHERE LOWER(descripcion) LIKE '%unidad%'
+          OR LOWER(descripcion) LIKE '%botella%'
+       ORDER BY id_formato ASC
+       LIMIT 1`
+    );
+    if (rows.length) {
+      return Number(rows[0].id_formato || 0) || null;
+    }
+  }
+
+  if (normalized === 'pack') {
+    const [rows] = await executor.query(
+      `SELECT id_formato
+       FROM formato_venta
+       WHERE LOWER(descripcion) LIKE '%pack%'
+          OR LOWER(descripcion) LIKE '%paquete%'
+       ORDER BY id_formato ASC
+       LIMIT 1`
+    );
+    if (rows.length) {
+      return Number(rows[0].id_formato || 0) || null;
+    }
+  }
+
+  const canonicalName = getCanonicalSaleFormatName(normalized);
+  if (!canonicalName) {
+    return null;
+  }
+
+  try {
+    await executor.query(
+      `INSERT INTO formato_venta (descripcion)
+       SELECT ?
+       FROM DUAL
+       WHERE NOT EXISTS (
+         SELECT 1 FROM formato_venta WHERE LOWER(descripcion) = ?
+       )`,
+      [canonicalName, canonicalName]
+    );
+  } catch (error) {
+    if (!error || error.code !== 'ER_DUP_ENTRY') {
+      throw error;
+    }
+  }
+
+  const [rows] = await executor.query(
+    `SELECT id_formato
+     FROM formato_venta
+     WHERE LOWER(descripcion) = ?
+     ORDER BY id_formato ASC
+     LIMIT 1`,
+    [canonicalName]
+  );
+  if (rows.length) {
+    return Number(rows[0].id_formato || 0) || null;
+  }
+
+  return null;
 }
 
 function normalizeImportedBarcode(rawValue, maxLength = 80) {
@@ -178,6 +319,36 @@ function isValidCajaNumber(value) {
   return Number.isInteger(value) && value >= 1 && value <= 8;
 }
 
+const MAX_ACTIVE_BRANCHES_DEFAULT = 3;
+const BRANCH_CREATOR_CONTACT_DEFAULT = 'SIA';
+
+function normalizeBranchCode(rawValue) {
+  const base = String(rawValue || '')
+    .trim()
+    .toUpperCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^A-Z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 16);
+  if (!base) return null;
+  return base;
+}
+
+async function resolveBranchForCaja(cajaId, connection = db) {
+  const cajaNum = toInt(cajaId);
+  if (!cajaNum) return 1;
+  const [rows] = await connection.query(
+    `SELECT sucursal_id
+     FROM cajas
+     WHERE n_caja = ?
+     LIMIT 1`,
+    [cajaNum]
+  );
+  const branchId = toInt(rows[0]?.sucursal_id);
+  return branchId || 1;
+}
+
 function normalizeFolioPrefix(value) {
   if (value === null || typeof value === 'undefined') return '';
   const prefix = String(value).trim().toUpperCase();
@@ -201,6 +372,174 @@ function buildFormattedTicketNumber(ticketNumber, folioSettings = {}) {
 
 function isIsoDate(value) {
   return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
+function normalizeInventoryMovementType(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  if (raw === 'ajuste') return 'ajuste';
+  if (raw === 'modificacion' || raw === 'modificaciÃ³n') return 'modificacion';
+  return null;
+}
+
+async function resolveCurrentCajaIdForUser(userId, executor = db) {
+  const safeUserId = toInt(userId);
+  if (!safeUserId) return null;
+  const [rows] = await executor.query(
+    `SELECT caja_id
+     FROM user_auth_sessions
+     WHERE user_id = ?
+       AND revoked_at IS NULL
+       AND expires_at > NOW()
+       AND caja_id IS NOT NULL
+     ORDER BY COALESCE(last_used_at, created_at) DESC, id DESC
+     LIMIT 1`,
+    [safeUserId]
+  );
+  return toInt(rows[0]?.caja_id) || null;
+}
+
+async function isAdminSiaUser(userId, executor = db) {
+  const safeUserId = toInt(userId);
+  if (!safeUserId) return false;
+  const [rows] = await executor.query(
+    `SELECT user
+     FROM usuarios
+     WHERE id = ?
+     LIMIT 1`,
+    [safeUserId]
+  );
+  if (!rows.length) return false;
+  return String(rows[0]?.user || '').trim().toLowerCase() === 'admin_sia';
+}
+
+function normalizeHourMinute(value, fallback = '00:00') {
+  const raw = String(value || '').trim();
+  if (/^([01]\d|2[0-3]):([0-5]\d)$/.test(raw)) {
+    return raw;
+  }
+  return fallback;
+}
+
+function parseCutIdList(rawValue) {
+  let source = [];
+  if (Array.isArray(rawValue)) {
+    source = rawValue;
+  } else if (typeof rawValue === 'string') {
+    source = rawValue.split(/[,\s;|]+/);
+  } else if (typeof rawValue === 'number') {
+    source = [rawValue];
+  } else {
+    return [];
+  }
+  const seen = new Set();
+  const out = [];
+  source.forEach((value) => {
+    const id = toInt(value);
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    out.push(id);
+  });
+  return out;
+}
+
+function normalizeCutRebuildFilters(source = {}) {
+  const fromDate = String(source?.desde || source?.from_date || '').trim();
+  const toDate = String(source?.hasta || source?.to_date || '').trim();
+  const fromTime = normalizeHourMinute(source?.hora_desde ?? source?.from_time, '00:00');
+  const toTime = normalizeHourMinute(source?.hora_hasta ?? source?.to_time, '23:59');
+  const cajaId = toInt(source?.caja);
+  const cajeroId = toInt(source?.cajero);
+  const turnoId = toInt(source?.turno);
+  const saleIds = parseCutIdList(source?.sale_ids);
+  const cutIdsFromList = parseCutIdList(source?.cut_ids);
+  const cutIds = cutIdsFromList.length
+    ? cutIdsFromList
+    : (turnoId ? [turnoId] : []);
+
+  if (!isIsoDate(fromDate) || !isIsoDate(toDate)) {
+    return { ok: false, message: 'Parametros desde y hasta son obligatorios en formato YYYY-MM-DD' };
+  }
+  const fromDateTime = `${fromDate} ${fromTime}:00`;
+  const toDateTime = `${toDate} ${toTime}:59`;
+  if (fromDateTime > toDateTime) {
+    return { ok: false, message: 'El rango de fecha/hora es invalido' };
+  }
+
+  return {
+    ok: true,
+    filters: {
+      fromDate,
+      toDate,
+      fromTime,
+      toTime,
+      fromDateTime,
+      toDateTime,
+      cajaId: cajaId || null,
+      cajeroId: cajeroId || null,
+      turnoId: turnoId || null,
+      saleIds,
+      cutIds,
+    },
+  };
+}
+
+function buildCutRebuildWhere(filters, alias = 'v', options = {}) {
+  const includeSaleIds = options?.includeSaleIds !== false;
+  const list = [];
+  const params = [];
+  list.push(`${alias}.fecha BETWEEN ? AND ?`);
+  params.push(filters.fromDateTime, filters.toDateTime);
+
+  if (filters.cajaId) {
+    list.push(`${alias}.caja_id = ?`);
+    params.push(filters.cajaId);
+  }
+  if (filters.cajeroId) {
+    list.push(`${alias}.usuario_id = ?`);
+    params.push(filters.cajeroId);
+  }
+  if (Array.isArray(filters.cutIds) && filters.cutIds.length > 0) {
+    list.push(`${alias}.turno_id IN (?)`);
+    params.push(filters.cutIds);
+  }
+  if (includeSaleIds && alias === 'v' && Array.isArray(filters.saleIds) && filters.saleIds.length > 0) {
+    list.push(`${alias}.id_venta IN (?)`);
+    params.push(filters.saleIds);
+  }
+
+  return {
+    whereClause: list.join(' AND '),
+    params,
+  };
+}
+
+function buildCutRebuildCutWhere(filters, alias = 'c') {
+  const list = [];
+  const params = [];
+  list.push(`${alias}.fecha BETWEEN ? AND ?`);
+  params.push(filters.fromDate, filters.toDate);
+  list.push(`${alias}.hora_apertura <= ?`);
+  params.push(filters.toDateTime);
+  list.push(`COALESCE(${alias}.hora_cierre, ${alias}.hora_apertura) >= ?`);
+  params.push(filters.fromDateTime);
+
+  if (filters.cajaId) {
+    list.push(`${alias}.caja_id = ?`);
+    params.push(filters.cajaId);
+  }
+  if (filters.cajeroId) {
+    list.push(`${alias}.usuario_id = ?`);
+    params.push(filters.cajeroId);
+  }
+  if (Array.isArray(filters.cutIds) && filters.cutIds.length > 0) {
+    list.push(`${alias}.id_corte IN (?)`);
+    params.push(filters.cutIds);
+  }
+
+  return {
+    whereClause: list.join(' AND '),
+    params,
+  };
 }
 
 function csvEscape(value, delimiter = ',') {
@@ -951,6 +1290,18 @@ function formatCLP(value) {
   return Math.round(amount).toLocaleString('es-CL');
 }
 
+function formatTicketQuantity(value) {
+  const qty = Number(value || 0);
+  if (!Number.isFinite(qty)) return '0';
+  if (Math.abs(qty - Math.round(qty)) < 0.0001) {
+    return Math.round(qty).toLocaleString('es-CL');
+  }
+  return qty.toLocaleString('es-CL', {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 3,
+  });
+}
+
 function padRight(value, width) {
   const str = String(value ?? '');
   if (str.length >= width) return str.slice(0, width);
@@ -963,6 +1314,47 @@ function padLeft(value, width) {
   return ' '.repeat(width - str.length) + str;
 }
 
+function normalizeTicketSingleLine(value = '') {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function truncateTicketLine(value = '', maxWidth = 42) {
+  const width = Math.max(1, Number(maxWidth || 1));
+  const singleLine = normalizeTicketSingleLine(value);
+  if (singleLine.length <= width) return singleLine;
+  if (width <= 3) return singleLine.slice(0, width);
+  return `${singleLine.slice(0, width - 3)}...`;
+}
+
+function buildRightAlignedTicketLine(label, valueText, columns, options = {}) {
+  const safeColumns = clampInt(columns, 16, 80, 42);
+  const normalizedLabel = normalizeTicketSingleLine(label);
+  const minLabelWidth = clampInt(options.minLabelWidth, 4, 24, 8);
+  const rightGutter = clampInt(options.rightGutter, 0, 3, 1);
+  const maxLineWidth = Math.max(10, safeColumns - rightGutter);
+  const minAmountWidth = clampInt(options.minAmountWidth, 4, 18, 7);
+
+  let normalizedValue = normalizeTicketSingleLine(valueText);
+  if (!normalizedValue) normalizedValue = '$0';
+  if (normalizedValue.length > (maxLineWidth - 1)) {
+    normalizedValue = normalizedValue.slice(-(maxLineWidth - 1));
+  }
+
+  let valueWidth = normalizedValue.length;
+  let leftWidth = maxLineWidth - valueWidth - 1;
+  if (leftWidth < minLabelWidth) {
+    const cappedValueWidth = Math.max(minAmountWidth, maxLineWidth - minLabelWidth - 1);
+    if (valueWidth > cappedValueWidth) {
+      normalizedValue = normalizedValue.slice(-cappedValueWidth);
+      valueWidth = normalizedValue.length;
+    }
+    leftWidth = Math.max(minLabelWidth, maxLineWidth - valueWidth - 1);
+  }
+
+  const labelText = truncateTicketLine(normalizedLabel, leftWidth);
+  return `${padRight(labelText, leftWidth)} ${padLeft(normalizedValue, valueWidth)}`;
+}
+
 function normalizeTicketPaperWidth(value, fallback = 58) {
   const parsed = Number.parseInt(value, 10);
   if (!Number.isInteger(parsed)) return fallback;
@@ -972,6 +1364,7 @@ function normalizeTicketPaperWidth(value, fallback = 58) {
 function clampColumnsByPaper(columnsValue, paperWidthMm, fallback = 30) {
   const paper = normalizeTicketPaperWidth(paperWidthMm, 58);
   if (paper === 58) {
+    // 58mm profile: allow dense layouts up to 56 cols when needed.
     return clampInt(columnsValue, 28, 56, fallback);
   }
   return clampInt(columnsValue, 32, 64, Math.max(42, fallback));
@@ -985,11 +1378,219 @@ function getPrintProfile(printerName, requestedColumns, paperWidthMm = 58) {
   return {
     columns,
     fontSize: paper === 58
-      ? (columns <= 30 ? 6.5 : (columns <= 36 ? 6.2 : (columns <= 42 ? 5.9 : (columns <= 48 ? 5.6 : 5.2))))
-      : (columns <= 36 ? 7.5 : 8),
+      ? (columns <= 30 ? 7.2 : (columns <= 36 ? 6.8 : (columns <= 42 ? 6.4 : (columns <= 48 ? 6.0 : 5.6))))
+      : (columns <= 36 ? 8.4 : 8.8),
     isXp58,
     paper_width_mm: paper,
   };
+}
+
+function getCutReportFontSize(baseFontSize, paperWidthMm = 58, columns = 42) {
+  const parsed = Number(baseFontSize);
+  const fallback = Number.isFinite(parsed) ? parsed : 6.5;
+  const paper = normalizeTicketPaperWidth(paperWidthMm, 58);
+  const safeColumns = clampColumnsByPaper(columns, paper, paper === 58 ? 30 : 42);
+
+  let tuned = fallback;
+  if (paper === 58) {
+    if (safeColumns <= 30) tuned = fallback + 0.4;
+    else if (safeColumns <= 38) tuned = fallback + 0.3;
+    else tuned = fallback + 0.2;
+  } else {
+    tuned = fallback + 0.5;
+  }
+
+  return Math.max(5.8, Math.min(13.2, Number(tuned.toFixed(1))));
+}
+
+function getReadableSaleTicketColumns(columnsValue, paperWidthMm = 58) {
+  const paper = normalizeTicketPaperWidth(paperWidthMm, 58);
+  // Para venta, respetar columnas configuradas por caja/papel dentro del rango valido.
+  return clampColumnsByPaper(columnsValue, paper, paper === 58 ? 30 : 42);
+}
+
+function buildCutPrintStyleRules(cutSettings = null) {
+  const labels = normalizeCutPrintLabels(cutSettings?.print_labels || {});
+  const styles = normalizeCutPrintStyles(cutSettings?.print_styles || {});
+  const rules = [];
+
+  const addRule = (key, match, text) => {
+    const style = styles[key];
+    const ruleText = String(text || '').trim();
+    if (!style || !ruleText) return;
+    const modeRaw = String(style.mode || 'normal').trim().toLowerCase();
+    const mode = modeRaw === 'bold' || modeRaw === 'italic' ? modeRaw : 'normal';
+    const sizeRaw = Number(style.size);
+    const size = Number.isFinite(sizeRaw) ? Math.max(0.8, Math.min(1.8, Number(sizeRaw.toFixed(2)))) : 1;
+    if (mode === 'normal' && Math.abs(size - 1) < 0.001) return;
+    rules.push({
+      key,
+      match: match === 'starts' ? 'starts' : 'exact',
+      text: ruleText,
+      mode,
+      scale: size,
+    });
+  };
+
+  addRule('title_cut', 'exact', labels.title_cut);
+  addRule('title_cash_box', 'exact', labels.title_cash_box);
+  addRule('title_entries', 'exact', labels.title_entries);
+  addRule('title_exits', 'exact', labels.title_exits);
+  addRule('title_sales', 'exact', labels.title_sales);
+  addRule('title_departments', 'exact', labels.title_departments);
+  addRule('title_report_footer', 'exact', labels.title_report_footer);
+  addRule('label_shift_prefix', 'starts', labels.label_shift_prefix);
+  addRule('label_generated_at', 'starts', labels.label_generated_at);
+  addRule('label_cashier', 'starts', labels.label_cashier);
+  addRule('label_box', 'starts', labels.label_box);
+  addRule('label_schedule', 'starts', labels.label_schedule);
+  addRule('label_sales_total', 'starts', labels.label_sales_total);
+  addRule('label_base_fund', 'starts', labels.label_base_fund);
+  addRule('label_cash_sales', 'starts', labels.label_cash_sales);
+  addRule('label_cash_payments', 'starts', labels.label_cash_payments);
+  addRule('label_cash_entries', 'starts', labels.label_cash_entries);
+  addRule('label_cash_exits', 'starts', labels.label_cash_exits);
+  addRule('label_cash_in_box', 'starts', labels.label_cash_in_box);
+  addRule('label_total_entries', 'starts', labels.label_total_entries);
+  addRule('label_total_exits', 'starts', labels.label_total_exits);
+  addRule('label_detail_title', 'exact', labels.label_detail_title);
+  addRule('label_no_entries', 'exact', labels.label_no_entries);
+  addRule('label_no_exits', 'exact', labels.label_no_exits);
+  addRule('label_hidden_detail', 'exact', labels.label_hidden_detail);
+  addRule('label_returns', 'starts', labels.label_returns);
+  addRule('label_total_sales_line', 'starts', labels.label_total_sales_line);
+  addRule('label_no_departments', 'exact', labels.label_no_departments);
+  addRule('label_report_no_items', 'exact', labels.label_report_no_items);
+
+  return rules;
+}
+
+function getSaleTicketFontSize(baseFontSize, paperWidthMm = 58, columns = 34) {
+  const parsed = Number(baseFontSize);
+  const fallback = Number.isFinite(parsed) ? parsed : 6.5;
+  // Mantener la misma escala base de la previsualizacion para evitar "zoom" en impresion real.
+  return Math.max(5.4, Math.min(11.2, Number(fallback.toFixed(1))));
+}
+
+function buildGdiTicketPrintCommand(tempFile, printerName, fontSize = 6.5, styleRules = null) {
+  const safeTempFile = escapePsSingleQuoted(tempFile);
+  const safePrinter = escapePsSingleQuoted(printerName);
+  const safeFontSize = Number.isFinite(Number(fontSize)) ? Number(fontSize) : 6.5;
+  const safeStyleRulesB64 = Array.isArray(styleRules) && styleRules.length
+    ? Buffer.from(JSON.stringify(styleRules), 'utf8').toString('base64')
+    : '';
+  return (
+    `Add-Type -AssemblyName System.Drawing; ` +
+    `$lines = @(Get-Content -Encoding UTF8 -Path '${safeTempFile}'); ` +
+    `$pd = New-Object System.Drawing.Printing.PrintDocument; ` +
+    `$pd.PrinterSettings.PrinterName = '${safePrinter}'; ` +
+    `if (-not $pd.PrinterSettings.IsValid) { throw 'Impresora no valida o no disponible'; } ` +
+    `$pd.OriginAtMargins = $false; ` +
+    `$pd.DefaultPageSettings.Margins = New-Object System.Drawing.Printing.Margins(0, 0, 0, 0); ` +
+    `$handler = [System.Drawing.Printing.PrintPageEventHandler]{ ` +
+    `param($sender,$e) ` +
+    `$styleRules = @(); ` +
+    `if ('${safeStyleRulesB64}'.Length -gt 0) { ` +
+    `try { ` +
+    `$styleJson = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${safeStyleRulesB64}')); ` +
+    `$parsedRules = ConvertFrom-Json -InputObject $styleJson; ` +
+    `if ($parsedRules) { $styleRules = @($parsedRules) } ` +
+    `} catch { $styleRules = @() } ` +
+    `} ` +
+    `$baseFontSize = [double]${safeFontSize}; ` +
+    `$maxLine = ' '; ` +
+    `for ($i = 0; $i -lt $lines.Count; $i++) { ` +
+    `$candidate = [string]$lines[$i]; ` +
+    `if ($candidate.Length -gt $maxLine.Length) { $maxLine = $candidate } ` +
+    `} ` +
+    `$measureFormat = New-Object System.Drawing.StringFormat([System.Drawing.StringFormat]::GenericTypographic); ` +
+    `$measureFormat.FormatFlags = $measureFormat.FormatFlags -bor [System.Drawing.StringFormatFlags]::MeasureTrailingSpaces; ` +
+    `$pageWidth = [double]$e.PageBounds.Width; ` +
+    `$usableWidth = [Math]::Max(40.0, $pageWidth - 1.0); ` +
+    `$targetMaxWidth = $usableWidth * 0.965; ` +
+    `$measureWidth = { param([double]$sizeToMeasure) ` +
+    `$probe = New-Object System.Drawing.Font('Consolas', [float]$sizeToMeasure); ` +
+    `try { [double]$e.Graphics.MeasureString($maxLine, $probe, 32767, $measureFormat).Width } ` +
+    `finally { $probe.Dispose() } ` +
+    `}; ` +
+    `$regularSize = [Math]::Round([Math]::Max(4.8, [Math]::Min(14.5, $baseFontSize)), 2); ` +
+    `$regularWidth = & $measureWidth $regularSize; ` +
+    `if ($regularWidth -gt $targetMaxWidth) { ` +
+    `for ($shrink = $regularSize - 0.1; $shrink -ge 4.6; $shrink -= 0.1) { ` +
+    `$shrinkWidth = & $measureWidth $shrink; ` +
+    `$regularSize = [Math]::Round($shrink, 2); ` +
+    `$regularWidth = $shrinkWidth; ` +
+    `if ($shrinkWidth -le $targetMaxWidth) { break } ` +
+    `} ` +
+    `} ` +
+    `$fontRegular = New-Object System.Drawing.Font('Consolas', [float]$regularSize); ` +
+    `$titleSize = [Math]::Max(5.4, [Math]::Min(16.0, $regularSize + 1.15)); ` +
+    `$fontBold = New-Object System.Drawing.Font('Consolas', [float]$titleSize, [System.Drawing.FontStyle]::Bold); ` +
+    `$brush = [System.Drawing.Brushes]::Black; ` +
+    `$hardX = $e.PageSettings.HardMarginX; ` +
+    `$hardY = $e.PageSettings.HardMarginY; ` +
+    `$x = -$hardX; ` +
+    `$y = -$hardY; ` +
+    `for ($i = 0; $i -lt $lines.Count; $i++) { ` +
+    `$line = [string]$lines[$i]; ` +
+    `$trim = $line.Trim(); ` +
+    `$isDivider = $trim -match '^[\\-\\=]{6,}$'; ` +
+    `$isTitle = $false; ` +
+    `if ($trim.Length -gt 0 -and -not $isDivider) { ` +
+    `if ($i -eq 0) { $isTitle = $true } ` +
+    `elseif ($trim -match '^(DETALLE|TOTAL|ORIGINAL CLIENTE|CORTE DE TURNO|DINERO EN CAJA|ENTRADAS EFECTIVO|SALIDAS EFECTIVO|VENTAS POR DEPTO|VENTAS|RESUMEN|COMPROBANTE DE VENTA|COMPROBANTE|TICKET|TURNO\\s*#\\d+)$') { $isTitle = $true } ` +
+    `} ` +
+    `$font = if ($isTitle) { $fontBold } else { $fontRegular }; ` +
+    `$isCustomFont = $false; ` +
+    `if ($trim.Length -gt 0 -and $styleRules.Count -gt 0) { ` +
+    `$customRule = $null; ` +
+    `foreach ($rule in $styleRules) { ` +
+    `if ($null -eq $rule) { continue } ` +
+    `$ruleText = [string]$rule.text; ` +
+    `if ([string]::IsNullOrWhiteSpace($ruleText)) { continue } ` +
+    `$matchType = [string]$rule.match; ` +
+    `if ($matchType -eq 'starts') { ` +
+    `if ($trim.StartsWith($ruleText, [System.StringComparison]::CurrentCultureIgnoreCase)) { $customRule = $rule; break } ` +
+    `} else { ` +
+    `if ([string]::Equals($trim, $ruleText, [System.StringComparison]::CurrentCultureIgnoreCase)) { $customRule = $rule; break } ` +
+    `} ` +
+    `} ` +
+    `if ($null -ne $customRule) { ` +
+    `$mode = [string]$customRule.mode; ` +
+    `$scale = [double]$customRule.scale; ` +
+    `if ([double]::IsNaN($scale) -or [double]::IsInfinity($scale)) { $scale = 1.0 } ` +
+    `$scale = [Math]::Max(0.8, [Math]::Min(1.8, $scale)); ` +
+    `$customStyle = [System.Drawing.FontStyle]::Regular; ` +
+    `if ($mode -eq 'bold') { $customStyle = $customStyle -bor [System.Drawing.FontStyle]::Bold } ` +
+    `elseif ($mode -eq 'italic') { $customStyle = $customStyle -bor [System.Drawing.FontStyle]::Italic } ` +
+    `if ($mode -eq 'normal' -and $isTitle) { $customStyle = [System.Drawing.FontStyle]::Regular } ` +
+    `if ($trim -match '[-+]?\\s*\\$\\s*[0-9\\.,]+$' -and $scale -gt 1.0) { $scale = 1.0 } ` +
+    `$customSize = [Math]::Max(4.8, [Math]::Min(18.0, $regularSize * $scale)); ` +
+    `$customMin = [Math]::Max(4.8, [Math]::Min(18.0, $regularSize * 0.82)); ` +
+    `for ($fitIter = 0; $fitIter -lt 16; $fitIter++) { ` +
+    `$probeFont = New-Object System.Drawing.Font('Consolas', [float]$customSize, $customStyle); ` +
+    `try { $probeWidth = [double]$e.Graphics.MeasureString($line, $probeFont, 32767, $measureFormat).Width } ` +
+    `finally { $probeFont.Dispose() } ` +
+    `if ($probeWidth -le $targetMaxWidth) { break } ` +
+    `$customSize = [Math]::Round($customSize - 0.08, 2); ` +
+    `if ($customSize -le $customMin) { $customSize = $customMin; break } ` +
+    `} ` +
+    `$font = New-Object System.Drawing.Font('Consolas', [float]$customSize, $customStyle); ` +
+    `$isCustomFont = $true; ` +
+    `} ` +
+    `} ` +
+    `$e.Graphics.DrawString($line, $font, $brush, $x, $y); ` +
+    `$y += $font.GetHeight($e.Graphics); ` +
+    `if ($isCustomFont -and $font) { $font.Dispose() } ` +
+    `} ` +
+    `$measureFormat.Dispose(); ` +
+    `$fontRegular.Dispose(); ` +
+    `$fontBold.Dispose(); ` +
+    `$e.HasMorePages = $false ` +
+    `}; ` +
+    `$pd.add_PrintPage($handler); ` +
+    `$pd.Print();`
+  );
 }
 
 function normalizePrintEngine(value) {
@@ -1002,7 +1603,318 @@ function normalizeFeedLines(value) {
   return clampInt(value, 0, 8, 2);
 }
 
-function buildSaleTicketText({ sale, details, settings, business }) {
+function normalizeCutMode(value) {
+  const mode = String(value || '').trim().toLowerCase();
+  return mode === 'sin_ajuste' ? 'sin_ajuste' : 'ajuste_auto';
+}
+
+function getDefaultCutPrintLabels() {
+  return {
+    title_cut: 'CORTE DE TURNO',
+    title_cash_box: 'DINERO EN CAJA',
+    title_entries: 'ENTRADAS EFECTIVO',
+    title_exits: 'SALIDAS EFECTIVO',
+    title_sales: 'VENTAS',
+    title_departments: 'VENTAS POR DEPTO',
+    title_report_footer: 'REPORTE DE CORTE',
+    label_shift_prefix: 'TURNO #',
+    label_generated_at: 'Realizado',
+    label_cashier: 'Cajero',
+    label_box: 'Caja',
+    label_schedule: 'Horario',
+    label_sales_total: 'Ventas totales',
+    label_sales_count_suffix: 'venta(s) en el turno',
+    label_base_fund: 'Fondo de caja',
+    label_cash_sales: 'Ventas en efectivo',
+    label_cash_payments: 'Abonos en efectivo',
+    label_cash_entries: 'Entradas',
+    label_cash_exits: 'Salidas',
+    label_cash_in_box: 'Efectivo en caja',
+    label_total_entries: 'Total entradas',
+    label_total_exits: 'Total salidas',
+    label_detail_title: 'Detalle y suma por item',
+    label_no_entries: 'SIN ENTRADAS DETALLADAS',
+    label_no_exits: 'SIN SALIDAS DETALLADAS',
+    label_hidden_detail: 'DETALLE OCULTO POR CONFIGURACION',
+    label_items_summary_suffix: 'item(s) resumidos',
+    label_returns: 'Devoluciones',
+    label_total_sales_line: 'Total ventas',
+    label_no_departments: 'SIN VENTAS POR DEPARTAMENTO',
+    label_no_department_name: 'SIN DEPARTAMENTO',
+    label_report_no_items: 'REPORTE CONFIGURADO SIN ITEMS',
+  };
+}
+
+function normalizeCutPrintLabels(value = null) {
+  const defaults = getDefaultCutPrintLabels();
+  let source = {};
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      if (parsed && typeof parsed === 'object') source = parsed;
+    } catch (_) {
+      source = {};
+    }
+  } else if (value && typeof value === 'object') {
+    source = value;
+  }
+  const out = {};
+  Object.keys(defaults).forEach((key) => {
+    const normalized = toText(source[key], 120);
+    out[key] = (normalized ? String(normalized).trim() : '') || defaults[key];
+  });
+  return out;
+}
+
+function getDefaultCutPrintStyleMap() {
+  const labels = getDefaultCutPrintLabels();
+  const out = {};
+  Object.keys(labels).forEach((key) => {
+    out[key] = { mode: 'normal', size: 1 };
+  });
+  return out;
+}
+
+function normalizeCutPrintStyles(value = null) {
+  const defaults = getDefaultCutPrintStyleMap();
+  let source = {};
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      if (parsed && typeof parsed === 'object') source = parsed;
+    } catch (_) {
+      source = {};
+    }
+  } else if (value && typeof value === 'object') {
+    source = value;
+  }
+  const out = {};
+  Object.keys(defaults).forEach((key) => {
+    const raw = source[key] && typeof source[key] === 'object' ? source[key] : {};
+    const modeRaw = String(raw.mode || '').trim().toLowerCase();
+    const mode = modeRaw === 'bold' || modeRaw === 'italic' ? modeRaw : 'normal';
+    const parsedSize = Number(raw.size);
+    const size = Number.isFinite(parsedSize) ? Math.max(0.8, Math.min(1.8, Number(parsedSize.toFixed(2)))) : 1;
+    out[key] = { mode, size };
+  });
+  return out;
+}
+
+function normalizeCutFormatSettingsRow(row = {}) {
+  const rawLabels = typeof row.cut_print_labels_json === 'undefined'
+    ? row.print_labels
+    : row.cut_print_labels_json;
+  const rawStyles = typeof row.cut_print_styles_json === 'undefined'
+    ? row.print_styles
+    : row.cut_print_styles_json;
+  return {
+    mode: normalizeCutMode(row.cut_mode ?? row.mode),
+    show_business_info: normalizeBool(row.cut_show_business_info ?? row.show_business_info, true) ? 1 : 0,
+    show_shift_info: normalizeBool(row.cut_show_shift_info ?? row.show_shift_info, true) ? 1 : 0,
+    show_sales_overview: normalizeBool(row.cut_show_sales_overview ?? row.show_sales_overview, true) ? 1 : 0,
+    show_cash_summary: normalizeBool(row.cut_show_cash_summary ?? row.show_cash_summary, true) ? 1 : 0,
+    show_entries_section: normalizeBool(row.cut_show_entries_section ?? row.show_entries_section, true) ? 1 : 0,
+    show_entries_detail: normalizeBool(row.cut_show_entries_detail ?? row.show_entries_detail, true) ? 1 : 0,
+    show_exits_section: normalizeBool(row.cut_show_exits_section ?? row.show_exits_section, true) ? 1 : 0,
+    show_exits_detail: normalizeBool(row.cut_show_exits_detail ?? row.show_exits_detail, true) ? 1 : 0,
+    show_sales_methods: normalizeBool(row.cut_show_sales_methods ?? row.show_sales_methods, true) ? 1 : 0,
+    show_department_totals: normalizeBool(row.cut_show_department_totals ?? row.show_department_totals, true) ? 1 : 0,
+    show_footer: normalizeBool(row.cut_show_footer ?? row.show_footer, true) ? 1 : 0,
+    print_labels: normalizeCutPrintLabels(rawLabels),
+    print_styles: normalizeCutPrintStyles(rawStyles),
+  };
+}
+
+async function getCutSettings(executor = db) {
+  const [rows] = await executor.query(
+    `SELECT cut_mode,
+            cut_show_business_info, cut_show_shift_info, cut_show_sales_overview,
+            cut_show_cash_summary, cut_show_entries_section, cut_show_entries_detail,
+            cut_show_exits_section, cut_show_exits_detail, cut_show_sales_methods,
+            cut_show_department_totals, cut_show_footer, cut_print_labels_json, cut_print_styles_json
+     FROM personalization_settings
+     WHERE id = 1
+     LIMIT 1`
+  );
+  if (!rows.length) return null;
+  return normalizeCutFormatSettingsRow(rows[0]);
+}
+
+function mergeCutFormatSettings(baseSettings = null, overrideSettings = null) {
+  const base = normalizeCutFormatSettingsRow(baseSettings || {});
+  const override = (overrideSettings && typeof overrideSettings === 'object') ? overrideSettings : {};
+  return normalizeCutFormatSettingsRow({
+    mode: override.mode ?? base.mode,
+    show_business_info: override.show_business_info ?? base.show_business_info,
+    show_shift_info: override.show_shift_info ?? base.show_shift_info,
+    show_sales_overview: override.show_sales_overview ?? base.show_sales_overview,
+    show_cash_summary: override.show_cash_summary ?? base.show_cash_summary,
+    show_entries_section: override.show_entries_section ?? base.show_entries_section,
+    show_entries_detail: override.show_entries_detail ?? base.show_entries_detail,
+    show_exits_section: override.show_exits_section ?? base.show_exits_section,
+    show_exits_detail: override.show_exits_detail ?? base.show_exits_detail,
+    show_sales_methods: override.show_sales_methods ?? base.show_sales_methods,
+    show_department_totals: override.show_department_totals ?? base.show_department_totals,
+    show_footer: override.show_footer ?? base.show_footer,
+    print_labels: normalizeCutPrintLabels(override.print_labels ?? base.print_labels),
+    print_styles: normalizeCutPrintStyles(override.print_styles ?? base.print_styles),
+  });
+}
+
+function extractCajaIdFromRequest(req) {
+  const query = req?.query || {};
+  const body = req?.body || {};
+  const headerCaja = req?.headers?.['x-caja-id'];
+  return (
+    toInt(query.caja)
+    || toInt(query.caja_id)
+    || toInt(body.caja)
+    || toInt(body.caja_id)
+    || toInt(body.numero_caja)
+    || toInt(headerCaja)
+    || null
+  );
+}
+
+function normalizeTicketSettingsRow(row = {}) {
+  const paperWidthMm = normalizeTicketPaperWidth(row.paper_width_mm, 58);
+  const columnsWidth = clampColumnsByPaper(
+    row.columns_width,
+    paperWidthMm,
+    paperWidthMm === 58 ? 30 : 42
+  );
+  return {
+    id: 1,
+    ticket_header: toText(row.ticket_header ?? 'COMPROBANTE DE VENTA', 120) || 'COMPROBANTE DE VENTA',
+    ticket_footer: toText(row.ticket_footer ?? 'Gracias por su compra', 255) || 'Gracias por su compra',
+    printer_name: typeof row.printer_name === 'string' ? row.printer_name.trim().slice(0, 255) : '',
+    columns_width: columnsWidth,
+    paper_width_mm: paperWidthMm,
+    print_engine: normalizePrintEngine(row.print_engine),
+    feed_lines_after_print: normalizeFeedLines(row.feed_lines_after_print),
+    show_business_info: normalizeBool(row.show_business_info, true) ? 1 : 0,
+    show_cashier: normalizeBool(row.show_cashier, true) ? 1 : 0,
+    show_box: normalizeBool(row.show_box, true) ? 1 : 0,
+    show_payment_method: normalizeBool(row.show_payment_method, true) ? 1 : 0,
+    show_ticket_number: normalizeBool(row.show_ticket_number, true) ? 1 : 0,
+    include_details_by_default: normalizeBool(row.include_details_by_default, true) ? 1 : 0,
+    updated_at: row.updated_at || null,
+  };
+}
+
+async function getBaseTicketSettings(executor = db) {
+  const [rows] = await executor.query('SELECT * FROM ticket_settings WHERE id = 1 LIMIT 1');
+  if (!rows.length) return null;
+  return normalizeTicketSettingsRow(rows[0]);
+}
+
+async function resolveCajaIdForTicketSettings(req, executor = db) {
+  const explicitCajaId = extractCajaIdFromRequest(req);
+  if (explicitCajaId) return explicitCajaId;
+  const authUserId = toInt(req?.user?.sub);
+  if (!authUserId) return null;
+  return resolveCurrentCajaIdForUser(authUserId, executor);
+}
+
+async function getTicketSettingsForCaja(cajaId, executor = db) {
+  const base = await getBaseTicketSettings(executor);
+  if (!base) return null;
+
+  const safeCajaId = toInt(cajaId);
+  if (!safeCajaId) {
+    return { ...base, caja_id: null };
+  }
+
+  const [rows] = await executor.query(
+    `SELECT caja_id, ticket_header, ticket_footer, printer_name, columns_width, paper_width_mm, print_engine, feed_lines_after_print,
+            show_business_info, show_cashier, show_box, show_payment_method, show_ticket_number, include_details_by_default, updated_at
+     FROM ticket_settings_by_caja
+     WHERE caja_id = ?
+     LIMIT 1`,
+    [safeCajaId]
+  );
+  if (!rows.length) {
+    return { ...base, caja_id: safeCajaId };
+  }
+
+  const merged = normalizeTicketSettingsRow({ ...base, ...rows[0] });
+  return { ...merged, caja_id: safeCajaId };
+}
+
+async function saveTicketSettingsForCaja(cajaId, normalizedSettings, executor = db) {
+  const safeCajaId = toInt(cajaId);
+  const values = [
+    normalizedSettings.ticket_header,
+    normalizedSettings.ticket_footer,
+    normalizedSettings.printer_name || null,
+    normalizedSettings.columns_width,
+    normalizedSettings.paper_width_mm,
+    normalizedSettings.print_engine,
+    normalizedSettings.feed_lines_after_print,
+    normalizedSettings.show_business_info,
+    normalizedSettings.show_cashier,
+    normalizedSettings.show_box,
+    normalizedSettings.show_payment_method,
+    normalizedSettings.show_ticket_number,
+    normalizedSettings.include_details_by_default,
+  ];
+
+  if (safeCajaId) {
+    await executor.query(
+      `INSERT INTO ticket_settings_by_caja (
+         caja_id, ticket_header, ticket_footer, printer_name, columns_width, paper_width_mm, print_engine, feed_lines_after_print,
+         show_business_info, show_cashier, show_box, show_payment_method, show_ticket_number, include_details_by_default
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         ticket_header = VALUES(ticket_header),
+         ticket_footer = VALUES(ticket_footer),
+         printer_name = VALUES(printer_name),
+         columns_width = VALUES(columns_width),
+         paper_width_mm = VALUES(paper_width_mm),
+         print_engine = VALUES(print_engine),
+         feed_lines_after_print = VALUES(feed_lines_after_print),
+         show_business_info = VALUES(show_business_info),
+         show_cashier = VALUES(show_cashier),
+         show_box = VALUES(show_box),
+         show_payment_method = VALUES(show_payment_method),
+         show_ticket_number = VALUES(show_ticket_number),
+         include_details_by_default = VALUES(include_details_by_default),
+         updated_at = CURRENT_TIMESTAMP`,
+      [safeCajaId, ...values]
+    );
+    return safeCajaId;
+  }
+
+  await executor.query(
+    `UPDATE ticket_settings
+     SET ticket_header = ?, ticket_footer = ?, printer_name = ?, columns_width = ?, paper_width_mm = ?, print_engine = ?, feed_lines_after_print = ?,
+         show_business_info = ?, show_cashier = ?, show_box = ?, show_payment_method = ?,
+         show_ticket_number = ?, include_details_by_default = ?
+     WHERE id = 1`,
+    values
+  );
+  return null;
+}
+
+function normalizeSaleTicketPaymentLabel(methodRaw = '') {
+  const method = String(methodRaw || '').trim().toLowerCase();
+  const labels = {
+    efectivo: 'Efectivo',
+    tarjeta: 'Tarjeta',
+    dolares: 'Dolares',
+    transferencia: 'Transferencia',
+    cheque: 'Cheque',
+    vale: 'Vale',
+    otro: 'Otro',
+  };
+  if (labels[method]) return labels[method];
+  if (method === 'mixto') return 'Desglosado';
+  if (!method) return 'Otro';
+  return `${method.charAt(0).toUpperCase()}${method.slice(1)}`;
+}
+
+function buildSaleTicketText({ sale, details, settings, business, paymentBreakdown = [] }) {
   const columns = clampInt(settings.columns_width, 28, 64, 42);
   const divider = '-'.repeat(columns);
   const lines = [];
@@ -1015,7 +1927,8 @@ function buildSaleTicketText({ sale, details, settings, business }) {
     const right = columns - text.length - left;
     return `${' '.repeat(left)}${text}${' '.repeat(right)}`;
   };
-  const wrapText = (value = '') => {
+  const wrapText = (value = '', maxWidth = columns) => {
+    const width = Math.max(8, Math.min(columns, Number(maxWidth || columns)));
     const raw = String(value || '').trim();
     if (!raw) return [];
     const words = raw.split(/\s+/);
@@ -1023,14 +1936,14 @@ function buildSaleTicketText({ sale, details, settings, business }) {
     let current = '';
     words.forEach((word) => {
       const candidate = current ? `${current} ${word}` : word;
-      if (candidate.length <= columns) {
+      if (candidate.length <= width) {
         current = candidate;
         return;
       }
       if (current) out.push(current);
-      if (word.length > columns) {
-        for (let i = 0; i < word.length; i += columns) {
-          out.push(word.slice(i, i + columns));
+      if (word.length > width) {
+        for (let i = 0; i < word.length; i += width) {
+          out.push(word.slice(i, i + width));
         }
         current = '';
       } else {
@@ -1063,7 +1976,21 @@ function buildSaleTicketText({ sale, details, settings, business }) {
     lines.push(`Caja: ${sale.caja_id}`);
   }
   if (normalizeBool(settings.show_payment_method, true)) {
-    lines.push(`Pago: ${sale.metodo_pago}`);
+    const paymentRows = Array.isArray(paymentBreakdown) ? paymentBreakdown : [];
+    if (paymentRows.length > 1) {
+      lines.push('Pago: Desglosado');
+      paymentRows.forEach((entry) => {
+        const label = normalizeSaleTicketPaymentLabel(entry?.metodo_pago);
+        const amountText = `$${formatCLP(entry?.monto || 0)}`;
+        lines.push(buildRightAlignedTicketLine(label, amountText, columns, { rightGutter: 3, minAmountWidth: 8 }));
+      });
+    } else if (paymentRows.length === 1) {
+      lines.push(`Pago: ${normalizeSaleTicketPaymentLabel(paymentRows[0]?.metodo_pago)}`);
+      const amountText = `$${formatCLP(paymentRows[0]?.monto || 0)}`;
+      lines.push(buildRightAlignedTicketLine('Monto', amountText, columns, { rightGutter: 3, minAmountWidth: 8 }));
+    } else {
+      lines.push(`Pago: ${normalizeSaleTicketPaymentLabel(sale.metodo_pago)}`);
+    }
   }
   lines.push(divider);
 
@@ -1077,26 +2004,264 @@ function buildSaleTicketText({ sale, details, settings, business }) {
       const subtotal = Number(row.subtotal || 0);
       const desc = String(row.descripcion || '').trim();
       const amountText = `$${formatCLP(subtotal)}`;
-      const leftWidth = Math.max(8, columns - amountText.length - 1);
-      wrapText(desc).forEach((line) => lines.push(line));
-      lines.push(padRight(`${formatCLP(qty)} x $${formatCLP(unit)}`, leftWidth) + ' ' + padLeft(amountText, amountText.length));
+      const detailDescWidth = Math.max(12, columns - 8);
+      lines.push(truncateTicketLine(desc, detailDescWidth));
+      lines.push(buildRightAlignedTicketLine(
+        `${formatTicketQuantity(qty)} x $${formatCLP(unit)}`,
+        amountText,
+        columns,
+        { rightGutter: 3, minAmountWidth: 8 }
+      ));
     });
     lines.push(divider);
   }
 
   const totalText = `$${formatCLP(sale.total)}`;
-  if (columns <= 34 || (`TOTAL ${totalText}`).length > columns) {
-    // Para tiras angostas, evita recorte del total imprimiendolo en dos lineas.
-    lines.push('TOTAL');
-    lines.push(totalText);
-  } else {
-    lines.push(padRight('TOTAL', Math.max(1, columns - totalText.length - 1)) + ` ${totalText}`);
-  }
+  lines.push(buildRightAlignedTicketLine('TOTAL', totalText, columns, { rightGutter: 3, minAmountWidth: 8 }));
   lines.push(divider);
   if (settings.ticket_footer) {
     wrapText(String(settings.ticket_footer).trim()).forEach((line) => lines.push(line));
   }
   lines.push(centerLine('ORIGINAL CLIENTE'));
+  lines.push('');
+  return lines.join('\r\n');
+}
+
+function normalizeCutTicketPaymentLabel(methodRaw = '') {
+  const method = String(methodRaw || '').trim().toLowerCase();
+  const labels = {
+    efectivo: 'EN EFECTIVO',
+    tarjeta: 'CON TARJETA',
+    credito: 'A CREDITO',
+    vale: 'CON VALES',
+    transferencia: 'TRANSFERENCIA',
+    cheque: 'CHEQUE',
+    dolares: 'DOLARES',
+    mixto: 'MIXTO',
+  };
+  if (labels[method]) return labels[method];
+  if (!method) return 'OTRO';
+  return method.toUpperCase();
+}
+
+function summarizeCutMovementItems(rows, fallbackLabel = 'SIN DETALLE') {
+  const grouped = new Map();
+  (Array.isArray(rows) ? rows : []).forEach((row) => {
+    const preferredLabel = String(row?.descripcion || '').trim()
+      || String(row?.metodo || '').trim()
+      || fallbackLabel;
+    const normalizedLabel = preferredLabel.slice(0, 120) || fallbackLabel;
+    const key = normalizedLabel.toLowerCase();
+    if (!grouped.has(key)) {
+      grouped.set(key, {
+        label: normalizedLabel,
+        total: 0,
+        count: 0,
+      });
+    }
+    const current = grouped.get(key);
+    current.total += Number(row?.monto || 0);
+    current.count += 1;
+  });
+  return Array.from(grouped.values()).sort((a, b) => {
+    const totalDiff = Number(b.total || 0) - Number(a.total || 0);
+    if (Math.abs(totalDiff) > 0.0001) return totalDiff;
+    return String(a.label || '').localeCompare(String(b.label || ''), 'es', { sensitivity: 'base' });
+  });
+}
+
+function buildCutSessionTicketText({ cut, settings, business, cutSettings = null }) {
+  const columns = clampInt(settings.columns_width, 28, 64, 42);
+  const divider = '-'.repeat(columns);
+  const lines = [];
+  const centerLine = (value = '') => {
+    const text = String(value).trim();
+    if (!text) return '';
+    if (text.length >= columns) return text.slice(0, columns);
+    const left = Math.floor((columns - text.length) / 2);
+    const right = columns - text.length - left;
+    return `${' '.repeat(left)}${text}${' '.repeat(right)}`;
+  };
+  const wrapText = (value = '', maxWidth = columns) => {
+    const width = Math.max(8, Math.min(columns, Number(maxWidth || columns)));
+    const raw = String(value || '').trim();
+    if (!raw) return [];
+    const words = raw.split(/\s+/);
+    const out = [];
+    let current = '';
+    words.forEach((word) => {
+      const candidate = current ? `${current} ${word}` : word;
+      if (candidate.length <= width) {
+        current = candidate;
+        return;
+      }
+      if (current) out.push(current);
+      if (word.length > width) {
+        for (let i = 0; i < word.length; i += width) {
+          out.push(word.slice(i, i + width));
+        }
+        current = '';
+      } else {
+        current = word;
+      }
+    });
+    if (current) out.push(current);
+    return out;
+  };
+  const money = (value) => `$${formatCLP(value)}`;
+  const pushAmountLine = (label, value, prefix = '', lineOptions = {}) => {
+    const valueText = `${prefix}${value}`;
+    lines.push(buildRightAlignedTicketLine(String(label || ''), valueText, columns, lineOptions));
+  };
+  const pushDetailItemLine = (label, total, count = 1) => {
+    const amountText = money(total || 0);
+    const labelWithCount = `${String(label || 'SIN DETALLE').trim().toUpperCase()}${count > 1 ? ` (${count})` : ''}`;
+    const maxLabelWidth = Math.max(8, columns - amountText.length - 2);
+    const compactLabel = truncateTicketLine(labelWithCount, maxLabelWidth) || 'SIN DETALLE';
+    lines.push(buildRightAlignedTicketLine(compactLabel, amountText, columns, { rightGutter: 2 }));
+  };
+
+  const generatedAt = cut?.generated_at ? new Date(cut.generated_at) : new Date();
+  const realizedDate = Number.isNaN(generatedAt.getTime()) ? new Date() : generatedAt;
+  const openedAt = cut?.hora_apertura ? new Date(cut.hora_apertura) : null;
+  const closedAt = cut?.hora_cierre ? new Date(cut.hora_cierre) : null;
+  const openTime = openedAt && !Number.isNaN(openedAt.getTime())
+    ? openedAt.toLocaleTimeString('es-CL', { hour12: true })
+    : '--:--';
+  const closeTime = closedAt && !Number.isNaN(closedAt.getTime())
+    ? closedAt.toLocaleTimeString('es-CL', { hour12: true })
+    : '--:--';
+  const methodRows = Array.isArray(cut?.method_totals) ? cut.method_totals : [];
+  const departmentRows = Array.isArray(cut?.department_totals)
+    ? cut.department_totals.filter((row) => Number(row?.total_vendido || 0) > 0)
+    : [];
+  const entradaRows = Array.isArray(cut?.detalle_entradas) ? cut.detalle_entradas : [];
+  const salidaRows = Array.isArray(cut?.detalle_salidas) ? cut.detalle_salidas : [];
+  const entradaItems = summarizeCutMovementItems(entradaRows, 'ENTRADA SIN DETALLE');
+  const salidaItems = summarizeCutMovementItems(salidaRows, 'SALIDA SIN DETALLE');
+  const cutFormat = normalizeCutFormatSettingsRow(cutSettings || {});
+  const showBusinessInfo = normalizeBool(cutFormat.show_business_info, true);
+  const showShiftInfo = normalizeBool(cutFormat.show_shift_info, true);
+  const showSalesOverview = normalizeBool(cutFormat.show_sales_overview, true);
+  const showCashSummary = normalizeBool(cutFormat.show_cash_summary, true);
+  const showEntriesSection = normalizeBool(cutFormat.show_entries_section, true);
+  const showEntriesDetail = normalizeBool(cutFormat.show_entries_detail, true);
+  const showExitsSection = normalizeBool(cutFormat.show_exits_section, true);
+  const showExitsDetail = normalizeBool(cutFormat.show_exits_detail, true);
+  const showSalesMethods = normalizeBool(cutFormat.show_sales_methods, true);
+  const showDepartmentTotals = normalizeBool(cutFormat.show_department_totals, true);
+  const showFooter = normalizeBool(cutFormat.show_footer, true);
+  const labels = normalizeCutPrintLabels(cutFormat.print_labels);
+  const formatShiftLine = (prefix, value) => {
+    const safePrefix = String(prefix || '').trim();
+    if (!safePrefix) return String(value);
+    return /[#:\-\s]$/.test(safePrefix) ? `${safePrefix}${value}` : `${safePrefix} ${value}`;
+  };
+
+  const businessName = String(business?.nombre || 'MINIMARKET').trim().toUpperCase() || 'MINIMARKET';
+  const businessType = String(business?.tipo_local || '').trim().toUpperCase();
+  if (showBusinessInfo) {
+    lines.push(centerLine(businessName));
+    if (businessType) lines.push(centerLine(businessType));
+  }
+  lines.push(centerLine(labels.title_cut));
+  if (showShiftInfo) {
+    lines.push(centerLine(formatShiftLine(labels.label_shift_prefix, Number(cut?.turno_id || 0) || '-')));
+  }
+  lines.push(divider);
+  if (showShiftInfo) {
+    lines.push(`${labels.label_generated_at}: ${realizedDate.toLocaleDateString('es-CL')} ${realizedDate.toLocaleTimeString('es-CL', { hour12: true })}`);
+    lines.push(`${labels.label_cashier}: ${String(cut?.cajero_nombre || cut?.cajero_id || 'CAJERO')}`);
+    lines.push(`${labels.label_box}: ${String(cut?.caja_id || '-')}`);
+    lines.push(`${labels.label_schedule}: ${openTime} - ${closeTime}`);
+    lines.push(divider);
+  }
+
+  if (showSalesOverview) {
+    pushAmountLine(labels.label_sales_total, money(cut?.total_ventas || 0), '', { rightGutter: 3, minAmountWidth: 8 });
+    lines.push(`${Math.round(Number(cut?.transacciones || 0))} ${labels.label_sales_count_suffix}`);
+    lines.push(divider);
+  }
+
+  if (showCashSummary) {
+    lines.push(centerLine(labels.title_cash_box));
+    pushAmountLine(labels.label_base_fund, money(cut?.monto_inicial || 0), '', { rightGutter: 2 });
+    pushAmountLine(labels.label_cash_sales, money(cut?.ventas_efectivo || 0), '', { rightGutter: 2 });
+    pushAmountLine(labels.label_cash_payments, money(cut?.abonos_efectivo || 0), '+ ', { rightGutter: 2 });
+    pushAmountLine(labels.label_cash_entries, money(cut?.entradas_dinero || 0), '+ ', { rightGutter: 2 });
+    pushAmountLine(labels.label_cash_exits, money(cut?.salidas_dinero || 0), '- ', { rightGutter: 2 });
+    lines.push(divider);
+    pushAmountLine(labels.label_cash_in_box, money(cut?.efectivo_en_caja || 0), '', { rightGutter: 2 });
+    lines.push(divider);
+  }
+
+  if (showEntriesSection) {
+    lines.push(centerLine(labels.title_entries));
+    pushAmountLine(labels.label_total_entries, money(cut?.total_entradas || 0), '', { rightGutter: 3, minAmountWidth: 8 });
+    if (!entradaItems.length) {
+      lines.push(labels.label_no_entries);
+    } else if (!showEntriesDetail) {
+      lines.push(labels.label_hidden_detail);
+      lines.push(`${entradaItems.length} ${labels.label_items_summary_suffix}`);
+    } else {
+      lines.push(labels.label_detail_title);
+      entradaItems.forEach((item) => pushDetailItemLine(item.label, item.total, item.count));
+    }
+    lines.push(divider);
+  }
+
+  if (showExitsSection) {
+    lines.push(centerLine(labels.title_exits));
+    pushAmountLine(labels.label_total_exits, money(cut?.total_salidas || 0), '', { rightGutter: 3, minAmountWidth: 8 });
+    if (!salidaItems.length) {
+      lines.push(labels.label_no_exits);
+    } else if (!showExitsDetail) {
+      lines.push(labels.label_hidden_detail);
+      lines.push(`${salidaItems.length} ${labels.label_items_summary_suffix}`);
+    } else {
+      lines.push(labels.label_detail_title);
+      salidaItems.forEach((item) => pushDetailItemLine(item.label, item.total, item.count));
+    }
+    lines.push(divider);
+  }
+
+  if (showSalesMethods || showSalesOverview) {
+    lines.push(centerLine(labels.title_sales));
+    if (showSalesMethods) {
+      methodRows.forEach((row) => {
+        pushAmountLine(normalizeCutTicketPaymentLabel(row?.metodo_pago), money(row?.total || 0), '', { rightGutter: 2 });
+      });
+    }
+    if (showSalesOverview) {
+      if (showSalesMethods) lines.push(divider);
+      pushAmountLine(labels.label_returns, money(cut?.devoluciones || 0), '- ', { rightGutter: 2 });
+      pushAmountLine(labels.label_total_sales_line, money(cut?.total_ventas || 0), '', { rightGutter: 2 });
+    }
+    lines.push(divider);
+  }
+
+  if (showDepartmentTotals) {
+    lines.push(centerLine(labels.title_departments));
+    if (!departmentRows.length) {
+      lines.push(labels.label_no_departments);
+    } else {
+      departmentRows.forEach((row) => {
+        pushAmountLine(String(row?.departamento || labels.label_no_department_name), money(row?.total_vendido || 0), '', { rightGutter: 2 });
+      });
+    }
+    lines.push(divider);
+  }
+
+  if (showFooter && settings?.ticket_footer) {
+    wrapText(String(settings.ticket_footer).trim()).forEach((line) => lines.push(line));
+    lines.push(divider);
+  }
+  if (!showFooter && !showBusinessInfo && !showShiftInfo && !showSalesOverview && !showCashSummary && !showEntriesSection && !showExitsSection && !showSalesMethods && !showDepartmentTotals) {
+    lines.push(labels.label_report_no_items);
+    lines.push(divider);
+  }
+
+  lines.push(centerLine(labels.title_report_footer));
   lines.push('');
   return lines.join('\r\n');
 }
@@ -1185,9 +2350,8 @@ function buildDteTestTicket58mmText({ settings, business, dteConfig, validationC
     const line1 = `${item.descripcion}`.slice(0, safeColumns);
     const unitLine = `${item.qty} x $${formatCLP(item.unit)}`;
     const amountText = `$${formatCLP(subtotal)}`;
-    const leftWidth = Math.max(8, safeColumns - amountText.length - 1);
     lines.push(line1);
-    lines.push(padRight(unitLine, leftWidth) + ' ' + padLeft(amountText, amountText.length));
+    lines.push(buildRightAlignedTicketLine(unitLine, amountText, safeColumns));
   });
 
   const total = sampleRows.reduce((acc, row) => acc + (row.qty * row.unit), 0);
@@ -1195,12 +2359,12 @@ function buildDteTestTicket58mmText({ settings, business, dteConfig, validationC
   const iva = total - neto;
   const totalText = `$${formatCLP(total)}`;
   lines.push(divider);
-  lines.push(padRight('SUBTOTAL', safeColumns - 1 - totalText.length) + ` ${totalText}`);
-  lines.push(padRight('NETO', safeColumns - 1 - `$${formatCLP(neto)}`.length) + ` $${formatCLP(neto)}`);
-  lines.push(padRight('IVA (19%)', safeColumns - 1 - `$${formatCLP(iva)}`.length) + ` $${formatCLP(iva)}`);
-  lines.push(padRight('TOTAL', safeColumns - 1 - totalText.length) + ` ${totalText}`);
-  lines.push(padRight('EFECTIVO', safeColumns - 1 - totalText.length) + ` ${totalText}`);
-  lines.push(padRight('VUELTO', safeColumns - 1 - '$0'.length) + ' $0');
+  lines.push(buildRightAlignedTicketLine('SUBTOTAL', totalText, safeColumns));
+  lines.push(buildRightAlignedTicketLine('NETO', `$${formatCLP(neto)}`, safeColumns));
+  lines.push(buildRightAlignedTicketLine('IVA (19%)', `$${formatCLP(iva)}`, safeColumns));
+  lines.push(buildRightAlignedTicketLine('TOTAL', totalText, safeColumns));
+  lines.push(buildRightAlignedTicketLine('EFECTIVO', totalText, safeColumns));
+  lines.push(buildRightAlignedTicketLine('VUELTO', '$0', safeColumns));
   lines.push(divider);
   lines.push(centerLine('TIMBRE ELECTRONICO SII'));
   lines.push(centerLine('(SIMULADO - SOLO PRUEBA)'));
@@ -1229,11 +2393,13 @@ async function ensureOperationalTables() {
   const usersCurrent = new Set(usersColumns.map((row) => row.COLUMN_NAME));
   if (!usersCurrent.has('es_administrador')) {
     await db.query('ALTER TABLE usuarios ADD COLUMN es_administrador TINYINT(1) NOT NULL DEFAULT 0 AFTER estado_usuario');
-    await db.query(
-      `UPDATE usuarios
-       SET es_administrador = 1
-       WHERE LOWER(user) = 'admin' OR LOWER(nombre) LIKE '%admin%'`
-    );
+    if (!schemaCreateOnlyMode) {
+      await db.query(
+        `UPDATE usuarios
+         SET es_administrador = 1
+         WHERE LOWER(user) = 'admin' OR LOWER(nombre) LIKE '%admin%'`
+      );
+    }
   }
 
   await db.query(`
@@ -1342,6 +2508,27 @@ async function ensureOperationalTables() {
      VALUES (1, 'COMPROBANTE DE VENTA', 'Gracias por su compra', NULL, 30, 58, 'auto', 2, 1, 1, 1, 1, 1, 1)
     ON DUPLICATE KEY UPDATE id = id`
   );
+
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS ticket_settings_by_caja (
+      caja_id INT PRIMARY KEY,
+      ticket_header VARCHAR(120) NOT NULL DEFAULT 'COMPROBANTE DE VENTA',
+      ticket_footer VARCHAR(255) NOT NULL DEFAULT 'Gracias por su compra',
+      printer_name VARCHAR(255) NULL,
+      columns_width INT NOT NULL DEFAULT 30,
+      paper_width_mm INT NOT NULL DEFAULT 58,
+      print_engine ENUM('auto','gdi','out_printer') NOT NULL DEFAULT 'auto',
+      feed_lines_after_print INT NOT NULL DEFAULT 2,
+      show_business_info TINYINT(1) NOT NULL DEFAULT 1,
+      show_cashier TINYINT(1) NOT NULL DEFAULT 1,
+      show_box TINYINT(1) NOT NULL DEFAULT 1,
+      show_payment_method TINYINT(1) NOT NULL DEFAULT 1,
+      show_ticket_number TINYINT(1) NOT NULL DEFAULT 1,
+      include_details_by_default TINYINT(1) NOT NULL DEFAULT 1,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX idx_ticket_settings_by_caja_updated (updated_at)
+    )
+  `);
 
   await db.query(`
     CREATE TABLE IF NOT EXISTS folio_settings (
@@ -1477,6 +2664,19 @@ async function ensureOperationalTables() {
       tax_percent DECIMAL(5,2) NOT NULL DEFAULT 19.00,
       prices_include_tax TINYINT(1) NOT NULL DEFAULT 1,
       cut_mode ENUM('ajuste_auto','sin_ajuste') NOT NULL DEFAULT 'ajuste_auto',
+      cut_show_business_info TINYINT(1) NOT NULL DEFAULT 1,
+      cut_show_shift_info TINYINT(1) NOT NULL DEFAULT 1,
+      cut_show_sales_overview TINYINT(1) NOT NULL DEFAULT 1,
+      cut_show_cash_summary TINYINT(1) NOT NULL DEFAULT 1,
+      cut_show_entries_section TINYINT(1) NOT NULL DEFAULT 1,
+      cut_show_entries_detail TINYINT(1) NOT NULL DEFAULT 1,
+      cut_show_exits_section TINYINT(1) NOT NULL DEFAULT 1,
+      cut_show_exits_detail TINYINT(1) NOT NULL DEFAULT 1,
+      cut_show_sales_methods TINYINT(1) NOT NULL DEFAULT 1,
+      cut_show_department_totals TINYINT(1) NOT NULL DEFAULT 1,
+      cut_show_footer TINYINT(1) NOT NULL DEFAULT 1,
+      cut_print_labels_json LONGTEXT NULL,
+      cut_print_styles_json LONGTEXT NULL,
       migrated_from_legacy TINYINT(1) NOT NULL DEFAULT 0,
       updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     )
@@ -1501,6 +2701,27 @@ async function ensureOperationalTables() {
     [config.db.database]
   );
   const psCols = new Set(psColsRows.map((row) => row.COLUMN_NAME));
+  const cutFormatColumns = [
+    ['cut_show_business_info', 'TINYINT(1) NOT NULL DEFAULT 1 AFTER cut_mode'],
+    ['cut_show_shift_info', 'TINYINT(1) NOT NULL DEFAULT 1 AFTER cut_show_business_info'],
+    ['cut_show_sales_overview', 'TINYINT(1) NOT NULL DEFAULT 1 AFTER cut_show_shift_info'],
+    ['cut_show_cash_summary', 'TINYINT(1) NOT NULL DEFAULT 1 AFTER cut_show_sales_overview'],
+    ['cut_show_entries_section', 'TINYINT(1) NOT NULL DEFAULT 1 AFTER cut_show_cash_summary'],
+    ['cut_show_entries_detail', 'TINYINT(1) NOT NULL DEFAULT 1 AFTER cut_show_entries_section'],
+    ['cut_show_exits_section', 'TINYINT(1) NOT NULL DEFAULT 1 AFTER cut_show_entries_detail'],
+    ['cut_show_exits_detail', 'TINYINT(1) NOT NULL DEFAULT 1 AFTER cut_show_exits_section'],
+    ['cut_show_sales_methods', 'TINYINT(1) NOT NULL DEFAULT 1 AFTER cut_show_exits_detail'],
+    ['cut_show_department_totals', 'TINYINT(1) NOT NULL DEFAULT 1 AFTER cut_show_sales_methods'],
+    ['cut_show_footer', 'TINYINT(1) NOT NULL DEFAULT 1 AFTER cut_show_department_totals'],
+    ['cut_print_labels_json', 'LONGTEXT NULL AFTER cut_show_footer'],
+    ['cut_print_styles_json', 'LONGTEXT NULL AFTER cut_print_labels_json'],
+  ];
+  for (const [colName, colDef] of cutFormatColumns) {
+    if (!psCols.has(colName)) {
+      await db.query(`ALTER TABLE personalization_settings ADD COLUMN ${colName} ${colDef}`);
+      psCols.add(colName);
+    }
+  }
   if (!psCols.has('migrated_from_legacy')) {
     await db.query('ALTER TABLE personalization_settings ADD COLUMN migrated_from_legacy TINYINT(1) NOT NULL DEFAULT 0 AFTER cut_mode');
   }
@@ -1509,7 +2730,7 @@ async function ensureOperationalTables() {
     'SELECT migrated_from_legacy FROM personalization_settings WHERE id = 1 LIMIT 1'
   );
   const alreadyMigrated = Number(psStateRows[0]?.migrated_from_legacy || 0) === 1;
-  if (!alreadyMigrated) {
+  if (!alreadyMigrated && !schemaCreateOnlyMode) {
     const [paymentLegacyRows] = await db.query('SELECT * FROM payment_settings WHERE id = 1 LIMIT 1');
     const [currencyLegacyRows] = await db.query('SELECT * FROM currency_settings WHERE id = 1 LIMIT 1');
     const [unitLegacyRows] = await db.query('SELECT * FROM unit_settings WHERE id = 1 LIMIT 1');
@@ -1628,25 +2849,42 @@ async function ensureOperationalTables() {
      ON DUPLICATE KEY UPDATE id = id`
   );
 
-  const [salesColumns] = await db.query(
+  const [salesColumnsLegacy] = await db.query(
     `SELECT COLUMN_NAME
      FROM information_schema.COLUMNS
      WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'ventas'`,
     [config.db.database]
   );
-  const salesCurrent = new Set(salesColumns.map((row) => row.COLUMN_NAME));
-  if (!salesCurrent.has('monto_efectivo')) {
+  const salesCurrentLegacy = new Set(salesColumnsLegacy.map((row) => row.COLUMN_NAME));
+  if (!salesCurrentLegacy.has('monto_efectivo')) {
     await db.query('ALTER TABLE ventas ADD COLUMN monto_efectivo DECIMAL(10,2) NOT NULL DEFAULT 0 AFTER total');
   }
-  if (!salesCurrent.has('monto_tarjeta')) {
+  if (!salesCurrentLegacy.has('monto_tarjeta')) {
     await db.query('ALTER TABLE ventas ADD COLUMN monto_tarjeta DECIMAL(10,2) NOT NULL DEFAULT 0 AFTER monto_efectivo');
   }
-  if (!salesCurrent.has('turno_id')) {
+  if (!salesCurrentLegacy.has('turno_id')) {
     await db.query('ALTER TABLE ventas ADD COLUMN turno_id INT NULL AFTER caja_id');
     await db.query('CREATE INDEX idx_ventas_turno_id ON ventas (turno_id)');
   }
-  if (!salesCurrent.has('folio_ticket')) {
+  if (!salesCurrentLegacy.has('folio_ticket')) {
     await db.query('ALTER TABLE ventas ADD COLUMN folio_ticket VARCHAR(16) NULL AFTER numero_ticket');
+  }
+
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS venta_pagos (
+      id_pago BIGINT AUTO_INCREMENT PRIMARY KEY,
+      venta_id INT NOT NULL,
+      metodo_pago ENUM('efectivo','tarjeta','dolares','transferencia','cheque','vale','otro') NOT NULL DEFAULT 'efectivo',
+      monto DECIMAL(10,2) NOT NULL DEFAULT 0,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_venta_pagos_venta (venta_id),
+      INDEX idx_venta_pagos_metodo (metodo_pago),
+      INDEX idx_venta_pagos_venta_metodo (venta_id, metodo_pago)
+    )
+  `);
+
+  if (!schemaCreateOnlyMode) {
+    await backfillSalePaymentAllocations(db);
   }
 
   await db.query(`
@@ -1658,6 +2896,23 @@ async function ensureOperationalTables() {
       ultimo_ticket INT NOT NULL DEFAULT 0,
       updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       INDEX idx_ticket_counter_caja_usuario (caja_id, usuario_id)
+    )
+  `);
+
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS corte_merge_audit (
+      id BIGINT AUTO_INCREMENT PRIMARY KEY,
+      merged_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      merged_by_user_id INT NOT NULL,
+      keeper_cut_id INT NOT NULL,
+      merged_cut_ids LONGTEXT NOT NULL,
+      caja_id INT NOT NULL,
+      usuario_id INT NOT NULL,
+      fecha DATE NOT NULL,
+      notes VARCHAR(255) NULL,
+      snapshot_json LONGTEXT NULL,
+      INDEX idx_corte_merge_audit_merged_at (merged_at),
+      INDEX idx_corte_merge_audit_keeper (keeper_cut_id)
     )
   `);
 
@@ -1698,6 +2953,28 @@ async function ensureOperationalTables() {
   if (!cashMovementTurnoIdx.length) {
     await db.query('CREATE INDEX idx_cash_movements_turno ON cash_movements (turno_id)');
   }
+
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS inventory_movements (
+      id_movimiento BIGINT AUTO_INCREMENT PRIMARY KEY,
+      fecha DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      producto_id INT NOT NULL,
+      codigo_barras VARCHAR(80) NOT NULL,
+      producto_descripcion VARCHAR(255) NOT NULL,
+      tipo_movimiento ENUM('ajuste','modificacion') NOT NULL DEFAULT 'ajuste',
+      cantidad_anterior DECIMAL(12,3) NOT NULL DEFAULT 0,
+      cambio_cantidad DECIMAL(12,3) NOT NULL DEFAULT 0,
+      cantidad_nueva DECIMAL(12,3) NOT NULL DEFAULT 0,
+      especificacion VARCHAR(255) NULL,
+      caja_id INT NULL,
+      usuario_id INT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_inventory_movements_fecha (fecha),
+      INDEX idx_inventory_movements_producto (producto_id),
+      INDEX idx_inventory_movements_caja_fecha (caja_id, fecha),
+      INDEX idx_inventory_movements_usuario_fecha (usuario_id, fecha)
+    )
+  `);
 
   const cashierPermissionsDefinition = CASHIER_PERMISSION_FIELDS
     .map((field) => `\`${field}\` TINYINT(1) NOT NULL DEFAULT ${Number(CASHIER_PERMISSION_DEFAULTS[field] || 0)}`)
@@ -1798,6 +3075,122 @@ async function ensureOperationalTables() {
      )`
   );
 
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS system_business_limits (
+      id INT PRIMARY KEY,
+      max_sucursales INT NOT NULL DEFAULT 3,
+      creator_contact VARCHAR(120) NOT NULL DEFAULT 'SIA',
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )
+  `);
+  await db.query(
+    `INSERT INTO system_business_limits (id, max_sucursales, creator_contact)
+     VALUES (1, ?, ?)
+     ON DUPLICATE KEY UPDATE id = id`,
+    [MAX_ACTIVE_BRANCHES_DEFAULT, BRANCH_CREATOR_CONTACT_DEFAULT]
+  );
+
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS sucursales (
+      id_sucursal INT AUTO_INCREMENT PRIMARY KEY,
+      codigo VARCHAR(16) NOT NULL,
+      nombre VARCHAR(120) NOT NULL,
+      direccion VARCHAR(255) NULL,
+      activa TINYINT(1) NOT NULL DEFAULT 1,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uq_sucursal_codigo (codigo),
+      UNIQUE KEY uq_sucursal_nombre (nombre),
+      INDEX idx_sucursal_activa (activa)
+    )
+  `);
+  await db.query(
+    `INSERT INTO sucursales (id_sucursal, codigo, nombre, direccion, activa)
+     SELECT 1, 'MATRIZ', 'Sucursal Principal', NULL, 1
+     FROM DUAL
+     WHERE NOT EXISTS (SELECT 1 FROM sucursales WHERE id_sucursal = 1)`
+  );
+
+  const [boxColumns] = await db.query(
+    `SELECT COLUMN_NAME
+     FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'cajas'`,
+    [config.db.database]
+  );
+  const boxCurrent = new Set(boxColumns.map((row) => row.COLUMN_NAME));
+  if (!boxCurrent.has('sucursal_id')) {
+    await db.query('ALTER TABLE cajas ADD COLUMN sucursal_id INT NOT NULL DEFAULT 1 AFTER nombre_caja');
+  }
+  if (!schemaCreateOnlyMode) {
+    await db.query('UPDATE cajas SET sucursal_id = 1 WHERE sucursal_id IS NULL OR sucursal_id < 1');
+  }
+  const [boxSucursalIdxRows] = await db.query(
+    `SELECT 1 AS ok
+     FROM information_schema.STATISTICS
+     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'cajas' AND INDEX_NAME = 'idx_cajas_sucursal'
+     LIMIT 1`,
+    [config.db.database]
+  );
+  if (!boxSucursalIdxRows.length) {
+    await db.query('CREATE INDEX idx_cajas_sucursal ON cajas (sucursal_id)');
+  }
+
+  const [salesBranchColumns] = await db.query(
+    `SELECT COLUMN_NAME
+     FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'ventas'`,
+    [config.db.database]
+  );
+  const salesBranchCurrent = new Set(salesBranchColumns.map((row) => row.COLUMN_NAME));
+  if (!salesBranchCurrent.has('sucursal_id')) {
+    await db.query('ALTER TABLE ventas ADD COLUMN sucursal_id INT NOT NULL DEFAULT 1 AFTER caja_id');
+  }
+  if (!schemaCreateOnlyMode) {
+    await db.query(
+      `UPDATE ventas v
+       INNER JOIN cajas c ON c.n_caja = v.caja_id
+       SET v.sucursal_id = c.sucursal_id`
+    );
+  }
+  const [salesSucursalIdxRows] = await db.query(
+    `SELECT 1 AS ok
+     FROM information_schema.STATISTICS
+     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'ventas' AND INDEX_NAME = 'idx_ventas_sucursal'
+     LIMIT 1`,
+    [config.db.database]
+  );
+  if (!salesSucursalIdxRows.length) {
+    await db.query('CREATE INDEX idx_ventas_sucursal ON ventas (sucursal_id)');
+  }
+
+  const [cutColumns] = await db.query(
+    `SELECT COLUMN_NAME
+     FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'corte_caja'`,
+    [config.db.database]
+  );
+  const cutCurrent = new Set(cutColumns.map((row) => row.COLUMN_NAME));
+  if (!cutCurrent.has('sucursal_id')) {
+    await db.query('ALTER TABLE corte_caja ADD COLUMN sucursal_id INT NOT NULL DEFAULT 1 AFTER caja_id');
+  }
+  if (!schemaCreateOnlyMode) {
+    await db.query(
+      `UPDATE corte_caja c1
+       INNER JOIN cajas c2 ON c2.n_caja = c1.caja_id
+       SET c1.sucursal_id = c2.sucursal_id`
+    );
+  }
+  const [cutSucursalIdxRows] = await db.query(
+    `SELECT 1 AS ok
+     FROM information_schema.STATISTICS
+     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'corte_caja' AND INDEX_NAME = 'idx_corte_sucursal'
+     LIMIT 1`,
+    [config.db.database]
+  );
+  if (!cutSucursalIdxRows.length) {
+    await db.query('CREATE INDEX idx_corte_sucursal ON corte_caja (sucursal_id)');
+  }
+
   // Modulo DTE (preparacion facturacion electronica) aislado del flujo de ventas actual.
   await dteModule.ensureDteTables(db);
 
@@ -1806,15 +3199,45 @@ async function ensureOperationalTables() {
       id INT AUTO_INCREMENT PRIMARY KEY,
       device_hash VARCHAR(64) NOT NULL,
       numero_caja INT NOT NULL,
+      sucursal_id INT NULL,
       nombre_caja VARCHAR(120) NULL,
       source VARCHAR(30) NOT NULL DEFAULT 'manual',
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       last_seen DATETIME NULL,
       UNIQUE KEY uq_device_caja_hash (device_hash),
-      INDEX idx_device_caja_numero (numero_caja)
+      INDEX idx_device_caja_numero (numero_caja),
+      INDEX idx_device_caja_sucursal (sucursal_id)
     )
   `);
+  const [bindingColumnsRows] = await db.query(
+    `SELECT COLUMN_NAME
+     FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'device_caja_bindings'`,
+    [config.db.database]
+  );
+  const bindingColumns = new Set(bindingColumnsRows.map((row) => row.COLUMN_NAME));
+  if (!bindingColumns.has('sucursal_id')) {
+    await db.query('ALTER TABLE device_caja_bindings ADD COLUMN sucursal_id INT NULL AFTER numero_caja');
+  }
+  const [bindingIdxRows] = await db.query(
+    `SELECT 1 AS ok
+     FROM information_schema.STATISTICS
+     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'device_caja_bindings' AND INDEX_NAME = 'idx_device_caja_sucursal'
+     LIMIT 1`,
+    [config.db.database]
+  );
+  if (!bindingIdxRows.length) {
+    await db.query('CREATE INDEX idx_device_caja_sucursal ON device_caja_bindings (sucursal_id)');
+  }
+  if (!schemaCreateOnlyMode) {
+    await db.query(
+      `UPDATE device_caja_bindings b
+       INNER JOIN cajas c ON c.n_caja = b.numero_caja
+       SET b.sucursal_id = c.sucursal_id
+       WHERE b.sucursal_id IS NULL`
+    );
+  }
 
   await db.query(`
     CREATE TABLE IF NOT EXISTS purchase_settings (
@@ -2109,6 +3532,7 @@ async function ensureOperationalTables() {
       user_id INT NOT NULL,
       token_hash CHAR(64) NOT NULL,
       caja_id INT NULL,
+      sucursal_id INT NULL,
       turno_id INT NULL,
       device_hash VARCHAR(64) NULL,
       expires_at DATETIME NOT NULL,
@@ -2121,11 +3545,23 @@ async function ensureOperationalTables() {
       INDEX idx_user_auth_revoked (revoked_at)
     )
   `);
-
-  await db.query(
-    `DELETE FROM user_auth_sessions
-     WHERE revoked_at IS NOT NULL OR expires_at < (NOW() - INTERVAL 2 DAY)`
+  const [authSessionColumnsRows] = await db.query(
+    `SELECT COLUMN_NAME
+     FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'user_auth_sessions'`,
+    [config.db.database]
   );
+  const authSessionColumns = new Set(authSessionColumnsRows.map((row) => row.COLUMN_NAME));
+  if (!authSessionColumns.has('sucursal_id')) {
+    await db.query('ALTER TABLE user_auth_sessions ADD COLUMN sucursal_id INT NULL AFTER caja_id');
+  }
+
+  if (!schemaCreateOnlyMode) {
+    await db.query(
+      `DELETE FROM user_auth_sessions
+       WHERE revoked_at IS NOT NULL OR expires_at < (NOW() - INTERVAL 2 DAY)`
+    );
+  }
 }
 
 app.use(async (req, res, next) => {
@@ -2152,19 +3588,54 @@ app.use(async (req, res, next) => {
   }
 });
 
-db.getConnection()
-  .then(async (connection) => {
-    console.log('Conexion exitosa a la base de datos.');
-    connection.release();
-    await ensureOperationalTables();
-  })
-  .catch((err) => {
-    console.error('Error de conexion a la base de datos:', err);
+const schemaSyncOnlyMode = String(process.env.DB_SCHEMA_SYNC_ONLY || '').trim() === '1';
+const schemaCreateOnlyMode = String(process.env.DB_SCHEMA_CREATE_ONLY || '').trim() === '1';
+
+async function bootstrapDatabase() {
+  const connection = await db.getConnection();
+  console.log('Conexion exitosa a la base de datos.');
+  connection.release();
+  await ensureOperationalTables();
+}
+
+function startApiServer() {
+  const server = app.listen(config.apiPort, () => {
+    console.log('El servidor se esta ejecutando en el puerto ', config.apiPort);
   });
 
-app.listen(config.apiPort, () => {
-  console.log('El servidor se esta ejecutando en el puerto ', config.apiPort);
-});
+  server.on('error', (err) => {
+    if (err && err.code === 'EADDRINUSE') {
+      console.error(`No se pudo iniciar el backend: el puerto ${config.apiPort} ya esta en uso.`);
+      console.error('Cierra el proceso que usa ese puerto o define PORT en server/.env.');
+      process.exit(1);
+      return;
+    }
+
+    console.error('Error al iniciar el servidor HTTP:', err);
+    process.exit(1);
+  });
+}
+
+if (schemaSyncOnlyMode) {
+  bootstrapDatabase()
+    .then(() => {
+      console.log('Actualizacion de estructura de base de datos completada.');
+      process.exit(0);
+    })
+    .catch((err) => {
+      console.error('Error de conexion a la base de datos:', err);
+      process.exit(1);
+    });
+} else {
+  bootstrapDatabase()
+    .then(() => {
+      startApiServer();
+    })
+    .catch((err) => {
+      console.error('Error de conexion a la base de datos:', err);
+      process.exit(1);
+    });
+}
 
 //---------------------------------------------------------------------------------
 //----------------------Rutas del backend------------------------------------------
@@ -2176,9 +3647,11 @@ app.get('/api/productos', async (req, res) => {
   try {
     const [results] = await db.query(
       `SELECT p.*,
+              fv.descripcion AS formato_venta,
               d.nombre AS departamento,
               s.name AS supplier_name
        FROM productos p
+       LEFT JOIN formato_venta fv ON fv.id_formato = p.id_formato
        LEFT JOIN departamento d ON d.id_departamento = p.id_departamento
        LEFT JOIN service_suppliers s ON s.id = p.supplier_id
        ORDER BY p.descripcion ASC`
@@ -2242,7 +3715,15 @@ app.get('/api/getInfo', async (req, res) => {
 // -----------------buscar todas las cajas del local
 app.get('/api/getCajas', async (req, res) => {
   try {
-    const [results] = await db.query('SELECT * FROM cajas ORDER BY n_caja ASC');
+    const [results] = await db.query(
+      `SELECT c.*,
+              c.sucursal_id,
+              s.nombre AS sucursal_nombre,
+              s.activa AS sucursal_activa
+       FROM cajas c
+       LEFT JOIN sucursales s ON s.id_sucursal = c.sucursal_id
+       ORDER BY c.n_caja ASC`
+    );
     if (results.length > 0) {
       res.json(results);
     } else {
@@ -2250,6 +3731,294 @@ app.get('/api/getCajas', async (req, res) => {
     }
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/sucursales/limits', async (_req, res) => {
+  try {
+    const [rows] = await db.query(
+      `SELECT max_sucursales, creator_contact
+       FROM system_business_limits
+       WHERE id = 1
+       LIMIT 1`
+    );
+    const row = rows[0] || {};
+    return res.json({
+      max_sucursales: toInt(row.max_sucursales) || MAX_ACTIVE_BRANCHES_DEFAULT,
+      creator_contact: String(row.creator_contact || BRANCH_CREATOR_CONTACT_DEFAULT),
+    });
+  } catch (err) {
+    return res.status(500).json({ message: 'No se pudieron cargar limites de sucursal' });
+  }
+});
+
+app.get('/api/sucursales', async (_req, res) => {
+  try {
+    const [rows] = await db.query(
+      `SELECT s.id_sucursal, s.codigo, s.nombre, s.direccion, s.activa,
+              COALESCE(c.cajas_total, 0) AS cajas_total
+       FROM sucursales s
+       LEFT JOIN (
+         SELECT sucursal_id, COUNT(*) AS cajas_total
+         FROM cajas
+         GROUP BY sucursal_id
+       ) c ON c.sucursal_id = s.id_sucursal
+       ORDER BY s.id_sucursal ASC`
+    );
+    return res.json(rows.map((row) => ({
+      id_sucursal: Number(row.id_sucursal || 0),
+      codigo: row.codigo || '',
+      nombre: row.nombre || '',
+      direccion: row.direccion || '',
+      activa: Number(row.activa || 0),
+      cajas_total: Number(row.cajas_total || 0),
+    })));
+  } catch (err) {
+    console.error('Error al listar sucursales:', err);
+    return res.status(500).json({ message: 'No se pudieron cargar sucursales' });
+  }
+});
+
+app.post('/api/sucursales', async (req, res) => {
+  const nombre = toText(req.body?.nombre, 120);
+  const direccion = toText(req.body?.direccion, 255);
+  const activa = normalizeBool(req.body?.activa, true) ? 1 : 0;
+  const requestedCode = toText(req.body?.codigo, 16);
+  let codigo = normalizeBranchCode(requestedCode || nombre || '');
+
+  if (!nombre) {
+    return res.status(400).json({ message: 'Nombre de sucursal invalido' });
+  }
+  if (!codigo) {
+    codigo = `SUC_${Date.now().toString().slice(-6)}`;
+  }
+
+  let connection;
+  try {
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+
+    const [limitRows] = await connection.query(
+      'SELECT max_sucursales, creator_contact FROM system_business_limits WHERE id = 1 LIMIT 1'
+    );
+    const maxBranches = toInt(limitRows[0]?.max_sucursales) || MAX_ACTIVE_BRANCHES_DEFAULT;
+    const creatorContact = String(limitRows[0]?.creator_contact || BRANCH_CREATOR_CONTACT_DEFAULT);
+
+    if (activa) {
+      const [activeRows] = await connection.query(
+        'SELECT COUNT(*) AS total FROM sucursales WHERE activa = 1'
+      );
+      const activeTotal = Number(activeRows[0]?.total || 0);
+      if (activeTotal >= maxBranches) {
+        await connection.rollback();
+        return res.status(409).json({
+          code: 'MAX_SUCURSALES_REACHED',
+          message: `Limite alcanzado: maximo ${maxBranches} sucursales activas. Para ampliar contacte a ${creatorContact}.`,
+        });
+      }
+    }
+
+    const [nameRows] = await connection.query(
+      'SELECT id_sucursal FROM sucursales WHERE LOWER(nombre) = LOWER(?) LIMIT 1',
+      [nombre]
+    );
+    if (nameRows.length) {
+      await connection.rollback();
+      return res.status(409).json({ message: 'Ya existe una sucursal con ese nombre' });
+    }
+
+    let finalCode = codigo;
+    let codeTry = 0;
+    while (codeTry < 50) {
+      const [codeRows] = await connection.query(
+        'SELECT id_sucursal FROM sucursales WHERE codigo = ? LIMIT 1',
+        [finalCode]
+      );
+      if (!codeRows.length) break;
+      codeTry += 1;
+      finalCode = `${codigo.slice(0, 12)}_${codeTry}`.slice(0, 16);
+    }
+    if (codeTry >= 50) {
+      await connection.rollback();
+      return res.status(500).json({ message: 'No se pudo generar un codigo unico para la sucursal' });
+    }
+
+    const [result] = await connection.query(
+      `INSERT INTO sucursales (codigo, nombre, direccion, activa)
+       VALUES (?, ?, ?, ?)`,
+      [finalCode, nombre, direccion || null, activa]
+    );
+
+    await connection.commit();
+    return res.status(201).json({
+      success: true,
+      id_sucursal: Number(result.insertId),
+      codigo: finalCode,
+      nombre,
+      direccion: direccion || null,
+      activa,
+    });
+  } catch (err) {
+    if (connection) {
+      try { await connection.rollback(); } catch (_) {}
+    }
+    console.error('Error al crear sucursal:', err);
+    return res.status(500).json({ message: 'No se pudo crear la sucursal' });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+app.put('/api/sucursales/:id', async (req, res) => {
+  const sucursalId = toInt(req.params?.id);
+  const nombre = toText(req.body?.nombre, 120);
+  const direccion = typeof req.body?.direccion === 'string' ? req.body.direccion.trim().slice(0, 255) : null;
+  const activaRaw = req.body?.activa;
+  const activa = typeof activaRaw === 'undefined' ? null : (normalizeBool(activaRaw, true) ? 1 : 0);
+  const codeRaw = toText(req.body?.codigo, 16);
+  const codigo = codeRaw ? normalizeBranchCode(codeRaw) : null;
+
+  if (!sucursalId) {
+    return res.status(400).json({ message: 'Sucursal invalida' });
+  }
+  if (codeRaw && !codigo) {
+    return res.status(400).json({ message: 'Codigo de sucursal invalido' });
+  }
+
+  let connection;
+  try {
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+
+    const [currentRows] = await connection.query(
+      `SELECT id_sucursal, codigo, nombre, direccion, activa
+       FROM sucursales
+       WHERE id_sucursal = ?
+       LIMIT 1`,
+      [sucursalId]
+    );
+    if (!currentRows.length) {
+      await connection.rollback();
+      return res.status(404).json({ message: 'Sucursal no encontrada' });
+    }
+    const current = currentRows[0];
+
+    const nextNombre = nombre || current.nombre;
+    const nextCodigo = codigo || current.codigo;
+    const nextDireccion = direccion === null ? current.direccion : (direccion || null);
+    const nextActiva = activa === null ? Number(current.activa || 0) : activa;
+
+    const [dupNameRows] = await connection.query(
+      'SELECT id_sucursal FROM sucursales WHERE LOWER(nombre) = LOWER(?) AND id_sucursal <> ? LIMIT 1',
+      [nextNombre, sucursalId]
+    );
+    if (dupNameRows.length) {
+      await connection.rollback();
+      return res.status(409).json({ message: 'El nombre de sucursal ya esta en uso' });
+    }
+
+    const [dupCodeRows] = await connection.query(
+      'SELECT id_sucursal FROM sucursales WHERE codigo = ? AND id_sucursal <> ? LIMIT 1',
+      [nextCodigo, sucursalId]
+    );
+    if (dupCodeRows.length) {
+      await connection.rollback();
+      return res.status(409).json({ message: 'El codigo de sucursal ya esta en uso' });
+    }
+
+    if (nextActiva === 1) {
+      const [limitRows] = await connection.query(
+        'SELECT max_sucursales, creator_contact FROM system_business_limits WHERE id = 1 LIMIT 1'
+      );
+      const maxBranches = toInt(limitRows[0]?.max_sucursales) || MAX_ACTIVE_BRANCHES_DEFAULT;
+      const creatorContact = String(limitRows[0]?.creator_contact || BRANCH_CREATOR_CONTACT_DEFAULT);
+      const [activeRows] = await connection.query(
+        `SELECT COUNT(*) AS total
+         FROM sucursales
+         WHERE activa = 1 AND id_sucursal <> ?`,
+        [sucursalId]
+      );
+      const activeOther = Number(activeRows[0]?.total || 0);
+      if (activeOther >= maxBranches) {
+        await connection.rollback();
+        return res.status(409).json({
+          code: 'MAX_SUCURSALES_REACHED',
+          message: `Limite alcanzado: maximo ${maxBranches} sucursales activas. Para ampliar contacte a ${creatorContact}.`,
+        });
+      }
+    }
+
+    await connection.query(
+      `UPDATE sucursales
+       SET codigo = ?, nombre = ?, direccion = ?, activa = ?
+       WHERE id_sucursal = ?`,
+      [nextCodigo, nextNombre, nextDireccion, nextActiva, sucursalId]
+    );
+
+    await connection.commit();
+    return res.json({
+      success: true,
+      id_sucursal: sucursalId,
+      codigo: nextCodigo,
+      nombre: nextNombre,
+      direccion: nextDireccion,
+      activa: nextActiva,
+    });
+  } catch (err) {
+    if (connection) {
+      try { await connection.rollback(); } catch (_) {}
+    }
+    console.error('Error al actualizar sucursal:', err);
+    return res.status(500).json({ message: 'No se pudo actualizar la sucursal' });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+app.delete('/api/sucursales/:id', async (req, res) => {
+  const sucursalId = toInt(req.params?.id);
+  if (!sucursalId) {
+    return res.status(400).json({ message: 'Sucursal invalida' });
+  }
+  if (sucursalId === 1) {
+    return res.status(409).json({ message: 'La sucursal principal no se puede eliminar' });
+  }
+
+  let connection;
+  try {
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+
+    const [branchRows] = await connection.query(
+      'SELECT id_sucursal FROM sucursales WHERE id_sucursal = ? LIMIT 1',
+      [sucursalId]
+    );
+    if (!branchRows.length) {
+      await connection.rollback();
+      return res.status(404).json({ message: 'Sucursal no encontrada' });
+    }
+
+    const [boxRows] = await connection.query(
+      'SELECT COUNT(*) AS total FROM cajas WHERE sucursal_id = ?',
+      [sucursalId]
+    );
+    const totalBoxes = Number(boxRows[0]?.total || 0);
+    if (totalBoxes > 0) {
+      await connection.rollback();
+      return res.status(409).json({ message: 'No se puede eliminar: la sucursal tiene cajas asignadas' });
+    }
+
+    await connection.query('DELETE FROM sucursales WHERE id_sucursal = ?', [sucursalId]);
+    await connection.commit();
+    return res.json({ success: true });
+  } catch (err) {
+    if (connection) {
+      try { await connection.rollback(); } catch (_) {}
+    }
+    console.error('Error al eliminar sucursal:', err);
+    return res.status(500).json({ message: 'No se pudo eliminar la sucursal' });
+  } finally {
+    if (connection) connection.release();
   }
 });
 
@@ -2261,7 +4030,7 @@ app.get('/api/device-caja/resolve', async (req, res) => {
 
   try {
     const [rows] = await db.query(
-      `SELECT device_hash, numero_caja, nombre_caja
+      `SELECT device_hash, numero_caja, sucursal_id, nombre_caja
        FROM device_caja_bindings
        WHERE device_hash = ?
        LIMIT 1`,
@@ -2280,6 +4049,7 @@ app.get('/api/device-caja/resolve', async (req, res) => {
     return res.json({
       found: true,
       numero_caja: Number(rows[0].numero_caja || 0),
+      sucursal_id: Number(rows[0].sucursal_id || 1),
       nombre_caja: rows[0].nombre_caja || '',
     });
   } catch (err) {
@@ -2299,18 +4069,20 @@ app.post('/api/device-caja/bind', async (req, res) => {
   }
 
   try {
+    const sucursalId = await resolveBranchForCaja(cajaId);
     await db.query(
-      `INSERT INTO device_caja_bindings (device_hash, numero_caja, nombre_caja, source, last_seen)
-       VALUES (?, ?, ?, 'api_bind', NOW())
+      `INSERT INTO device_caja_bindings (device_hash, numero_caja, sucursal_id, nombre_caja, source, last_seen)
+       VALUES (?, ?, ?, ?, 'api_bind', NOW())
        ON DUPLICATE KEY UPDATE
          numero_caja = VALUES(numero_caja),
+         sucursal_id = VALUES(sucursal_id),
          nombre_caja = VALUES(nombre_caja),
          source = 'api_bind',
          last_seen = NOW()`,
-      [deviceHash, cajaId, cajaName]
+      [deviceHash, cajaId, sucursalId, cajaName]
     );
 
-    return res.json({ success: true, numero_caja: cajaId, nombre_caja: cajaName });
+    return res.json({ success: true, numero_caja: cajaId, nombre_caja: cajaName, sucursal_id: sucursalId });
   } catch (err) {
     console.error('Error al vincular dispositivo con caja:', err);
     return res.status(500).json({ message: 'Error interno del servidor' });
@@ -2367,7 +4139,7 @@ app.post('/api/cajeros', async (req, res) => {
   const permisos = buildCashierPermissions(req.body?.permisos || {});
 
   if (!username || !nombre || !plainPassword || plainPassword.length < 4) {
-    return res.status(400).json({ error: 'Datos de cajero inválidos' });
+    return res.status(400).json({ error: 'Datos de cajero invÃ¡lidos' });
   }
 
   let connection;
@@ -2420,7 +4192,7 @@ app.put('/api/cajeros/:id', async (req, res) => {
   const permisos = buildCashierPermissions(req.body?.permisos || {});
 
   if (!userId || !username || !nombre) {
-    return res.status(400).json({ error: 'Datos de cajero inválidos' });
+    return res.status(400).json({ error: 'Datos de cajero invÃ¡lidos' });
   }
 
   let connection;
@@ -2442,7 +4214,7 @@ app.put('/api/cajeros/:id', async (req, res) => {
 
     if (plainPassword && plainPassword.length < 4) {
       await connection.rollback();
-      return res.status(400).json({ error: 'La contraseña debe tener al menos 4 caracteres' });
+      return res.status(400).json({ error: 'La contraseÃ±a debe tener al menos 4 caracteres' });
     }
 
     if (plainPassword) {
@@ -2487,7 +4259,7 @@ app.put('/api/cajeros/:id', async (req, res) => {
 app.delete('/api/cajeros/:id', async (req, res) => {
   const userId = toInt(req.params?.id);
   if (!userId) {
-    return res.status(400).json({ error: 'ID de cajero inválido' });
+    return res.status(400).json({ error: 'ID de cajero invÃ¡lido' });
   }
 
   let connection;
@@ -2514,11 +4286,12 @@ app.delete('/api/cajeros/:id', async (req, res) => {
 
 app.get('/api/ticket-settings', async (req, res) => {
   try {
-    const [rows] = await db.query('SELECT * FROM ticket_settings WHERE id = 1 LIMIT 1');
-    if (!rows.length) {
+    const cajaId = await resolveCajaIdForTicketSettings(req);
+    const settings = await getTicketSettingsForCaja(cajaId);
+    if (!settings) {
       return res.status(404).json({ message: 'Configuracion de ticket no disponible' });
     }
-    return res.json(rows[0]);
+    return res.json(settings);
   } catch (err) {
     return res.status(500).json({ message: 'Error al obtener configuracion de ticket' });
   }
@@ -2539,31 +4312,30 @@ app.put('/api/ticket-settings', async (req, res) => {
   const showPaymentMethod = normalizeBool(payload.show_payment_method, true);
   const showTicketNumber = normalizeBool(payload.show_ticket_number, true);
   const includeDetails = normalizeBool(payload.include_details_by_default, true);
+  const requestedCajaId = extractCajaIdFromRequest(req);
 
   try {
-    await db.query(
-      `UPDATE ticket_settings
-       SET ticket_header = ?, ticket_footer = ?, printer_name = ?, columns_width = ?, paper_width_mm = ?, print_engine = ?, feed_lines_after_print = ?,
-           show_business_info = ?, show_cashier = ?, show_box = ?, show_payment_method = ?,
-           show_ticket_number = ?, include_details_by_default = ?
-       WHERE id = 1`,
-      [
-        ticketHeader,
-        ticketFooter,
-        printerName || null,
-        columnsWidth,
-        paperWidthMm,
-        printEngine,
-        feedLines,
-        showBusinessInfo,
-        showCashier,
-        showBox,
-        showPaymentMethod,
-        showTicketNumber,
-        includeDetails,
-      ]
-    );
-    return res.json({ message: 'Configuracion de ticket actualizada' });
+    const effectiveCajaId = requestedCajaId || await resolveCajaIdForTicketSettings(req);
+    const normalized = normalizeTicketSettingsRow({
+      ticket_header: ticketHeader,
+      ticket_footer: ticketFooter,
+      printer_name: printerName || null,
+      columns_width: columnsWidth,
+      paper_width_mm: paperWidthMm,
+      print_engine: printEngine,
+      feed_lines_after_print: feedLines,
+      show_business_info: showBusinessInfo,
+      show_cashier: showCashier,
+      show_box: showBox,
+      show_payment_method: showPaymentMethod,
+      show_ticket_number: showTicketNumber,
+      include_details_by_default: includeDetails,
+    });
+    const savedCajaId = await saveTicketSettingsForCaja(effectiveCajaId, normalized);
+    return res.json({
+      message: 'Configuracion de ticket actualizada',
+      caja_id: savedCajaId || null,
+    });
   } catch (err) {
     return res.status(500).json({ message: 'Error al guardar configuracion de ticket' });
   }
@@ -2834,16 +4606,15 @@ app.post('/api/dte/certificate/verify-password', async (req, res) => {
   }
 });
 
-app.post('/api/dte/print-test-58mm', async (_req, res) => {
+app.post('/api/dte/print-test-58mm', async (req, res) => {
   try {
-    const [settingsRows] = await db.query('SELECT * FROM ticket_settings WHERE id = 1 LIMIT 1');
-    if (!settingsRows.length) {
+    const settings = await getTicketSettingsForCaja(await resolveCajaIdForTicketSettings(req));
+    if (!settings) {
       return res.status(400).json({ message: 'No existe configuracion de ticket' });
     }
-    const settings = settingsRows[0];
     const configuredPrinter = String(settings.printer_name || '').trim();
     if (!configuredPrinter) {
-      return res.status(400).json({ message: 'No hay impresora configurada en el sistema' });
+      return res.status(400).json({ message: 'No hay impresora configurada para esta caja' });
     }
 
     const [businessRows] = await db.query(
@@ -2879,25 +4650,12 @@ app.post('/api/dte/print-test-58mm', async (_req, res) => {
     await fs.writeFile(tempFile, ticketText, 'utf8');
 
     try {
-      const printFontSize = dteProfile.fontSize;
-      const gdiPrintCommand =
-        `Add-Type -AssemblyName System.Drawing; ` +
-        `$text = Get-Content -Raw -Encoding UTF8 -Path '${escapePsSingleQuoted(tempFile)}'; ` +
-        `$pd = New-Object System.Drawing.Printing.PrintDocument; ` +
-        `$pd.PrinterSettings.PrinterName = '${escapePsSingleQuoted(configuredPrinter)}'; ` +
-        `if (-not $pd.PrinterSettings.IsValid) { throw 'Impresora no valida o no disponible'; } ` +
-        `$handler = [System.Drawing.Printing.PrintPageEventHandler]{ ` +
-        `param($sender,$e) ` +
-        `$font = New-Object System.Drawing.Font('Consolas', ${printFontSize}); ` +
-        `$brush = [System.Drawing.Brushes]::Black; ` +
-        `$marginMm = 0; ` +
-        `$x = [Math]::Round(($e.Graphics.DpiX / 25.4) * $marginMm); ` +
-        `$y = 0; ` +
-        `$e.Graphics.DrawString($text, $font, $brush, $x, $y); ` +
-        `$e.HasMorePages = $false ` +
-        `}; ` +
-        `$pd.add_PrintPage($handler); ` +
-        `$pd.Print();`;
+    const printFontSize = getCutReportFontSize(
+      dteProfile.fontSize,
+      dteProfile.paper_width_mm,
+      dteProfile.columns
+    );
+      const gdiPrintCommand = buildGdiTicketPrintCommand(tempFile, configuredPrinter, printFontSize);
       await runPowerShell(gdiPrintCommand);
     } finally {
       await fs.unlink(tempFile).catch(() => {});
@@ -3121,17 +4879,14 @@ app.get('/api/logo-settings', async (req, res) => {
 
 app.put('/api/logo-settings', async (req, res) => {
   const logoData = typeof req.body?.logo_data === 'string' ? req.body.logo_data.trim() : '';
-  if (!logoData) {
-    return res.status(400).json({ message: 'Logotipo invalido' });
-  }
-  if (logoData.length > 800000) {
+  if (logoData && logoData.length > 800000) {
     return res.status(400).json({ message: 'El logotipo supera el tamano permitido' });
   }
   try {
-    await db.query('UPDATE personalization_settings SET logo_data = ? WHERE id = 1', [logoData]);
-    return res.json({ message: 'Logotipo actualizado' });
+    await db.query('UPDATE personalization_settings SET logo_data = ? WHERE id = 1', [logoData || null]);
+    return res.json({ message: logoData ? 'Logotipo actualizado' : 'Logotipo eliminado' });
   } catch (err) {
-    return res.status(500).json({ message: 'Error al guardar logotipo' });
+    return res.status(500).json({ message: logoData ? 'Error al guardar logotipo' : 'Error al eliminar logotipo' });
   }
 });
 
@@ -3289,8 +5044,8 @@ app.post('/api/cash-drawer/open-test', async (req, res) => {
 
     let printerName = String(settings.drawer_printer_name || '').trim();
     if (!printerName) {
-      const [ticketRows] = await db.query('SELECT printer_name FROM ticket_settings WHERE id = 1 LIMIT 1');
-      printerName = String(ticketRows[0]?.printer_name || '').trim();
+      const ticketSettings = await getTicketSettingsForCaja(await resolveCajaIdForTicketSettings(req));
+      printerName = String(ticketSettings?.printer_name || '').trim();
     }
     const message = await sendCashDrawerPulse({
       connectionType: connection,
@@ -3306,26 +5061,64 @@ app.post('/api/cash-drawer/open-test', async (req, res) => {
 
 app.get('/api/cut-settings', async (req, res) => {
   try {
-    const [rows] = await db.query(
-      `SELECT cut_mode AS mode
-       FROM personalization_settings
-       WHERE id = 1
-       LIMIT 1`
-    );
-    if (!rows.length) {
+    const settings = await getCutSettings(db);
+    if (!settings) {
       return res.status(404).json({ message: 'Configuracion de corte no disponible' });
     }
-    return res.json(rows[0]);
+    return res.json(settings);
   } catch (err) {
     return res.status(500).json({ message: 'Error al obtener configuracion de corte' });
   }
 });
 
 app.put('/api/cut-settings', async (req, res) => {
-  const mode = req.body?.mode === 'sin_ajuste' ? 'sin_ajuste' : 'ajuste_auto';
   try {
-    await db.query('UPDATE personalization_settings SET cut_mode = ? WHERE id = 1', [mode]);
-    return res.json({ message: 'Configuracion de corte actualizada', mode });
+    const currentSettings = await getCutSettings(db);
+    if (!currentSettings) {
+      return res.status(404).json({ message: 'Configuracion de corte no disponible' });
+    }
+    const payload = req.body || {};
+    const normalized = {
+      mode: normalizeCutMode(payload.mode ?? currentSettings.mode),
+      show_business_info: normalizeBool(payload.show_business_info, Boolean(currentSettings.show_business_info)) ? 1 : 0,
+      show_shift_info: normalizeBool(payload.show_shift_info, Boolean(currentSettings.show_shift_info)) ? 1 : 0,
+      show_sales_overview: normalizeBool(payload.show_sales_overview, Boolean(currentSettings.show_sales_overview)) ? 1 : 0,
+      show_cash_summary: normalizeBool(payload.show_cash_summary, Boolean(currentSettings.show_cash_summary)) ? 1 : 0,
+      show_entries_section: normalizeBool(payload.show_entries_section, Boolean(currentSettings.show_entries_section)) ? 1 : 0,
+      show_entries_detail: normalizeBool(payload.show_entries_detail, Boolean(currentSettings.show_entries_detail)) ? 1 : 0,
+      show_exits_section: normalizeBool(payload.show_exits_section, Boolean(currentSettings.show_exits_section)) ? 1 : 0,
+      show_exits_detail: normalizeBool(payload.show_exits_detail, Boolean(currentSettings.show_exits_detail)) ? 1 : 0,
+      show_sales_methods: normalizeBool(payload.show_sales_methods, Boolean(currentSettings.show_sales_methods)) ? 1 : 0,
+      show_department_totals: normalizeBool(payload.show_department_totals, Boolean(currentSettings.show_department_totals)) ? 1 : 0,
+      show_footer: normalizeBool(payload.show_footer, Boolean(currentSettings.show_footer)) ? 1 : 0,
+      print_labels: normalizeCutPrintLabels(payload.print_labels ?? currentSettings.print_labels),
+      print_styles: normalizeCutPrintStyles(payload.print_styles ?? currentSettings.print_styles),
+    };
+    await db.query(
+      `UPDATE personalization_settings
+       SET cut_mode = ?, cut_show_business_info = ?, cut_show_shift_info = ?, cut_show_sales_overview = ?,
+           cut_show_cash_summary = ?, cut_show_entries_section = ?, cut_show_entries_detail = ?,
+           cut_show_exits_section = ?, cut_show_exits_detail = ?, cut_show_sales_methods = ?,
+           cut_show_department_totals = ?, cut_show_footer = ?, cut_print_labels_json = ?, cut_print_styles_json = ?
+       WHERE id = 1`,
+      [
+        normalized.mode,
+        normalized.show_business_info,
+        normalized.show_shift_info,
+        normalized.show_sales_overview,
+        normalized.show_cash_summary,
+        normalized.show_entries_section,
+        normalized.show_entries_detail,
+        normalized.show_exits_section,
+        normalized.show_exits_detail,
+        normalized.show_sales_methods,
+        normalized.show_department_totals,
+        normalized.show_footer,
+        JSON.stringify(normalized.print_labels),
+        JSON.stringify(normalized.print_styles),
+      ]
+    );
+    return res.json({ message: 'Configuracion de corte actualizada', ...normalized });
   } catch (err) {
     return res.status(500).json({ message: 'Error al guardar configuracion de corte' });
   }
@@ -3845,7 +5638,7 @@ app.post('/api/purchase-order/close', async (req, res) => {
     );
     if (missingRows.length && !forceClose) {
       return res.status(409).json({
-        message: 'Aún faltan productos por ingresar en este pedido.',
+        message: 'AÃºn faltan productos por ingresar en este pedido.',
         missing_items: missingRows,
       });
     }
@@ -3916,7 +5709,7 @@ app.get('/api/purchase-orders/summary', async (req, res) => {
 app.get('/api/purchase-order/:id/detail', async (req, res) => {
   const orderId = toInt(req.params?.id);
   if (!orderId) {
-    return res.status(400).json({ message: 'Orden inválida' });
+    return res.status(400).json({ message: 'Orden invÃ¡lida' });
   }
   try {
     const [orderRows] = await db.query(
@@ -4047,7 +5840,7 @@ app.post('/api/purchase-order/items', async (req, res) => {
 app.delete('/api/purchase-order/items/:itemId', async (req, res) => {
   const itemId = toInt(req.params?.itemId);
   if (!itemId) {
-    return res.status(400).json({ message: 'Item inválido para eliminar' });
+    return res.status(400).json({ message: 'Item invÃ¡lido para eliminar' });
   }
 
   try {
@@ -4200,13 +5993,13 @@ app.post('/api/purchase-order/assign-email', async (req, res) => {
             <div style="font-size:12px; opacity:.95;">Solicitada por: ${String(requesterName || 'Usuario del sistema').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>
           </div>
           <div style="padding:14px 18px; color:#0f172a; font-size:13px;">
-            ${note ? `<div style="margin-bottom:10px;"><strong>Observación:</strong> ${String(note).replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>` : ''}
+            ${note ? `<div style="margin-bottom:10px;"><strong>ObservaciÃ³n:</strong> ${String(note).replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>` : ''}
             <table role="presentation" cellspacing="0" cellpadding="0" style="width:100%; border-collapse:collapse; border:1px solid #e2e8f0;">
               <thead>
                 <tr style="background:#e2e8f0;">
                   <th style="padding:10px 8px; font-size:12px; text-align:left; color:#0f172a;">#</th>
                   <th style="padding:10px 8px; font-size:12px; text-align:left; color:#0f172a;">Producto</th>
-                  <th style="padding:10px 8px; font-size:12px; text-align:left; color:#0f172a;">Código</th>
+                  <th style="padding:10px 8px; font-size:12px; text-align:left; color:#0f172a;">CÃ³digo</th>
                   <th style="padding:10px 8px; font-size:12px; text-align:right; color:#0f172a;">Solicitado</th>
                   <th style="padding:10px 8px; font-size:12px; text-align:right; color:#0f172a;">Recibido</th>
                   <th style="padding:10px 8px; font-size:12px; text-align:right; color:#0f172a;">Pendiente</th>
@@ -4484,6 +6277,195 @@ app.get('/api/productos/catalog', async (req, res) => {
   }
 });
 
+app.get('/api/inventory/movements', async (req, res) => {
+  const authUserId = toInt(req.user?.sub);
+  if (!authUserId) {
+    return res.status(401).json({ message: 'Sesion invalida' });
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+  const fromDate = String(req.query?.from || '').trim() || today;
+  const toDate = String(req.query?.to || '').trim() || today;
+  const cajaRaw = String(req.query?.caja || 'all').trim().toLowerCase();
+  const movementTypeRaw = String(req.query?.movement_type || 'all').trim().toLowerCase();
+  const allowedMovementTypes = new Set(['all', 'ajuste', 'modificacion', 'venta', 'top_sold']);
+  if (movementTypeRaw && !allowedMovementTypes.has(movementTypeRaw)) {
+    return res.status(400).json({ message: 'Tipo de movimiento invalido' });
+  }
+  const movementType = allowedMovementTypes.has(movementTypeRaw) ? movementTypeRaw : 'all';
+
+  if (!isIsoDate(fromDate) || !isIsoDate(toDate)) {
+    return res.status(400).json({ message: 'Parametros from y to deben tener formato YYYY-MM-DD' });
+  }
+  if (fromDate > toDate) {
+    return res.status(400).json({ message: 'La fecha desde no puede ser mayor que hasta' });
+  }
+
+  let cajaId = null;
+  if (cajaRaw && cajaRaw !== 'all') {
+    cajaId = toInt(cajaRaw);
+    if (!cajaId || cajaId < 1) {
+      return res.status(400).json({ message: 'Caja invalida' });
+    }
+  }
+
+  const movementFilters = ['DATE(m.fecha) BETWEEN ? AND ?'];
+  const movementParams = [fromDate, toDate];
+  if (cajaId) {
+    movementFilters.push('m.caja_id = ?');
+    movementParams.push(cajaId);
+  }
+  if (movementType === 'ajuste' || movementType === 'modificacion') {
+    movementFilters.push('m.tipo_movimiento = ?');
+    movementParams.push(movementType);
+  }
+
+  const salesFilters = ['DATE(v.fecha) BETWEEN ? AND ?'];
+  const salesParams = [fromDate, toDate];
+  if (cajaId) {
+    salesFilters.push('v.caja_id = ?');
+    salesParams.push(cajaId);
+  }
+
+  const inventorySelectSql = `
+    SELECT CONCAT('inv-', m.id_movimiento) AS registro_id,
+           DATE_FORMAT(m.fecha, '%Y-%m-%d %H:%i:%s') AS fecha,
+           m.producto_id,
+           m.codigo_barras,
+           m.producto_descripcion,
+           m.tipo_movimiento,
+           m.cantidad_anterior,
+           m.cambio_cantidad,
+           m.cantidad_nueva,
+           m.especificacion,
+           m.caja_id,
+           m.usuario_id,
+           COALESCE(u.nombre, CONCAT('Usuario ', m.usuario_id)) AS usuario_nombre,
+           NULL AS cantidad_vendida,
+           NULL AS total_vendido
+    FROM inventory_movements m
+    LEFT JOIN usuarios u ON u.id = m.usuario_id
+    WHERE ${movementFilters.join(' AND ')}
+  `;
+
+  const salesSelectSql = `
+    SELECT CONCAT('sale-', d.id_detalle) AS registro_id,
+           DATE_FORMAT(v.fecha, '%Y-%m-%d %H:%i:%s') AS fecha,
+           COALESCE(d.producto_id, 0) AS producto_id,
+           COALESCE(p.codigo_barras, '') AS codigo_barras,
+           COALESCE(NULLIF(p.descripcion, ''), NULLIF(d.descripcion, ''), 'Producto') AS producto_descripcion,
+           'venta' AS tipo_movimiento,
+           NULL AS cantidad_anterior,
+           (COALESCE(d.cantidad, 0) * -1) AS cambio_cantidad,
+           NULL AS cantidad_nueva,
+           CONCAT('Ticket ', COALESCE(NULLIF(v.folio_ticket, ''), CAST(v.numero_ticket AS CHAR))) AS especificacion,
+           v.caja_id,
+           v.usuario_id,
+           COALESCE(u.nombre, CONCAT('Usuario ', v.usuario_id)) AS usuario_nombre,
+           COALESCE(d.cantidad, 0) AS cantidad_vendida,
+           COALESCE(d.subtotal, 0) AS total_vendido
+    FROM detalle_venta d
+    INNER JOIN ventas v ON v.id_venta = d.venta_id
+    LEFT JOIN productos p ON p.id_producto = d.producto_id
+    LEFT JOIN usuarios u ON u.id = v.usuario_id
+    WHERE ${salesFilters.join(' AND ')}
+  `;
+
+  try {
+    if (movementType === 'top_sold') {
+      const [topRows] = await db.query(
+        `SELECT COALESCE(p.id_producto, d.producto_id, 0) AS producto_id,
+                COALESCE(p.codigo_barras, '') AS codigo_barras,
+                COALESCE(NULLIF(p.descripcion, ''), NULLIF(d.descripcion, ''), 'Producto') AS producto_descripcion,
+                COALESCE(SUM(d.cantidad), 0) AS cantidad_vendida,
+                COALESCE(SUM(d.subtotal), 0) AS total_vendido
+         FROM detalle_venta d
+         INNER JOIN ventas v ON v.id_venta = d.venta_id
+         LEFT JOIN productos p ON p.id_producto = d.producto_id
+         WHERE ${salesFilters.join(' AND ')}
+         GROUP BY COALESCE(p.id_producto, d.producto_id, 0),
+                  COALESCE(p.codigo_barras, ''),
+                  COALESCE(NULLIF(p.descripcion, ''), NULLIF(d.descripcion, ''), 'Producto')
+         HAVING COALESCE(SUM(d.cantidad), 0) > 0
+         ORDER BY cantidad_vendida DESC, total_vendido DESC, producto_descripcion ASC
+         LIMIT 200`,
+        salesParams
+      );
+
+      return res.json(topRows.map((row) => ({
+        id_movimiento: `top-${Number(row.producto_id || 0)}-${String(row.codigo_barras || '').trim()}`,
+        fecha: '',
+        producto_id: Number(row.producto_id || 0),
+        codigo_barras: row.codigo_barras || '',
+        producto_descripcion: row.producto_descripcion || '',
+        tipo_movimiento: 'top_sold',
+        cantidad_anterior: null,
+        cambio_cantidad: null,
+        cantidad_nueva: null,
+        especificacion: 'Ranking de ventas',
+        caja_id: cajaId || null,
+        usuario_id: null,
+        usuario_nombre: '',
+        cantidad_vendida: Number(row.cantidad_vendida || 0),
+        total_vendido: Number(row.total_vendido || 0),
+      })));
+    }
+
+    let rows = [];
+    if (movementType === 'venta') {
+      const [salesRows] = await db.query(
+        `${salesSelectSql}
+         ORDER BY v.fecha DESC, d.id_detalle DESC
+         LIMIT 2000`,
+        salesParams
+      );
+      rows = salesRows;
+    } else if (movementType === 'all') {
+      const [mixedRows] = await db.query(
+        `SELECT *
+         FROM (
+           ${inventorySelectSql}
+           UNION ALL
+           ${salesSelectSql}
+         ) AS mix
+         ORDER BY mix.fecha DESC, mix.registro_id DESC
+         LIMIT 2000`,
+        [...movementParams, ...salesParams]
+      );
+      rows = mixedRows;
+    } else {
+      const [inventoryRows] = await db.query(
+        `${inventorySelectSql}
+         ORDER BY m.fecha DESC, m.id_movimiento DESC
+         LIMIT 2000`,
+        movementParams
+      );
+      rows = inventoryRows;
+    }
+
+    return res.json(rows.map((row) => ({
+      id_movimiento: row.registro_id || Number(row.id_movimiento || 0),
+      fecha: row.fecha || '',
+      producto_id: Number(row.producto_id || 0),
+      codigo_barras: row.codigo_barras || '',
+      producto_descripcion: row.producto_descripcion || '',
+      tipo_movimiento: row.tipo_movimiento || 'ajuste',
+      cantidad_anterior: row.cantidad_anterior === null ? null : Number(row.cantidad_anterior || 0),
+      cambio_cantidad: row.cambio_cantidad === null ? null : Number(row.cambio_cantidad || 0),
+      cantidad_nueva: row.cantidad_nueva === null ? null : Number(row.cantidad_nueva || 0),
+      especificacion: row.especificacion || '',
+      caja_id: toInt(row.caja_id),
+      usuario_id: row.usuario_id === null ? null : Number(row.usuario_id || 0),
+      usuario_nombre: row.usuario_nombre || '',
+      cantidad_vendida: row.cantidad_vendida === null ? null : Number(row.cantidad_vendida || 0),
+      total_vendido: row.total_vendido === null ? null : Number(row.total_vendido || 0),
+    })));
+  } catch (err) {
+    console.error('Error listando movimientos de inventario:', err);
+    return res.status(500).json({ message: 'No se pudieron cargar movimientos de inventario' });
+  }
+});
+
 app.get('/api/promociones', async (req, res) => {
   try {
     const [promotions] = await db.query(
@@ -4619,8 +6601,8 @@ app.post('/api/productos/import', async (req, res) => {
       continue;
     }
     try {
-      const [formatRows] = await db.query('SELECT id_formato FROM formato_venta WHERE LOWER(descripcion) = ? LIMIT 1', [formatName]);
-      if (!formatRows.length) continue;
+      const resolvedFormatId = await resolveSaleFormatId(db, formatName);
+      if (!resolvedFormatId) continue;
       let [departmentRows] = await db.query('SELECT id_departamento FROM departamento WHERE nombre = ? LIMIT 1', [departmentName]);
       if (!departmentRows.length) {
         await db.query('INSERT INTO departamento (nombre) VALUES (?)', [departmentName]);
@@ -4645,7 +6627,7 @@ app.post('/api/productos/import', async (req, res) => {
         [
           barcode,
           description,
-          formatRows[0].id_formato,
+          resolvedFormatId,
           cost,
           profit,
           price,
@@ -4664,6 +6646,129 @@ app.post('/api/productos/import', async (req, res) => {
   }
 
   return res.json({ inserted });
+});
+
+app.get('/api/productos/export.xlsx', async (req, res) => {
+  try {
+    const [rows] = await db.query(
+      `SELECT p.id_producto, p.codigo_barras, p.descripcion,
+              p.id_formato, fv.descripcion AS formato_venta,
+              p.costo, p.ganancia, p.precio_venta,
+              p.utiliza_inventario, p.cantidad_actual, p.cantidad_minima, p.cantidad_maxima,
+              p.id_departamento, d.nombre AS departamento,
+              p.supplier_id, s.name AS proveedor,
+              p.exento_iva
+       FROM productos p
+       LEFT JOIN formato_venta fv ON fv.id_formato = p.id_formato
+       LEFT JOIN departamento d ON d.id_departamento = p.id_departamento
+       LEFT JOIN service_suppliers s ON s.id = p.supplier_id
+       ORDER BY p.descripcion ASC`
+    );
+
+    let ExcelJS;
+    try {
+      ExcelJS = require('exceljs');
+    } catch (_) {
+      return res.status(500).json({ message: 'Falta dependencia exceljs en el servidor' });
+    }
+
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet('Productos');
+    const headers = [
+      'id_producto',
+      'codigo_barras',
+      'descripcion',
+      'id_formato',
+      'formato_venta',
+      'costo',
+      'ganancia',
+      'precio_venta',
+      'utiliza_inventario',
+      'cantidad_actual',
+      'cantidad_minima',
+      'cantidad_maxima',
+      'id_departamento',
+      'departamento',
+      'supplier_id',
+      'proveedor',
+      'exento_iva',
+    ];
+
+    worksheet.addRow(headers);
+    const headerRow = worksheet.getRow(1);
+    headerRow.eachCell((cell) => {
+      cell.font = { name: 'Calibri', size: 10, bold: true, color: { argb: 'FFFFFFFF' } };
+      cell.alignment = { horizontal: 'center', vertical: 'middle' };
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1D4ED8' } };
+      cell.border = {
+        top: { style: 'thin', color: { argb: 'FF9CA3AF' } },
+        left: { style: 'thin', color: { argb: 'FF9CA3AF' } },
+        bottom: { style: 'thin', color: { argb: 'FF9CA3AF' } },
+        right: { style: 'thin', color: { argb: 'FF9CA3AF' } },
+      };
+    });
+
+    for (const row of rows) {
+      worksheet.addRow([
+        row.id_producto,
+        String(row.codigo_barras ?? ''),
+        row.descripcion,
+        row.id_formato,
+        row.formato_venta,
+        row.costo,
+        row.ganancia,
+        row.precio_venta,
+        row.utiliza_inventario,
+        row.cantidad_actual,
+        row.cantidad_minima,
+        row.cantidad_maxima,
+        row.id_departamento,
+        row.departamento,
+        row.supplier_id,
+        row.proveedor,
+        row.exento_iva,
+      ]);
+    }
+
+    worksheet.getColumn(1).width = 12;
+    worksheet.getColumn(2).width = 22;
+    worksheet.getColumn(3).width = 45;
+    worksheet.getColumn(4).width = 12;
+    worksheet.getColumn(5).width = 16;
+    worksheet.getColumn(6).width = 14;
+    worksheet.getColumn(7).width = 14;
+    worksheet.getColumn(8).width = 14;
+    worksheet.getColumn(9).width = 18;
+    worksheet.getColumn(10).width = 14;
+    worksheet.getColumn(11).width = 14;
+    worksheet.getColumn(12).width = 14;
+    worksheet.getColumn(13).width = 16;
+    worksheet.getColumn(14).width = 24;
+    worksheet.getColumn(15).width = 12;
+    worksheet.getColumn(16).width = 26;
+    worksheet.getColumn(17).width = 12;
+
+    for (let rowNumber = 2; rowNumber <= worksheet.rowCount; rowNumber += 1) {
+      const row = worksheet.getRow(rowNumber);
+      row.getCell(2).numFmt = '@';
+      row.eachCell((cell) => {
+        cell.border = {
+          top: { style: 'thin', color: { argb: 'FFE5E7EB' } },
+          left: { style: 'thin', color: { argb: 'FFE5E7EB' } },
+          bottom: { style: 'thin', color: { argb: 'FFE5E7EB' } },
+          right: { style: 'thin', color: { argb: 'FFE5E7EB' } },
+        };
+      });
+    }
+
+    const fileDate = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="productos_${fileDate}.xlsx"`);
+    await workbook.xlsx.write(res);
+    return res.end();
+  } catch (err) {
+    return res.status(500).json({ message: 'No se pudo exportar productos Excel' });
+  }
 });
 
 app.get('/api/productos/export.csv', async (req, res) => {
@@ -4784,21 +6889,13 @@ app.get('/api/productos/export.json', async (req, res) => {
 app.post('/api/print/sale-ticket', async (req, res) => {
   const ventaId = toInt(req.body?.venta_id);
   const includeDetailsOverride = req.body?.include_details;
+  const returnPayload = normalizeBool(req.body?.return_payload, false);
+  const requestedCajaId = extractCajaIdFromRequest(req);
   if (!ventaId) {
     return res.status(400).json({ message: 'venta_id invalido' });
   }
 
   try {
-    const [settingsRows] = await db.query('SELECT * FROM ticket_settings WHERE id = 1 LIMIT 1');
-    if (!settingsRows.length) {
-      return res.status(400).json({ message: 'No existe configuracion de ticket' });
-    }
-    const settings = settingsRows[0];
-    const configuredPrinter = String(settings.printer_name || '').trim();
-    if (!configuredPrinter) {
-      return res.status(400).json({ message: 'No hay impresora configurada en el sistema' });
-    }
-
     const [saleRows] = await db.query(
       `SELECT v.id_venta, v.fecha, v.numero_ticket, v.folio_ticket, v.usuario_id, v.metodo_pago, v.caja_id, v.total,
               COALESCE(u.nombre, '') AS cajero_nombre
@@ -4812,6 +6909,13 @@ app.post('/api/print/sale-ticket', async (req, res) => {
       return res.status(404).json({ message: 'Venta no encontrada' });
     }
     const sale = saleRows[0];
+    const salePaymentRows = await fetchSalePaymentAllocations(db, ventaId, sale);
+    const settingsCajaId = toInt(sale.caja_id) || requestedCajaId || await resolveCajaIdForTicketSettings(req);
+    const settings = await getTicketSettingsForCaja(settingsCajaId);
+    if (!settings) {
+      return res.status(400).json({ message: 'No existe configuracion de ticket' });
+    }
+    const configuredPrinter = String(settings.printer_name || '').trim();
 
     const [detailRows] = await db.query(
       `SELECT d.cantidad, d.precio_unitario, d.subtotal,
@@ -4831,62 +6935,68 @@ app.post('/api/print/sale-ticket', async (req, res) => {
     );
     const business = businessRows[0] || null;
 
+    const includeDetailsDefault = normalizeBool(settings.include_details_by_default, true);
     const includeDetails = typeof includeDetailsOverride === 'undefined'
-      ? settings.include_details_by_default
-      : includeDetailsOverride;
-    const printProfile = getPrintProfile(configuredPrinter, settings.columns_width, settings.paper_width_mm);
-    const printColumns = printProfile.columns;
-    const printFontSize = printProfile.fontSize;
+      ? includeDetailsDefault
+      : normalizeBool(includeDetailsOverride, includeDetailsDefault);
+    const basePrintProfile = getPrintProfile(configuredPrinter, settings.columns_width, settings.paper_width_mm);
+    const printColumns = getReadableSaleTicketColumns(basePrintProfile.columns, basePrintProfile.paper_width_mm);
+    const printProfile = getPrintProfile(configuredPrinter, printColumns, basePrintProfile.paper_width_mm);
+    const printFontSize = getSaleTicketFontSize(
+      printProfile.fontSize,
+      printProfile.paper_width_mm,
+      printColumns
+    );
     const printEngine = normalizePrintEngine(settings.print_engine);
     const feedLines = normalizeFeedLines(settings.feed_lines_after_print);
 
     const ticketTextBase = buildSaleTicketText({
       sale,
       details: includeDetails ? detailRows : [],
-      settings: { ...settings, include_details_by_default: includeDetails, columns_width: printColumns },
+      settings: { ...settings, include_details_by_default: includeDetails ? 1 : 0, columns_width: printColumns },
       business,
+      paymentBreakdown: salePaymentRows,
     });
     const ticketText = `${ticketTextBase}${'\r\n'.repeat(feedLines)}`;
+    if (returnPayload) {
+      return res.json({
+        message: 'Payload de ticket generado',
+        printer: configuredPrinter || null,
+        print_engine: printEngine,
+        font_size: printFontSize,
+        feed_lines_after_print: feedLines,
+        paper_width_mm: printProfile.paper_width_mm,
+        columns_width: printColumns,
+        ticket_text: ticketText,
+        caja_id: settingsCajaId || null,
+      });
+    }
+    if (!configuredPrinter) {
+      return res.status(400).json({ message: 'No hay impresora configurada para esta caja' });
+    }
 
     const tempFile = path.join(os.tmpdir(), `ticket-${ventaId}-${Date.now()}.txt`);
     await fs.writeFile(tempFile, ticketText, 'utf8');
 
     try {
-      const gdiPrintCommand =
-        `Add-Type -AssemblyName System.Drawing; ` +
-        `$text = Get-Content -Raw -Encoding UTF8 -Path '${escapePsSingleQuoted(tempFile)}'; ` +
-        `$pd = New-Object System.Drawing.Printing.PrintDocument; ` +
-        `$pd.PrinterSettings.PrinterName = '${escapePsSingleQuoted(configuredPrinter)}'; ` +
-        `if (-not $pd.PrinterSettings.IsValid) { throw 'Impresora no valida o no disponible'; } ` +
-        `$handler = [System.Drawing.Printing.PrintPageEventHandler]{ ` +
-        `param($sender,$e) ` +
-        `$font = New-Object System.Drawing.Font('Consolas', ${printFontSize}); ` +
-        `$brush = [System.Drawing.Brushes]::Black; ` +
-        `$marginMm = 0; ` +
-        `$x = [Math]::Round(($e.Graphics.DpiX / 25.4) * $marginMm); ` +
-        `$y = 0; ` +
-        `$e.Graphics.DrawString($text, $font, $brush, $x, $y); ` +
-        `$e.HasMorePages = $false ` +
-        `}; ` +
-        `$pd.add_PrintPage($handler); ` +
-        `$pd.Print();`;
+      const gdiPrintCommand = buildGdiTicketPrintCommand(tempFile, configuredPrinter, printFontSize);
 
-      if (printEngine === 'gdi' || printProfile.isXp58) {
-        await runPowerShell(gdiPrintCommand);
-      } else if (printEngine === 'out_printer') {
+      if (printEngine === 'out_printer') {
         await runPowerShell(
           `$content = Get-Content -Raw -Encoding UTF8 -Path '${escapePsSingleQuoted(tempFile)}'; ` +
           `$content | Out-Printer -Name '${escapePsSingleQuoted(configuredPrinter)}'`
         );
+      } else if (printEngine === 'gdi' || printProfile.isXp58) {
+        await runPowerShell(gdiPrintCommand);
       } else {
         try {
+          // Auto mode: prefer GDI first to avoid large margins on thermal drivers.
+          await runPowerShell(gdiPrintCommand);
+        } catch (directPrintError) {
           await runPowerShell(
             `$content = Get-Content -Raw -Encoding UTF8 -Path '${escapePsSingleQuoted(tempFile)}'; ` +
             `$content | Out-Printer -Name '${escapePsSingleQuoted(configuredPrinter)}'`
           );
-        } catch (directPrintError) {
-          // Fallback for drivers where Out-Printer fails.
-          await runPowerShell(gdiPrintCommand);
         }
       }
     } finally {
@@ -4900,17 +7010,795 @@ app.post('/api/print/sale-ticket', async (req, res) => {
   }
 });
 
-app.post('/api/print/sale-ticket-test', async (_req, res) => {
+app.post('/api/print/cut-session-ticket', async (req, res) => {
+  const returnPayload = normalizeBool(req.body?.return_payload, false);
+  const requestedCajaFromRequest = extractCajaIdFromRequest(req);
+  const requestedCutId = toInt(req.body?.cut_id);
+  const requesterUserId = toInt(req.user?.sub);
+  const requestedCajeroId = toInt(req.body?.cajero) || requesterUserId;
+
   try {
-    const [settingsRows] = await db.query('SELECT * FROM ticket_settings WHERE id = 1 LIMIT 1');
-    if (!settingsRows.length) {
+    let targetCutId = 0;
+    let targetCajaId = requestedCajaFromRequest || await resolveCajaIdForTicketSettings(req);
+    let targetCajeroId = requestedCajeroId;
+    let targetDateIso = new Date().toISOString().slice(0, 10);
+    let shiftOpenAt = null;
+    let shiftCloseAt = null;
+    let shiftInitialAmount = 0;
+    let shiftEstado = 'abierto';
+
+    if (requestedCutId) {
+      const [cutRows] = await db.query(
+        `SELECT id_corte, DATE_FORMAT(fecha, '%Y-%m-%d') AS fecha_iso, caja_id, usuario_id, hora_apertura, hora_cierre, monto_inicial, estado
+         FROM corte_caja
+         WHERE id_corte = ?
+         LIMIT 1`,
+        [requestedCutId]
+      );
+      if (!cutRows.length) {
+        return res.status(404).json({ message: 'Corte historico no encontrado' });
+      }
+      const selectedCut = cutRows[0];
+      targetCutId = Number(selectedCut.id_corte || 0);
+      targetCajaId = Number(selectedCut.caja_id || 0) || targetCajaId;
+      targetCajeroId = Number(selectedCut.usuario_id || 0) || targetCajeroId;
+      targetDateIso = String(selectedCut.fecha_iso || targetDateIso).slice(0, 10);
+      shiftOpenAt = selectedCut.hora_apertura;
+      shiftCloseAt = selectedCut.hora_cierre || null;
+      shiftInitialAmount = Number(selectedCut.monto_inicial || 0);
+      shiftEstado = String(selectedCut.estado || 'cerrado').toLowerCase();
+    } else {
+      if (!targetCajaId || !targetCajeroId) {
+        return res.status(400).json({ message: 'Caja y cajero son obligatorios para imprimir corte' });
+      }
+      const [openRows] = await db.query(
+        `SELECT id_corte, DATE_FORMAT(fecha, '%Y-%m-%d') AS fecha_iso, hora_apertura, monto_inicial, estado
+         FROM corte_caja
+         WHERE fecha = CURDATE() AND caja_id = ? AND usuario_id = ? AND estado = 'abierto'
+         ORDER BY id_corte DESC
+         LIMIT 1`,
+        [targetCajaId, targetCajeroId]
+      );
+      if (!openRows.length) {
+        return res.status(409).json({ message: 'No hay turno abierto para esta caja/cajero' });
+      }
+      const openShift = openRows[0];
+      targetCutId = Number(openShift.id_corte || 0);
+      targetDateIso = String(openShift.fecha_iso || targetDateIso).slice(0, 10);
+      shiftOpenAt = openShift.hora_apertura;
+      shiftCloseAt = null;
+      shiftInitialAmount = Number(openShift.monto_inicial || 0);
+      shiftEstado = String(openShift.estado || 'abierto').toLowerCase();
+    }
+
+    if (!targetCutId || !targetCajaId || !targetCajeroId || !shiftOpenAt) {
+      return res.status(400).json({ message: 'No se pudo determinar el corte a imprimir' });
+    }
+
+    const salesWhere = `v.caja_id = ? AND v.usuario_id = ? AND DATE(v.fecha) = ? AND (v.turno_id = ? OR (v.turno_id IS NULL AND v.fecha >= ? AND v.fecha <= COALESCE(?, NOW())))`;
+    const salesParams = [targetCajaId, targetCajeroId, targetDateIso, targetCutId, shiftOpenAt, shiftCloseAt];
+    const movementWhere = `m.caja_id = ? AND m.usuario_id = ? AND DATE(m.fecha) = ? AND (m.turno_id = ? OR (m.turno_id IS NULL AND m.fecha >= ? AND m.fecha <= COALESCE(?, NOW())))`;
+    const movementParams = [targetCajaId, targetCajeroId, targetDateIso, targetCutId, shiftOpenAt, shiftCloseAt];
+
+    const [summaryRows] = await db.query(
+      `SELECT vp.metodo_pago, COUNT(DISTINCT v.id_venta) AS transacciones, COALESCE(SUM(vp.monto), 0) AS total
+       FROM ventas v
+       INNER JOIN venta_pagos vp ON vp.venta_id = v.id_venta
+       WHERE ${salesWhere}
+       GROUP BY vp.metodo_pago
+       ORDER BY FIELD(vp.metodo_pago, 'efectivo', 'tarjeta', 'dolares', 'transferencia', 'cheque', 'vale', 'otro'), vp.metodo_pago ASC`,
+      salesParams
+    );
+    const [totalsRows] = await db.query(
+      `SELECT COUNT(*) AS transacciones, COALESCE(SUM(v.total), 0) AS total
+       FROM ventas v
+       WHERE ${salesWhere}`,
+      salesParams
+    );
+    const [movementSummaryRows] = await db.query(
+      `SELECT m.tipo, COUNT(*) AS transacciones, COALESCE(SUM(m.monto), 0) AS total
+       FROM cash_movements m
+       WHERE ${movementWhere}
+       GROUP BY m.tipo`,
+      movementParams
+    );
+    const [movementDetailRows] = await db.query(
+      `SELECT DATE_FORMAT(m.fecha, '%Y-%m-%d %H:%i:%s') AS fecha,
+              m.tipo, m.metodo, m.monto, COALESCE(m.descripcion, '') AS descripcion
+       FROM cash_movements m
+       WHERE ${movementWhere}
+       ORDER BY m.fecha ASC, m.id_movimiento ASC
+       LIMIT 500`,
+      movementParams
+    );
+    const [cashRows] = await db.query(
+      `SELECT COALESCE(SUM(
+          CASE WHEN vp.metodo_pago = 'efectivo' THEN vp.monto ELSE 0 END
+        ), 0) AS total_efectivo
+       FROM ventas v
+       LEFT JOIN venta_pagos vp ON vp.venta_id = v.id_venta
+       WHERE ${salesWhere}`,
+      salesParams
+    );
+    const [departmentRows] = await db.query(
+      `SELECT COALESCE(dep.nombre, 'Sin departamento') AS departamento,
+              COALESCE(SUM(d.subtotal), 0) AS total_vendido
+       FROM detalle_venta d
+       INNER JOIN ventas v ON v.id_venta = d.venta_id
+       LEFT JOIN productos p ON p.id_producto = d.producto_id
+       LEFT JOIN departamento dep ON dep.id_departamento = p.id_departamento
+       WHERE ${salesWhere}
+       GROUP BY dep.id_departamento, dep.nombre
+       ORDER BY total_vendido DESC, departamento ASC`,
+      salesParams
+    );
+    const [cashierRows] = await db.query(
+      `SELECT COALESCE(NULLIF(nombre, ''), CONCAT('Cajero ', id)) AS nombre
+       FROM usuarios
+       WHERE id = ?
+       LIMIT 1`,
+      [targetCajeroId]
+    );
+    const [businessRows] = await db.query(
+      `SELECT nombre, telefono, mail, tipo_local
+       FROM info
+       ORDER BY id_info DESC
+       LIMIT 1`
+    );
+
+    const settings = await getTicketSettingsForCaja(targetCajaId);
+    if (!settings) {
       return res.status(400).json({ message: 'No existe configuracion de ticket' });
     }
-    const settings = settingsRows[0];
-    const configuredPrinter = String(settings.printer_name || '').trim();
+    let configuredPrinter = String(settings.printer_name || '').trim();
     if (!configuredPrinter) {
-      return res.status(400).json({ message: 'No hay impresora configurada en el sistema' });
+      try {
+        configuredPrinter = await runPowerShell(
+          "(Get-CimInstance Win32_Printer | Where-Object { $_.Default -eq $true } | Select-Object -First 1 -ExpandProperty Name)"
+        );
+      } catch (_) {
+        configuredPrinter = '';
+      }
     }
+
+    const printProfile = getPrintProfile(configuredPrinter, settings.columns_width, settings.paper_width_mm);
+    const printColumns = printProfile.columns;
+    const printFontSize = getCutReportFontSize(
+      printProfile.fontSize,
+      printProfile.paper_width_mm,
+      printColumns
+    );
+    const printEngine = normalizePrintEngine(settings.print_engine);
+    const feedLines = normalizeFeedLines(settings.feed_lines_after_print);
+
+    const efectivoVentas = Number(cashRows[0]?.total_efectivo || 0);
+    const abonosEfectivo = sumMovementAmounts(movementDetailRows, {
+      type: 'abono',
+      method: 'efectivo',
+      field: 'monto',
+    });
+    const entradasDinero = sumMovementAmounts(movementSummaryRows, { type: 'entrada', field: 'total' });
+    const salidasDinero = sumMovementAmounts(movementSummaryRows, { type: 'salida', field: 'total' });
+    const devoluciones = movementSummaryRows
+      .filter((row) => String(row.tipo || '').toLowerCase().includes('devol'))
+      .reduce((acc, row) => acc + Number(row.total || 0), 0);
+    const totalEntradas = sumMovementAmounts(movementDetailRows, { type: 'entrada', field: 'monto' });
+    const totalSalidas = sumMovementAmounts(movementDetailRows, { type: 'salida', field: 'monto' });
+    const totalVentas = Number(totalsRows[0]?.total || 0);
+    const totalTransacciones = Number(totalsRows[0]?.transacciones || 0);
+    const efectivoEnCaja = shiftInitialAmount + efectivoVentas + abonosEfectivo + entradasDinero - salidasDinero;
+
+    const cutPayload = {
+      turno_id: targetCutId,
+      caja_id: targetCajaId,
+      cajero_id: targetCajeroId,
+      cajero_nombre: String(cashierRows[0]?.nombre || '').trim() || `Cajero ${targetCajeroId}`,
+      generated_at: requestedCutId ? (shiftCloseAt || new Date()) : new Date(),
+      hora_apertura: shiftOpenAt,
+      hora_cierre: shiftCloseAt || new Date(),
+      estado: shiftEstado,
+      total_ventas: totalVentas,
+      transacciones: totalTransacciones,
+      monto_inicial: shiftInitialAmount,
+      ventas_efectivo: efectivoVentas,
+      abonos_efectivo: abonosEfectivo,
+      entradas_dinero: entradasDinero,
+      salidas_dinero: salidasDinero,
+      efectivo_en_caja: efectivoEnCaja,
+      devoluciones,
+      total_entradas: totalEntradas,
+      total_salidas: totalSalidas,
+      detalle_entradas: movementDetailRows
+        .filter((row) => String(row.tipo || '').toLowerCase() === 'entrada')
+        .map((row) => ({
+          fecha: row.fecha,
+          tipo: row.tipo,
+          metodo: row.metodo,
+          monto: toPositiveAmount(row.monto, 0),
+          descripcion: String(row.descripcion || '').trim(),
+        })),
+      detalle_salidas: movementDetailRows
+        .filter((row) => String(row.tipo || '').toLowerCase() === 'salida')
+        .map((row) => ({
+          fecha: row.fecha,
+          tipo: row.tipo,
+          metodo: row.metodo,
+          monto: toPositiveAmount(row.monto, 0),
+          descripcion: String(row.descripcion || '').trim(),
+        })),
+      method_totals: (Array.isArray(summaryRows) ? summaryRows : []).map((row) => ({
+        metodo_pago: row.metodo_pago,
+        total: Number(row.total || 0),
+      })),
+      department_totals: (Array.isArray(departmentRows) ? departmentRows : []).map((row) => ({
+        departamento: row.departamento,
+        total_vendido: Number(row.total_vendido || 0),
+      })),
+    };
+    const cutSettings = await getCutSettings(db);
+    const cutPrintStyleRules = buildCutPrintStyleRules(cutSettings);
+
+    const ticketTextBase = buildCutSessionTicketText({
+      cut: cutPayload,
+      settings: { ...settings, columns_width: printColumns },
+      business: businessRows[0] || null,
+      cutSettings,
+    });
+    const ticketText = `${ticketTextBase}${'\r\n'.repeat(feedLines)}`;
+
+    if (returnPayload) {
+      return res.json({
+        message: requestedCutId ? 'Payload de corte historico generado' : 'Payload de corte generado',
+        printer: configuredPrinter || null,
+        print_engine: printEngine,
+        font_size: printFontSize,
+        feed_lines_after_print: feedLines,
+        paper_width_mm: printProfile.paper_width_mm,
+        columns_width: printColumns,
+        ticket_text: ticketText,
+        cut_print_labels: cutSettings?.print_labels || null,
+        cut_print_styles: cutSettings?.print_styles || null,
+        caja_id: targetCajaId,
+        cut_id: targetCutId,
+      });
+    }
+    if (!configuredPrinter) {
+      return res.status(400).json({ message: 'No hay impresora disponible (ni configurada en caja ni predeterminada en Windows)' });
+    }
+
+    const tempFile = path.join(os.tmpdir(), `cut-ticket-${targetCutId}-${Date.now()}.txt`);
+    await fs.writeFile(tempFile, ticketText, 'utf8');
+    try {
+      const gdiPrintCommand = buildGdiTicketPrintCommand(tempFile, configuredPrinter, printFontSize, cutPrintStyleRules);
+
+      if (printEngine === 'out_printer') {
+        await runPowerShell(
+          `$content = Get-Content -Raw -Encoding UTF8 -Path '${escapePsSingleQuoted(tempFile)}'; ` +
+          `$content | Out-Printer -Name '${escapePsSingleQuoted(configuredPrinter)}'`
+        );
+      } else if (printEngine === 'gdi' || printProfile.isXp58) {
+        await runPowerShell(gdiPrintCommand);
+      } else {
+        try {
+          // Auto mode: prefer GDI first to avoid large margins on thermal drivers.
+          await runPowerShell(gdiPrintCommand);
+        } catch (_) {
+          await runPowerShell(
+            `$content = Get-Content -Raw -Encoding UTF8 -Path '${escapePsSingleQuoted(tempFile)}'; ` +
+            `$content | Out-Printer -Name '${escapePsSingleQuoted(configuredPrinter)}'`
+          );
+        }
+      }
+    } finally {
+      await fs.unlink(tempFile).catch(() => {});
+    }
+
+    const message = requestedCutId
+      ? 'Corte historico enviado a impresion'
+      : 'Reporte de corte enviado a impresion';
+    return res.json({ message, printer: configuredPrinter, cut_id: targetCutId });
+  } catch (err) {
+    console.error('Error al imprimir corte de turno:', err);
+    return res.status(500).json({ message: `No se pudo imprimir el corte: ${err.message}` });
+  }
+});
+
+app.post('/api/print/cut-rebuilt-ticket', async (req, res) => {
+  const returnPayload = normalizeBool(req.body?.return_payload, false);
+  const requesterUserId = toInt(req.user?.sub);
+
+  if (!requesterUserId) {
+    return res.status(401).json({ message: 'Sesion invalida' });
+  }
+
+  try {
+    const allowed = await isAdminSiaUser(requesterUserId);
+    if (!allowed) {
+      return res.status(403).json({ message: 'Solo admin_sia puede imprimir cortes reconstruidos' });
+    }
+
+    const parsed = normalizeCutRebuildFilters(req.body || {});
+    if (!parsed.ok) {
+      return res.status(400).json({ message: parsed.message });
+    }
+    const filters = parsed.filters;
+    const requestedCutIds = parseCutIdList(req.body?.cut_ids);
+    const requestedKeepCutId = toInt(req.body?.keep_cut_id);
+    if (requestedCutIds.length > 0) {
+      filters.cutIds = requestedCutIds;
+    }
+    if (requestedKeepCutId && !filters.cutIds.includes(requestedKeepCutId)) {
+      filters.cutIds = [...filters.cutIds, requestedKeepCutId];
+    }
+
+    const salesFilter = buildCutRebuildWhere(filters, 'v');
+    const movementFilter = buildCutRebuildWhere(filters, 'm', { includeSaleIds: false });
+    const cutFilter = buildCutRebuildCutWhere(filters, 'c');
+
+    const [summaryRows] = await db.query(
+      `SELECT v.metodo_pago, COUNT(*) AS transacciones, COALESCE(SUM(v.total), 0) AS total
+       FROM ventas v
+       WHERE ${salesFilter.whereClause}
+       GROUP BY v.metodo_pago
+       ORDER BY v.metodo_pago ASC`,
+      salesFilter.params
+    );
+    const [totalsRows] = await db.query(
+      `SELECT COUNT(*) AS transacciones, COALESCE(SUM(v.total), 0) AS total
+       FROM ventas v
+       WHERE ${salesFilter.whereClause}`,
+      salesFilter.params
+    );
+    const [movementSummaryRows] = await db.query(
+      `SELECT m.tipo, COUNT(*) AS transacciones, COALESCE(SUM(m.monto), 0) AS total
+       FROM cash_movements m
+       WHERE ${movementFilter.whereClause}
+       GROUP BY m.tipo`,
+      movementFilter.params
+    );
+    const [movementDetailRows] = await db.query(
+      `SELECT DATE_FORMAT(m.fecha, '%Y-%m-%d %H:%i:%s') AS fecha,
+              m.tipo, m.metodo, m.monto, COALESCE(m.descripcion, '') AS descripcion
+       FROM cash_movements m
+       WHERE ${movementFilter.whereClause}
+       ORDER BY m.fecha ASC, m.id_movimiento ASC
+       LIMIT 1000`,
+      movementFilter.params
+    );
+    const [cashRows] = await db.query(
+      `SELECT COALESCE(SUM(
+          CASE
+            WHEN v.metodo_pago = 'efectivo' THEN v.total
+            WHEN v.metodo_pago = 'mixto' THEN
+              CASE
+                WHEN COALESCE(v.monto_efectivo, 0) > 0 THEN v.monto_efectivo
+                ELSE v.total / 2
+              END
+            ELSE 0
+          END
+        ), 0) AS total_efectivo
+       FROM ventas v
+       WHERE ${salesFilter.whereClause}`,
+      salesFilter.params
+    );
+    const [departmentRows] = await db.query(
+      `SELECT COALESCE(dep.nombre, 'Sin departamento') AS departamento,
+              COALESCE(SUM(d.subtotal), 0) AS total_vendido
+       FROM detalle_venta d
+       INNER JOIN ventas v ON v.id_venta = d.venta_id
+       LEFT JOIN productos p ON p.id_producto = d.producto_id
+       LEFT JOIN departamento dep ON dep.id_departamento = p.id_departamento
+       WHERE ${salesFilter.whereClause}
+       GROUP BY dep.id_departamento, dep.nombre
+       ORDER BY total_vendido DESC, departamento ASC`,
+      salesFilter.params
+    );
+    const [cutRows] = await db.query(
+      `SELECT c.id_corte, c.fecha, c.caja_id, c.usuario_id,
+              c.hora_apertura, c.hora_cierre, c.monto_inicial, c.estado
+       FROM corte_caja c
+       WHERE ${cutFilter.whereClause}
+      ORDER BY COALESCE(c.hora_apertura, CONCAT(c.fecha, ' 00:00:00')) ASC, c.id_corte ASC`,
+      cutFilter.params
+    );
+
+    const totalVentas = Number(totalsRows[0]?.total || 0);
+    const totalTransacciones = Number(totalsRows[0]?.transacciones || 0);
+    if (!cutRows.length && totalTransacciones <= 0 && totalVentas <= 0) {
+      return res.status(404).json({ message: 'No hay datos para generar reporte reconstruido' });
+    }
+
+    const uniqueCajaIds = Array.from(new Set(
+      cutRows.map((row) => Number(row.caja_id || 0)).filter((id) => id > 0)
+    ));
+    const uniqueCajeroIds = Array.from(new Set(
+      cutRows.map((row) => Number(row.usuario_id || 0)).filter((id) => id > 0)
+    ));
+    if (!filters.cajaId && uniqueCajaIds.length > 1) {
+      return res.status(400).json({ message: 'Selecciona una sola caja para imprimir el reporte reconstruido' });
+    }
+    if (!filters.cajeroId && uniqueCajeroIds.length > 1) {
+      return res.status(400).json({ message: 'Selecciona un solo cajero para imprimir el reporte reconstruido' });
+    }
+
+    const sortedCuts = cutRows.slice().sort((a, b) => {
+      const aTime = new Date(a.hora_apertura || a.fecha || 0).getTime();
+      const bTime = new Date(b.hora_apertura || b.fecha || 0).getTime();
+      if (aTime !== bTime) return aTime - bTime;
+      return Number(a.id_corte || 0) - Number(b.id_corte || 0);
+    });
+    const firstCut = sortedCuts[0] || null;
+    const lastCut = sortedCuts[sortedCuts.length - 1] || null;
+    const targetCutId = requestedKeepCutId
+      || (filters.cutIds.length ? Number(filters.cutIds[0] || 0) : 0)
+      || Number(firstCut?.id_corte || 0)
+      || 0;
+    let targetCajaId = filters.cajaId
+      || Number(firstCut?.caja_id || 0)
+      || extractCajaIdFromRequest(req)
+      || await resolveCajaIdForTicketSettings(req);
+    const targetCajeroId = filters.cajeroId || Number(firstCut?.usuario_id || 0) || null;
+    const shiftOpenAt = firstCut?.hora_apertura || `${filters.fromDate} ${filters.fromTime}:00`;
+    const shiftCloseAt = lastCut?.hora_cierre || `${filters.toDate} ${filters.toTime}:59`;
+    const shiftInitialAmount = Number(firstCut?.monto_inicial || 0);
+    const shiftEstado = sortedCuts.some((row) => String(row.estado || '').toLowerCase() === 'abierto')
+      ? 'abierto'
+      : 'cerrado';
+
+    if (!targetCajaId) {
+      return res.status(400).json({ message: 'No se pudo determinar la caja para imprimir' });
+    }
+
+    const [cashierRows] = targetCajeroId
+      ? await db.query(
+        `SELECT COALESCE(NULLIF(nombre, ''), CONCAT('Cajero ', id)) AS nombre
+         FROM usuarios
+         WHERE id = ?
+         LIMIT 1`,
+        [targetCajeroId]
+      )
+      : [[]];
+    const [businessRows] = await db.query(
+      `SELECT nombre, telefono, mail, tipo_local
+       FROM info
+       ORDER BY id_info DESC
+       LIMIT 1`
+    );
+
+    const settings = await getTicketSettingsForCaja(targetCajaId);
+    if (!settings) {
+      return res.status(400).json({ message: 'No existe configuracion de ticket' });
+    }
+    let configuredPrinter = String(settings.printer_name || '').trim();
+    if (!configuredPrinter) {
+      try {
+        configuredPrinter = await runPowerShell(
+          "(Get-CimInstance Win32_Printer | Where-Object { $_.Default -eq $true } | Select-Object -First 1 -ExpandProperty Name)"
+        );
+      } catch (_) {
+        configuredPrinter = '';
+      }
+    }
+
+    const printProfile = getPrintProfile(configuredPrinter, settings.columns_width, settings.paper_width_mm);
+    const printColumns = printProfile.columns;
+    const printFontSize = getCutReportFontSize(
+      printProfile.fontSize,
+      printProfile.paper_width_mm,
+      printColumns
+    );
+    const printEngine = normalizePrintEngine(settings.print_engine);
+    const feedLines = normalizeFeedLines(settings.feed_lines_after_print);
+
+    const efectivoVentas = Number(cashRows[0]?.total_efectivo || 0);
+    const abonosEfectivo = sumMovementAmounts(movementDetailRows, {
+      type: 'abono',
+      method: 'efectivo',
+      field: 'monto',
+    });
+    const entradasDinero = sumMovementAmounts(movementSummaryRows, { type: 'entrada', field: 'total' });
+    const salidasDinero = sumMovementAmounts(movementSummaryRows, { type: 'salida', field: 'total' });
+    const devoluciones = movementSummaryRows
+      .filter((row) => String(row.tipo || '').toLowerCase().includes('devol'))
+      .reduce((acc, row) => acc + Number(row.total || 0), 0);
+    const totalEntradas = sumMovementAmounts(movementDetailRows, { type: 'entrada', field: 'monto' });
+    const totalSalidas = sumMovementAmounts(movementDetailRows, { type: 'salida', field: 'monto' });
+    const efectivoEnCaja = shiftInitialAmount + efectivoVentas + abonosEfectivo + entradasDinero - salidasDinero;
+
+    const cutPayload = {
+      turno_id: targetCutId || '-',
+      caja_id: targetCajaId,
+      cajero_id: targetCajeroId || '-',
+      cajero_nombre: String(cashierRows[0]?.nombre || '').trim() || (targetCajeroId ? `Cajero ${targetCajeroId}` : 'Cajero'),
+      generated_at: new Date(),
+      hora_apertura: shiftOpenAt,
+      hora_cierre: shiftCloseAt,
+      estado: shiftEstado,
+      total_ventas: totalVentas,
+      transacciones: totalTransacciones,
+      monto_inicial: shiftInitialAmount,
+      ventas_efectivo: efectivoVentas,
+      abonos_efectivo: abonosEfectivo,
+      entradas_dinero: entradasDinero,
+      salidas_dinero: salidasDinero,
+      efectivo_en_caja: efectivoEnCaja,
+      devoluciones,
+      total_entradas: totalEntradas,
+      total_salidas: totalSalidas,
+      detalle_entradas: movementDetailRows
+        .filter((row) => String(row.tipo || '').toLowerCase() === 'entrada')
+        .map((row) => ({
+          fecha: row.fecha,
+          tipo: row.tipo,
+          metodo: row.metodo,
+          monto: toPositiveAmount(row.monto, 0),
+          descripcion: String(row.descripcion || '').trim(),
+        })),
+      detalle_salidas: movementDetailRows
+        .filter((row) => String(row.tipo || '').toLowerCase() === 'salida')
+        .map((row) => ({
+          fecha: row.fecha,
+          tipo: row.tipo,
+          metodo: row.metodo,
+          monto: toPositiveAmount(row.monto, 0),
+          descripcion: String(row.descripcion || '').trim(),
+        })),
+      method_totals: (Array.isArray(summaryRows) ? summaryRows : []).map((row) => ({
+        metodo_pago: row.metodo_pago,
+        total: Number(row.total || 0),
+      })),
+      department_totals: (Array.isArray(departmentRows) ? departmentRows : []).map((row) => ({
+        departamento: row.departamento,
+        total_vendido: Number(row.total_vendido || 0),
+      })),
+    };
+    const cutSettings = await getCutSettings(db);
+    const cutPrintStyleRules = buildCutPrintStyleRules(cutSettings);
+
+    const ticketTextBase = buildCutSessionTicketText({
+      cut: cutPayload,
+      settings: { ...settings, columns_width: printColumns },
+      business: businessRows[0] || null,
+      cutSettings,
+    });
+    const ticketText = `${ticketTextBase}${'\r\n'.repeat(feedLines)}`;
+
+    if (returnPayload) {
+      return res.json({
+        message: 'Payload de corte reconstruido generado',
+        printer: configuredPrinter || null,
+        print_engine: printEngine,
+        font_size: printFontSize,
+        feed_lines_after_print: feedLines,
+        paper_width_mm: printProfile.paper_width_mm,
+        columns_width: printColumns,
+        ticket_text: ticketText,
+        cut_print_labels: cutSettings?.print_labels || null,
+        cut_print_styles: cutSettings?.print_styles || null,
+        caja_id: targetCajaId,
+        cut_id: targetCutId || null,
+      });
+    }
+    if (!configuredPrinter) {
+      return res.status(400).json({ message: 'No hay impresora disponible (ni configurada en caja ni predeterminada en Windows)' });
+    }
+
+    const tempFile = path.join(os.tmpdir(), `cut-rebuilt-ticket-${targetCutId || 'multi'}-${Date.now()}.txt`);
+    await fs.writeFile(tempFile, ticketText, 'utf8');
+    try {
+      const gdiPrintCommand = buildGdiTicketPrintCommand(tempFile, configuredPrinter, printFontSize, cutPrintStyleRules);
+
+      if (printEngine === 'out_printer') {
+        await runPowerShell(
+          `$content = Get-Content -Raw -Encoding UTF8 -Path '${escapePsSingleQuoted(tempFile)}'; ` +
+          `$content | Out-Printer -Name '${escapePsSingleQuoted(configuredPrinter)}'`
+        );
+      } else if (printEngine === 'gdi' || printProfile.isXp58) {
+        await runPowerShell(gdiPrintCommand);
+      } else {
+        try {
+          // Auto mode: prefer GDI first to avoid large margins on thermal drivers.
+          await runPowerShell(gdiPrintCommand);
+        } catch (_) {
+          await runPowerShell(
+            `$content = Get-Content -Raw -Encoding UTF8 -Path '${escapePsSingleQuoted(tempFile)}'; ` +
+            `$content | Out-Printer -Name '${escapePsSingleQuoted(configuredPrinter)}'`
+          );
+        }
+      }
+    } finally {
+      await fs.unlink(tempFile).catch(() => {});
+    }
+
+    return res.json({
+      message: 'Reporte reconstruido enviado a impresion',
+      printer: configuredPrinter,
+      cut_id: targetCutId || null,
+    });
+  } catch (err) {
+    console.error('Error al imprimir corte reconstruido:', err);
+    return res.status(500).json({ message: `No se pudo imprimir el corte reconstruido: ${err.message}` });
+  }
+});
+
+app.post('/api/print/cut-format-test', async (req, res) => {
+  const returnPayload = normalizeBool(req.body?.return_payload, false);
+  const requestedCajaId = extractCajaIdFromRequest(req) || await resolveCajaIdForTicketSettings(req);
+  const requesterUserId = toInt(req.user?.sub) || null;
+
+  try {
+    const settings = await getTicketSettingsForCaja(requestedCajaId);
+    if (!settings) {
+      return res.status(400).json({ message: 'No existe configuracion de ticket' });
+    }
+    let configuredPrinter = String(settings.printer_name || '').trim();
+    if (!configuredPrinter) {
+      try {
+        configuredPrinter = await runPowerShell(
+          "(Get-CimInstance Win32_Printer | Where-Object { $_.Default -eq $true } | Select-Object -First 1 -ExpandProperty Name)"
+        );
+      } catch (_) {
+        configuredPrinter = '';
+      }
+    }
+
+    const [businessRows] = await db.query(
+      `SELECT nombre, telefono, mail, tipo_local
+       FROM info
+       ORDER BY id_info DESC
+       LIMIT 1`
+    );
+    const [cashierRows] = requesterUserId
+      ? await db.query(
+        `SELECT COALESCE(NULLIF(nombre, ''), CONCAT('Cajero ', id)) AS nombre
+         FROM usuarios
+         WHERE id = ?
+         LIMIT 1`,
+        [requesterUserId]
+      )
+      : [[]];
+
+    const persistedCutSettings = await getCutSettings(db);
+    const cutSettings = mergeCutFormatSettings(persistedCutSettings, req.body?.cut_settings);
+    const cutPrintStyleRules = buildCutPrintStyleRules(cutSettings);
+
+    const printProfile = getPrintProfile(configuredPrinter, settings.columns_width, settings.paper_width_mm);
+    const printColumns = printProfile.columns;
+    const printFontSize = getCutReportFontSize(
+      printProfile.fontSize,
+      printProfile.paper_width_mm,
+      printColumns
+    );
+    const printEngine = normalizePrintEngine(settings.print_engine);
+    const feedLines = normalizeFeedLines(settings.feed_lines_after_print);
+
+    const now = new Date();
+    const openedAt = new Date(now);
+    openedAt.setHours(8, 0, 0, 0);
+    const closedAt = new Date(now);
+    const sampleEntryDetails = [
+      { fecha: now.toISOString(), tipo: 'entrada', metodo: 'efectivo', monto: 2500, descripcion: 'FONDO EXTRA CAJA' },
+      { fecha: now.toISOString(), tipo: 'entrada', metodo: 'efectivo', monto: 1200, descripcion: 'ABONO CLIENTE RUTA' },
+    ];
+    const sampleExitDetails = [
+      { fecha: now.toISOString(), tipo: 'salida', metodo: 'efectivo', monto: 1600, descripcion: 'COMPRA RAPIDA INSUMOS' },
+      { fecha: now.toISOString(), tipo: 'salida', metodo: 'efectivo', monto: 900, descripcion: 'PAGO MENSAJERIA' },
+    ];
+
+    const montoInicial = 10000;
+    const efectivoVentas = 28500;
+    const abonosEfectivo = 1200;
+    const entradasDinero = sampleEntryDetails.reduce((acc, row) => acc + Number(row.monto || 0), 0);
+    const salidasDinero = sampleExitDetails.reduce((acc, row) => acc + Number(row.monto || 0), 0);
+    const devoluciones = 600;
+    const totalVentas = 41400;
+    const efectivoEnCaja = montoInicial + efectivoVentas + abonosEfectivo + entradasDinero - salidasDinero;
+
+    const cutPayload = {
+      turno_id: 125,
+      caja_id: requestedCajaId || 1,
+      cajero_id: requesterUserId || 1,
+      cajero_nombre: String(cashierRows[0]?.nombre || 'CAJERO DEMO').trim() || 'CAJERO DEMO',
+      generated_at: now,
+      hora_apertura: openedAt,
+      hora_cierre: closedAt,
+      estado: 'cerrado',
+      total_ventas: totalVentas,
+      transacciones: 24,
+      monto_inicial: montoInicial,
+      ventas_efectivo: efectivoVentas,
+      abonos_efectivo: abonosEfectivo,
+      entradas_dinero: entradasDinero,
+      salidas_dinero: salidasDinero,
+      efectivo_en_caja: efectivoEnCaja,
+      devoluciones,
+      total_entradas: entradasDinero,
+      total_salidas: salidasDinero,
+      detalle_entradas: sampleEntryDetails,
+      detalle_salidas: sampleExitDetails,
+      method_totals: [
+        { metodo_pago: 'efectivo', total: 28500 },
+        { metodo_pago: 'tarjeta', total: 12900 },
+      ],
+      department_totals: [
+        { departamento: 'ABARROTES', total_vendido: 18600 },
+        { departamento: 'BEBIDAS', total_vendido: 9100 },
+        { departamento: 'LACTEOS', total_vendido: 13700 },
+      ],
+    };
+
+    const ticketTextBase = buildCutSessionTicketText({
+      cut: cutPayload,
+      settings: { ...settings, columns_width: printColumns },
+      business: businessRows[0] || null,
+      cutSettings,
+    });
+    const ticketText = `${ticketTextBase}${'\r\n'.repeat(feedLines)}`;
+
+    if (returnPayload) {
+      return res.json({
+        message: 'Payload de corte de prueba generado',
+        printer: configuredPrinter || null,
+        print_engine: printEngine,
+        font_size: printFontSize,
+        feed_lines_after_print: feedLines,
+        paper_width_mm: printProfile.paper_width_mm,
+        columns_width: printColumns,
+        ticket_text: ticketText,
+        cut_print_labels: cutSettings?.print_labels || null,
+        cut_print_styles: cutSettings?.print_styles || null,
+        caja_id: requestedCajaId || null,
+      });
+    }
+    if (!configuredPrinter) {
+      return res.status(400).json({ message: 'No hay impresora disponible (ni configurada en caja ni predeterminada en Windows)' });
+    }
+
+    const tempFile = path.join(os.tmpdir(), `cut-format-test-${Date.now()}.txt`);
+    await fs.writeFile(tempFile, ticketText, 'utf8');
+    try {
+      const gdiPrintCommand = buildGdiTicketPrintCommand(tempFile, configuredPrinter, printFontSize, cutPrintStyleRules);
+
+      if (printEngine === 'out_printer') {
+        await runPowerShell(
+          `$content = Get-Content -Raw -Encoding UTF8 -Path '${escapePsSingleQuoted(tempFile)}'; ` +
+          `$content | Out-Printer -Name '${escapePsSingleQuoted(configuredPrinter)}'`
+        );
+      } else if (printEngine === 'gdi' || printProfile.isXp58) {
+        await runPowerShell(gdiPrintCommand);
+      } else {
+        try {
+          await runPowerShell(gdiPrintCommand);
+        } catch (_) {
+          await runPowerShell(
+            `$content = Get-Content -Raw -Encoding UTF8 -Path '${escapePsSingleQuoted(tempFile)}'; ` +
+            `$content | Out-Printer -Name '${escapePsSingleQuoted(configuredPrinter)}'`
+          );
+        }
+      }
+    } finally {
+      await fs.unlink(tempFile).catch(() => {});
+    }
+
+    return res.json({
+      message: 'Formato de corte de prueba enviado a impresion',
+      printer: configuredPrinter || null,
+    });
+  } catch (err) {
+    console.error('Error al imprimir corte de prueba:', err);
+    return res.status(500).json({ message: `No se pudo imprimir corte de prueba: ${err.message}` });
+  }
+});
+
+app.post('/api/print/sale-ticket-test', async (req, res) => {
+  const returnPayload = normalizeBool(req.body?.return_payload, false);
+  try {
+    const requestedCajaId = extractCajaIdFromRequest(req) || await resolveCajaIdForTicketSettings(req);
+    const settings = await getTicketSettingsForCaja(requestedCajaId);
+    if (!settings) {
+      return res.status(400).json({ message: 'No existe configuracion de ticket' });
+    }
+    const configuredPrinter = String(settings.printer_name || '').trim();
 
     const [businessRows] = await db.query(
       `SELECT nombre, telefono, mail, tipo_local
@@ -4932,14 +7820,19 @@ app.post('/api/print/sale-ticket-test', async (_req, res) => {
       folio_ticket: 'TST000001',
       usuario_id: 1,
       metodo_pago: 'efectivo',
-      caja_id: 1,
+      caja_id: requestedCajaId || 1,
       total,
       cajero_nombre: 'CAJERO DEMO',
     };
 
-    const printProfile = getPrintProfile(configuredPrinter, settings.columns_width, settings.paper_width_mm);
-    const printColumns = printProfile.columns;
-    const printFontSize = printProfile.fontSize;
+    const basePrintProfile = getPrintProfile(configuredPrinter, settings.columns_width, settings.paper_width_mm);
+    const printColumns = getReadableSaleTicketColumns(basePrintProfile.columns, basePrintProfile.paper_width_mm);
+    const printProfile = getPrintProfile(configuredPrinter, printColumns, basePrintProfile.paper_width_mm);
+    const printFontSize = getSaleTicketFontSize(
+      printProfile.fontSize,
+      printProfile.paper_width_mm,
+      printColumns
+    );
     const printEngine = normalizePrintEngine(settings.print_engine);
     const feedLines = normalizeFeedLines(settings.feed_lines_after_print);
     const ticketTextBase = buildSaleTicketText({
@@ -4949,45 +7842,45 @@ app.post('/api/print/sale-ticket-test', async (_req, res) => {
       business,
     });
     const ticketText = `${ticketTextBase}${'\r\n'.repeat(feedLines)}`;
+    if (returnPayload) {
+      return res.json({
+        message: 'Payload de ticket de prueba generado',
+        printer: configuredPrinter || null,
+        print_engine: printEngine,
+        font_size: printFontSize,
+        feed_lines_after_print: feedLines,
+        paper_width_mm: printProfile.paper_width_mm,
+        columns_width: printColumns,
+        ticket_text: ticketText,
+        caja_id: requestedCajaId || null,
+      });
+    }
+    if (!configuredPrinter) {
+      return res.status(400).json({ message: 'No hay impresora configurada para esta caja' });
+    }
 
     const tempFile = path.join(os.tmpdir(), `ticket-test-${Date.now()}.txt`);
     await fs.writeFile(tempFile, ticketText, 'utf8');
 
     try {
-      const gdiPrintCommand =
-        `Add-Type -AssemblyName System.Drawing; ` +
-        `$text = Get-Content -Raw -Encoding UTF8 -Path '${escapePsSingleQuoted(tempFile)}'; ` +
-        `$pd = New-Object System.Drawing.Printing.PrintDocument; ` +
-        `$pd.PrinterSettings.PrinterName = '${escapePsSingleQuoted(configuredPrinter)}'; ` +
-        `if (-not $pd.PrinterSettings.IsValid) { throw 'Impresora no valida o no disponible'; } ` +
-        `$handler = [System.Drawing.Printing.PrintPageEventHandler]{ ` +
-        `param($sender,$e) ` +
-        `$font = New-Object System.Drawing.Font('Consolas', ${printFontSize}); ` +
-        `$brush = [System.Drawing.Brushes]::Black; ` +
-        `$marginMm = 0; ` +
-        `$x = [Math]::Round(($e.Graphics.DpiX / 25.4) * $marginMm); ` +
-        `$y = 0; ` +
-        `$e.Graphics.DrawString($text, $font, $brush, $x, $y); ` +
-        `$e.HasMorePages = $false ` +
-        `}; ` +
-        `$pd.add_PrintPage($handler); ` +
-        `$pd.Print();`;
+      const gdiPrintCommand = buildGdiTicketPrintCommand(tempFile, configuredPrinter, printFontSize);
 
-      if (printEngine === 'gdi' || printProfile.isXp58) {
-        await runPowerShell(gdiPrintCommand);
-      } else if (printEngine === 'out_printer') {
+      if (printEngine === 'out_printer') {
         await runPowerShell(
           `$content = Get-Content -Raw -Encoding UTF8 -Path '${escapePsSingleQuoted(tempFile)}'; ` +
           `$content | Out-Printer -Name '${escapePsSingleQuoted(configuredPrinter)}'`
         );
+      } else if (printEngine === 'gdi' || printProfile.isXp58) {
+        await runPowerShell(gdiPrintCommand);
       } else {
         try {
+          // Auto mode: prefer GDI first to avoid large margins on thermal drivers.
+          await runPowerShell(gdiPrintCommand);
+        } catch (_) {
           await runPowerShell(
             `$content = Get-Content -Raw -Encoding UTF8 -Path '${escapePsSingleQuoted(tempFile)}'; ` +
             `$content | Out-Printer -Name '${escapePsSingleQuoted(configuredPrinter)}'`
           );
-        } catch (_) {
-          await runPowerShell(gdiPrintCommand);
         }
       }
     } finally {
@@ -5143,9 +8036,173 @@ function buildReportSalesWhereFromQuery(query = {}, alias = 'v') {
   };
 }
 
+const CARD_LIKE_PAYMENT_METHODS = ['tarjeta', 'dolares', 'transferencia', 'cheque', 'vale'];
+const SALE_PAYMENT_METHODS = ['efectivo', ...CARD_LIKE_PAYMENT_METHODS, 'otro'];
+
+function normalizeSalePaymentMethod(methodRaw = '') {
+  const method = String(methodRaw || '').trim().toLowerCase();
+  return SALE_PAYMENT_METHODS.includes(method) ? method : 'otro';
+}
+
+function buildSalePaymentAllocationsFromLegacyRow(row = {}) {
+  const method = String(row?.metodo_pago || '').trim().toLowerCase();
+  const total = Math.max(0, toClpAmount(row?.total || 0, 0));
+  let montoEfectivo = 0;
+  let montoTarjeta = 0;
+
+  if (method === 'efectivo') {
+    montoEfectivo = total;
+  } else if (method === 'tarjeta') {
+    montoTarjeta = total;
+  } else if (CARD_LIKE_PAYMENT_METHODS.includes(method)) {
+    montoTarjeta = total;
+  } else if (method === 'mixto') {
+    const efectivoIn = toNumber(row?.monto_efectivo);
+    const tarjetaIn = toNumber(row?.monto_tarjeta);
+    if (Number.isFinite(efectivoIn) && Number.isFinite(tarjetaIn) && efectivoIn >= 0 && tarjetaIn >= 0) {
+      const tarjetaFija = Math.max(0, toClpAmount(tarjetaIn, 0));
+      if (tarjetaFija >= total) {
+        montoTarjeta = total;
+        montoEfectivo = 0;
+      } else {
+        montoTarjeta = tarjetaFija;
+        montoEfectivo = Math.max(0, total - montoTarjeta);
+      }
+    } else {
+      montoEfectivo = Math.max(0, toClpAmount(total / 2, 0));
+      montoTarjeta = Math.max(0, total - montoEfectivo);
+    }
+  }
+
+  const allocations = [];
+  if (method === 'mixto') {
+    if (montoEfectivo > 0) allocations.push({ metodo_pago: 'efectivo', monto: montoEfectivo });
+    if (montoTarjeta > 0) allocations.push({ metodo_pago: 'tarjeta', monto: montoTarjeta });
+  } else {
+    const normalizedMethod = normalizeSalePaymentMethod(method);
+    if (total > 0) allocations.push({ metodo_pago: normalizedMethod, monto: total });
+  }
+  if (!allocations.length && total > 0) {
+    allocations.push({ metodo_pago: 'otro', monto: total });
+  }
+  return {
+    montoEfectivo,
+    montoTarjeta,
+    allocations,
+  };
+}
+
+async function insertSalePaymentAllocations(executor, ventaId, allocations = []) {
+  const saleId = toInt(ventaId);
+  if (!saleId) return;
+  const rows = (Array.isArray(allocations) ? allocations : [])
+    .map((entry) => ({
+      metodo_pago: normalizeSalePaymentMethod(entry?.metodo_pago),
+      monto: Math.max(0, toClpAmount(entry?.monto || 0, 0)),
+    }))
+    .filter((entry) => entry.monto > 0);
+
+  if (!rows.length) return;
+  const placeholders = rows.map(() => '(?, ?, ?)').join(', ');
+  const values = [];
+  rows.forEach((entry) => {
+    values.push(saleId, entry.metodo_pago, entry.monto);
+  });
+  await executor.query(
+    `INSERT INTO venta_pagos (venta_id, metodo_pago, monto)
+     VALUES ${placeholders}`,
+    values
+  );
+}
+
+async function fetchSalePaymentAllocations(executor, ventaId, fallbackSaleRow = null) {
+  const saleId = toInt(ventaId);
+  if (!saleId) return [];
+  const [rows] = await executor.query(
+    `SELECT metodo_pago, monto
+     FROM venta_pagos
+     WHERE venta_id = ?
+     ORDER BY id_pago ASC`,
+    [saleId]
+  );
+  if (Array.isArray(rows) && rows.length) {
+    return rows.map((row) => ({
+      metodo_pago: normalizeSalePaymentMethod(row.metodo_pago),
+      monto: Math.max(0, Number(row.monto || 0)),
+    }));
+  }
+  if (!fallbackSaleRow) return [];
+  return buildSalePaymentAllocationsFromLegacyRow(fallbackSaleRow).allocations;
+}
+
+async function backfillSalePaymentAllocations(executor = db) {
+  const batchSize = 500;
+  while (true) {
+    const [legacyRows] = await executor.query(
+      `SELECT v.id_venta, v.metodo_pago, v.total, v.monto_efectivo, v.monto_tarjeta
+       FROM ventas v
+       LEFT JOIN venta_pagos vp ON vp.venta_id = v.id_venta
+       WHERE vp.venta_id IS NULL
+       ORDER BY v.id_venta ASC
+       LIMIT ?`,
+      [batchSize]
+    );
+    if (!legacyRows.length) break;
+
+    const insertRows = [];
+    legacyRows.forEach((row) => {
+      const allocations = buildSalePaymentAllocationsFromLegacyRow(row).allocations;
+      allocations.forEach((entry) => {
+        insertRows.push({
+          venta_id: Number(row.id_venta || 0),
+          metodo_pago: entry.metodo_pago,
+          monto: entry.monto,
+        });
+      });
+    });
+
+    if (insertRows.length) {
+      const placeholders = insertRows.map(() => '(?, ?, ?)').join(', ');
+      const values = [];
+      insertRows.forEach((entry) => {
+        values.push(entry.venta_id, entry.metodo_pago, entry.monto);
+      });
+      await executor.query(
+        `INSERT INTO venta_pagos (venta_id, metodo_pago, monto)
+         VALUES ${placeholders}`,
+        values
+      );
+    } else {
+      // Evita loop infinito en filas con total 0.
+      const ids = legacyRows.map((row) => Number(row.id_venta || 0)).filter((id) => id > 0);
+      if (ids.length) {
+        await executor.query(
+          `INSERT INTO venta_pagos (venta_id, metodo_pago, monto)
+           VALUES ${ids.map(() => '(?, ?, ?)').join(', ')}`,
+          ids.flatMap((id) => [id, 'otro', 0])
+        );
+      }
+    }
+  }
+}
+
+function buildCardLikeSqlList(alias = 'vp') {
+  return `${alias}.metodo_pago IN ('tarjeta', 'dolares', 'transferencia', 'cheque', 'vale')`;
+}
+
 function buildCashAmountSql(alias = 'v') {
   return `
     CASE
+      WHEN EXISTS (
+        SELECT 1
+        FROM venta_pagos vp_exists
+        WHERE vp_exists.venta_id = ${alias}.id_venta
+      ) THEN COALESCE((
+        SELECT SUM(vp_cash.monto)
+        FROM venta_pagos vp_cash
+        WHERE vp_cash.venta_id = ${alias}.id_venta
+          AND vp_cash.metodo_pago = 'efectivo'
+      ), 0)
       WHEN ${alias}.metodo_pago = 'efectivo' THEN ${alias}.total
       WHEN ${alias}.metodo_pago = 'mixto' THEN
         CASE
@@ -5160,6 +8217,16 @@ function buildCashAmountSql(alias = 'v') {
 function buildCardAmountSql(alias = 'v') {
   return `
     CASE
+      WHEN EXISTS (
+        SELECT 1
+        FROM venta_pagos vp_exists
+        WHERE vp_exists.venta_id = ${alias}.id_venta
+      ) THEN COALESCE((
+        SELECT SUM(vp_card.monto)
+        FROM venta_pagos vp_card
+        WHERE vp_card.venta_id = ${alias}.id_venta
+          AND ${buildCardLikeSqlList('vp_card')}
+      ), 0)
       WHEN ${alias}.metodo_pago = 'tarjeta' THEN ${alias}.total
       WHEN ${alias}.metodo_pago = 'mixto' THEN
         CASE
@@ -5170,6 +8237,80 @@ function buildCardAmountSql(alias = 'v') {
       ELSE 0
     END
   `;
+}
+
+async function calculateShiftTotalsByTurno(turnoId, executor = db) {
+  const safeTurnoId = toInt(turnoId);
+  if (!safeTurnoId) {
+    return {
+      byPayment: [],
+      totalVentas: 0,
+      transacciones: 0,
+      totalEfectivo: 0,
+      totalTarjeta: 0,
+      totalMixto: 0,
+      entradasDinero: 0,
+      salidasDinero: 0,
+      abonosEfectivo: 0,
+    };
+  }
+
+  const [byPayment] = await executor.query(
+    `SELECT vp.metodo_pago, COUNT(DISTINCT v.id_venta) AS transacciones, COALESCE(SUM(vp.monto), 0) AS total
+     FROM ventas v
+     INNER JOIN venta_pagos vp ON vp.venta_id = v.id_venta
+     WHERE v.turno_id = ?
+     GROUP BY vp.metodo_pago`,
+    [safeTurnoId]
+  );
+  const [totals] = await executor.query(
+    `SELECT COUNT(*) AS transacciones, COALESCE(SUM(total), 0) AS total
+     FROM ventas
+     WHERE turno_id = ?`,
+    [safeTurnoId]
+  );
+  const [cashAndCardRows] = await executor.query(
+    `SELECT
+       COALESCE(SUM(
+         CASE WHEN vp.metodo_pago = 'efectivo' THEN vp.monto ELSE 0 END
+       ), 0) AS total_efectivo,
+       COALESCE(SUM(
+         CASE WHEN ${buildCardLikeSqlList('vp')} THEN vp.monto ELSE 0 END
+       ), 0) AS total_tarjeta
+     FROM ventas v
+     LEFT JOIN venta_pagos vp ON vp.venta_id = v.id_venta
+     WHERE v.turno_id = ?`,
+    [safeTurnoId]
+  );
+  const [movementRows] = await executor.query(
+    `SELECT tipo, COALESCE(SUM(monto), 0) AS total
+     FROM cash_movements
+     WHERE turno_id = ?
+     GROUP BY tipo`,
+    [safeTurnoId]
+  );
+
+  let totalMixto = 0;
+  (Array.isArray(byPayment) ? byPayment : []).forEach((row) => {
+    if (String(row.metodo_pago || '').toLowerCase() !== 'mixto') return;
+    totalMixto += Number(row.total || 0);
+  });
+
+  const entradasDinero = sumMovementAmounts(movementRows, { type: 'entrada', field: 'total' });
+  const salidasDinero = sumMovementAmounts(movementRows, { type: 'salida', field: 'total' });
+  const abonosEfectivo = sumMovementAmounts(movementRows, { type: 'abono', field: 'total' });
+
+  return {
+    byPayment,
+    totalVentas: Number(totals[0]?.total || 0),
+    transacciones: Number(totals[0]?.transacciones || 0),
+    totalEfectivo: Number(cashAndCardRows[0]?.total_efectivo || 0),
+    totalTarjeta: Number(cashAndCardRows[0]?.total_tarjeta || 0),
+    totalMixto,
+    entradasDinero,
+    salidasDinero,
+    abonosEfectivo,
+  };
 }
 
 // resumen para vista de reportes por rango de fechas
@@ -5198,10 +8339,11 @@ app.get('/api/reportes/resumen', async (req, res) => {
 
   try {
     const [salesSummary] = await db.query(
-      `SELECT metodo_pago, COUNT(*) AS transacciones, COALESCE(SUM(total), 0) AS total
-       FROM ventas
+      `SELECT vp.metodo_pago, COUNT(DISTINCT v.id_venta) AS transacciones, COALESCE(SUM(vp.monto), 0) AS total
+       FROM ventas v
+       INNER JOIN venta_pagos vp ON vp.venta_id = v.id_venta
        WHERE ${whereClause}
-       GROUP BY metodo_pago`,
+       GROUP BY vp.metodo_pago`,
       values
     );
 
@@ -5253,10 +8395,11 @@ app.get('/api/corte/actual', async (req, res) => {
 
   try {
     const [paymentBreakdown] = await db.query(
-      `SELECT metodo_pago, COUNT(*) AS transacciones, COALESCE(SUM(total), 0) AS total
-       FROM ventas
-       WHERE DATE(fecha) = CURDATE() ${whereExtra}
-       GROUP BY metodo_pago`,
+      `SELECT vp.metodo_pago, COUNT(DISTINCT v.id_venta) AS transacciones, COALESCE(SUM(vp.monto), 0) AS total
+       FROM ventas v
+       INNER JOIN venta_pagos vp ON vp.venta_id = v.id_venta
+       WHERE DATE(v.fecha) = CURDATE() ${whereExtra}
+       GROUP BY vp.metodo_pago`,
       values
     );
 
@@ -5268,7 +8411,7 @@ app.get('/api/corte/actual', async (req, res) => {
     );
 
     const [closedRows] = await db.query(
-      `SELECT id_corte, hora_cierre, total_ventas, transacciones, monto_inicial, monto_declarado, diferencia_efectivo, estado
+      `SELECT id_corte, hora_apertura, hora_cierre, total_ventas, transacciones, monto_inicial, monto_declarado, diferencia_efectivo, estado
        FROM corte_caja
        WHERE fecha = CURDATE() ${whereExtra}
        ORDER BY id_corte DESC
@@ -5313,12 +8456,87 @@ app.get('/api/corte/historial', async (req, res) => {
 
   try {
     const [rows] = await db.query(
-      `SELECT c.id_corte, c.fecha, c.caja_id, c.usuario_id, COALESCE(u.nombre, '') AS cajero_nombre,
-              c.hora_cierre, c.monto_inicial, c.monto_declarado, c.diferencia_efectivo,
-              c.total_efectivo, c.total_tarjeta, c.total_mixto, c.total_ventas, c.transacciones, c.estado, c.observaciones
+      `SELECT c.id_corte,
+              DATE_FORMAT(c.fecha, '%Y-%m-%d') AS fecha,
+              c.caja_id,
+              c.usuario_id,
+              COALESCE(u.nombre, '') AS cajero_nombre,
+              c.hora_apertura,
+              c.hora_cierre,
+              c.monto_inicial,
+              c.monto_declarado,
+              c.diferencia_efectivo,
+              CASE
+                WHEN COUNT(v.id_venta) > 0 THEN COALESCE(SUM(
+                  CASE
+                    WHEN v.metodo_pago = 'efectivo' THEN v.total
+                    WHEN v.metodo_pago = 'mixto' THEN
+                      CASE
+                        WHEN COALESCE(v.monto_efectivo, 0) > 0 THEN v.monto_efectivo
+                        ELSE v.total / 2
+                      END
+                    ELSE 0
+                  END
+                ), 0)
+                ELSE COALESCE(c.total_efectivo, 0)
+              END AS total_efectivo,
+              CASE
+                WHEN COUNT(v.id_venta) > 0 THEN COALESCE(SUM(
+                  CASE
+                    WHEN v.metodo_pago = 'tarjeta' THEN v.total
+                    WHEN v.metodo_pago = 'mixto' THEN
+                      CASE
+                        WHEN COALESCE(v.monto_efectivo, 0) > 0 THEN (v.total - v.monto_efectivo)
+                        ELSE v.total / 2
+                      END
+                    ELSE 0
+                  END
+                ), 0)
+                ELSE COALESCE(c.total_tarjeta, 0)
+              END AS total_tarjeta,
+              CASE
+                WHEN COUNT(v.id_venta) > 0 THEN COALESCE(SUM(
+                  CASE
+                    WHEN v.metodo_pago = 'mixto' THEN v.total
+                    ELSE 0
+                  END
+                ), 0)
+                ELSE COALESCE(c.total_mixto, 0)
+              END AS total_mixto,
+              CASE
+                WHEN COUNT(v.id_venta) > 0 THEN COALESCE(SUM(v.total), 0)
+                ELSE COALESCE(c.total_ventas, 0)
+              END AS total_ventas,
+              CASE
+                WHEN COUNT(v.id_venta) > 0 THEN COUNT(v.id_venta)
+                ELSE COALESCE(c.transacciones, 0)
+              END AS transacciones,
+              c.estado,
+              c.observaciones
        FROM corte_caja c
        LEFT JOIN usuarios u ON u.id = c.usuario_id
+       LEFT JOIN ventas v
+         ON v.caja_id = c.caja_id
+        AND v.usuario_id = c.usuario_id
+        AND DATE(v.fecha) = c.fecha
+        AND (
+          v.turno_id = c.id_corte
+          OR (
+            v.turno_id IS NULL
+            AND v.fecha >= COALESCE(c.hora_apertura, CONCAT(c.fecha, ' 00:00:00'))
+            AND v.fecha <= COALESCE(c.hora_cierre, NOW())
+          )
+        )
        WHERE ${filters.join(' AND ')}
+       GROUP BY c.id_corte, c.fecha, c.caja_id, c.usuario_id, u.nombre,
+                c.hora_apertura, c.hora_cierre, c.monto_inicial, c.monto_declarado, c.diferencia_efectivo,
+                c.total_efectivo, c.total_tarjeta, c.total_mixto, c.total_ventas, c.transacciones, c.estado, c.observaciones
+       HAVING (
+         CASE
+           WHEN COUNT(v.id_venta) > 0 THEN COUNT(v.id_venta)
+           ELSE COALESCE(c.transacciones, 0)
+         END
+       ) > 0
        ORDER BY c.fecha DESC, c.id_corte DESC
        LIMIT 200`,
       values
@@ -5327,6 +8545,735 @@ app.get('/api/corte/historial', async (req, res) => {
   } catch (error) {
     console.error('Error al consultar historial de cortes:', error);
     return res.status(500).json({ message: 'Error interno del servidor' });
+  }
+});
+
+app.get('/api/corte/rebuild-preview', async (req, res) => {
+  const requesterUserId = toInt(req.user?.sub);
+  if (!requesterUserId) {
+    return res.status(401).json({ message: 'Sesion invalida' });
+  }
+
+  try {
+    const allowed = await isAdminSiaUser(requesterUserId);
+    if (!allowed) {
+      return res.status(403).json({ message: 'Solo admin_sia puede reconstruir cortes' });
+    }
+
+    const parsed = normalizeCutRebuildFilters(req.query || {});
+    if (!parsed.ok) {
+      return res.status(400).json({ message: parsed.message });
+    }
+    const filters = parsed.filters;
+    const salesFilter = buildCutRebuildWhere(filters, 'v');
+    const cutFilter = buildCutRebuildCutWhere(filters, 'c');
+
+    const [summaryRows] = await db.query(
+      `SELECT v.metodo_pago, COUNT(*) AS transacciones, COALESCE(SUM(v.total), 0) AS total
+       FROM ventas v
+       WHERE ${salesFilter.whereClause}
+       GROUP BY v.metodo_pago
+       ORDER BY v.metodo_pago ASC`,
+      salesFilter.params
+    );
+    const [totalsRows] = await db.query(
+      `SELECT COUNT(*) AS transacciones, COALESCE(SUM(v.total), 0) AS total
+       FROM ventas v
+       WHERE ${salesFilter.whereClause}`,
+      salesFilter.params
+    );
+    const [salesRows] = await db.query(
+      `SELECT v.id_venta,
+              DATE_FORMAT(v.fecha, '%Y-%m-%d %H:%i:%s') AS fecha,
+              COALESCE(NULLIF(v.folio_ticket, ''), CAST(v.numero_ticket AS CHAR)) AS numero_ticket,
+              v.turno_id, v.caja_id, v.usuario_id,
+              COALESCE(u.nombre, CONCAT('Cajero ', v.usuario_id)) AS cajero_nombre,
+              CASE WHEN v.turno_id IS NULL THEN 0 ELSE 1 END AS tiene_corte_asociado,
+              v.metodo_pago, v.total
+       FROM ventas v
+       LEFT JOIN usuarios u ON u.id = v.usuario_id
+       WHERE ${salesFilter.whereClause}
+       ORDER BY v.fecha ASC, v.id_venta ASC
+       LIMIT 2000`,
+      salesFilter.params
+    );
+
+    const [cutRows] = await db.query(
+      `SELECT c.id_corte,
+              DATE_FORMAT(c.fecha, '%Y-%m-%d') AS fecha_iso,
+              c.caja_id, c.usuario_id,
+              COALESCE(u.nombre, CONCAT('Cajero ', c.usuario_id)) AS cajero_nombre,
+              c.hora_apertura, c.hora_cierre, c.monto_inicial, c.estado,
+              COALESCE(s.transacciones, 0) AS transacciones,
+              COALESCE(s.total_ventas, 0) AS total_ventas
+       FROM corte_caja c
+       LEFT JOIN usuarios u ON u.id = c.usuario_id
+       LEFT JOIN (
+         SELECT v.turno_id, COUNT(*) AS transacciones, COALESCE(SUM(v.total), 0) AS total_ventas
+         FROM ventas v
+         WHERE v.fecha BETWEEN ? AND ?
+           AND v.turno_id IS NOT NULL
+         GROUP BY v.turno_id
+       ) s ON s.turno_id = c.id_corte
+       WHERE ${cutFilter.whereClause}
+       ORDER BY c.fecha DESC, c.hora_apertura DESC, c.id_corte DESC
+       LIMIT 400`,
+      [filters.fromDateTime, filters.toDateTime, ...cutFilter.params]
+    );
+
+    return res.json({
+      filters: {
+        desde: filters.fromDate,
+        hasta: filters.toDate,
+        hora_desde: filters.fromTime,
+        hora_hasta: filters.toTime,
+        caja: filters.cajaId,
+        cajero: filters.cajeroId,
+        turno: filters.turnoId,
+        sale_ids: filters.saleIds,
+        cut_ids: filters.cutIds,
+      },
+      totals: {
+        transacciones: Number(totalsRows[0]?.transacciones || 0),
+        total: Number(totalsRows[0]?.total || 0),
+      },
+      summary: (Array.isArray(summaryRows) ? summaryRows : []).map((row) => ({
+        metodo_pago: row.metodo_pago,
+        transacciones: Number(row.transacciones || 0),
+        total: Number(row.total || 0),
+      })),
+      cuts: (Array.isArray(cutRows) ? cutRows : []).map((row) => ({
+        id_corte: Number(row.id_corte || 0),
+        fecha: row.fecha_iso || null,
+        caja_id: Number(row.caja_id || 0),
+        usuario_id: Number(row.usuario_id || 0),
+        cajero_nombre: row.cajero_nombre || '',
+        hora_apertura: row.hora_apertura || null,
+        hora_cierre: row.hora_cierre || null,
+        monto_inicial: Number(row.monto_inicial || 0),
+        estado: row.estado || 'cerrado',
+        transacciones: Number(row.transacciones || 0),
+        total_ventas: Number(row.total_ventas || 0),
+      })),
+      sales: (Array.isArray(salesRows) ? salesRows : []).map((row) => ({
+        id_venta: Number(row.id_venta || 0),
+        fecha: row.fecha || '',
+        numero_ticket: row.numero_ticket || '',
+        turno_id: Number(row.turno_id || 0) || null,
+        caja_id: Number(row.caja_id || 0) || null,
+        usuario_id: Number(row.usuario_id || 0) || null,
+        cajero_nombre: row.cajero_nombre || '',
+        tiene_corte_asociado: Number(row.tiene_corte_asociado || 0) === 1,
+        metodo_pago: row.metodo_pago || '',
+        total: Number(row.total || 0),
+      })),
+    });
+  } catch (error) {
+    console.error('Error al generar preview de reconstruccion de corte:', error);
+    return res.status(500).json({ message: 'No se pudo preparar la reconstruccion de corte' });
+  }
+});
+
+app.post('/api/corte/merge', async (req, res) => {
+  const requesterUserId = toInt(req.user?.sub);
+  if (!requesterUserId) {
+    return res.status(401).json({ message: 'Sesion invalida' });
+  }
+
+  try {
+    const allowed = await isAdminSiaUser(requesterUserId);
+    if (!allowed) {
+      return res.status(403).json({ message: 'Solo admin_sia puede unificar cortes' });
+    }
+
+    const parsedKeepCutId = toInt(req.body?.keep_cut_id);
+    const selectedCutIds = parseCutIdList(req.body?.cut_ids);
+    const selectedSaleIds = parseCutIdList(req.body?.sale_ids);
+    const requestedCutFromDate = String(req.body?.cut_from_date || '').trim();
+    const requestedCutFromTime = normalizeHourMinute(req.body?.cut_from_time, '');
+    const requestedCutToDate = String(req.body?.cut_to_date || '').trim();
+    const requestedCutToTime = normalizeHourMinute(req.body?.cut_to_time, '');
+    const requestedCutCajaId = toInt(req.body?.cut_caja_id);
+    const requestedCutCajeroId = toInt(req.body?.cut_cajero_id);
+    const legacyCutDate = String(req.body?.cut_date || '').trim();
+    const legacyCutStartTime = normalizeHourMinute(req.body?.cut_start_time, '');
+    const legacyCutDurationMinutes = toInt(req.body?.cut_duration_minutes);
+    const allCutIds = parsedKeepCutId && !selectedCutIds.includes(parsedKeepCutId)
+      ? [parsedKeepCutId, ...selectedCutIds]
+      : selectedCutIds;
+    const uniqueCutIds = parseCutIdList(allCutIds);
+
+    if (!uniqueCutIds.length && !selectedSaleIds.length) {
+      return res.status(400).json({ message: 'Debes seleccionar ventas o al menos un corte' });
+    }
+    if (uniqueCutIds.length === 1 && !selectedSaleIds.length) {
+      return res.json({
+        message: 'Solo se selecciono un corte. No fue necesario unificar.',
+        keep_cut_id: uniqueCutIds[0],
+        removed_cut_ids: [],
+        reassigned_sales: 0,
+        reassigned_movements: 0,
+        reassigned_sessions: 0,
+        created_new_cut: false,
+      });
+    }
+
+    let connection;
+    try {
+      connection = await db.getConnection();
+      await connection.beginTransaction();
+
+      const toDateIso = (value) => {
+        if (!value) return '';
+        if (value instanceof Date && !Number.isNaN(value.getTime())) {
+          return value.toISOString().slice(0, 10);
+        }
+        const raw = String(value);
+        const iso = raw.match(/^\d{4}-\d{2}-\d{2}/);
+        return iso ? iso[0] : '';
+      };
+      const toValidDate = (value) => {
+        if (!value) return null;
+        const candidate = value instanceof Date ? value : new Date(value);
+        if (Number.isNaN(candidate.getTime())) return null;
+        return candidate;
+      };
+      const pickEarlier = (acc, value) => {
+        const current = toValidDate(value);
+        if (!current) return acc;
+        if (!acc) return current;
+        return current < acc ? current : acc;
+      };
+      const pickLater = (acc, value) => {
+        const current = toValidDate(value);
+        if (!current) return acc;
+        if (!acc) return current;
+        return current > acc ? current : acc;
+      };
+      let customCutWindow = null;
+      const hasModernWindowInput = Boolean(
+        requestedCutFromDate
+        || requestedCutFromTime
+        || requestedCutToDate
+        || requestedCutToTime
+        || requestedCutCajaId
+        || requestedCutCajeroId
+      );
+      const hasLegacyWindowInput = Boolean(legacyCutDate || legacyCutStartTime || legacyCutDurationMinutes);
+      if (hasModernWindowInput) {
+        if (!isIsoDate(requestedCutFromDate) || !isIsoDate(requestedCutToDate)) {
+          await connection.rollback();
+          return res.status(400).json({ message: 'cut_from_date y cut_to_date deben tener formato YYYY-MM-DD' });
+        }
+        if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(requestedCutFromTime) || !/^([01]\d|2[0-3]):([0-5]\d)$/.test(requestedCutToTime)) {
+          await connection.rollback();
+          return res.status(400).json({ message: 'cut_from_time y cut_to_time deben tener formato HH:MM' });
+        }
+        if (!requestedCutCajaId || !requestedCutCajeroId) {
+          await connection.rollback();
+          return res.status(400).json({ message: 'cut_caja_id y cut_cajero_id son obligatorios' });
+        }
+        const startAt = toValidDate(`${requestedCutFromDate}T${requestedCutFromTime}:00`);
+        const endAt = toValidDate(`${requestedCutToDate}T${requestedCutToTime}:59`);
+        if (!startAt || !endAt || startAt > endAt) {
+          await connection.rollback();
+          return res.status(400).json({ message: 'La fecha/hora de inicio no puede ser mayor que la fecha/hora de fin' });
+        }
+        customCutWindow = {
+          dateIso: requestedCutFromDate,
+          fromDate: requestedCutFromDate,
+          fromTime: requestedCutFromTime,
+          toDate: requestedCutToDate,
+          toTime: requestedCutToTime,
+          startAt,
+          endAt,
+          durationMinutes: Math.max(1, Math.ceil((endAt.getTime() - startAt.getTime()) / 60000)),
+          cajaId: requestedCutCajaId,
+          cajeroId: requestedCutCajeroId,
+        };
+      } else if (hasLegacyWindowInput) {
+        if (!isIsoDate(legacyCutDate)) {
+          await connection.rollback();
+          return res.status(400).json({ message: 'cut_date debe tener formato YYYY-MM-DD' });
+        }
+        if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(legacyCutStartTime)) {
+          await connection.rollback();
+          return res.status(400).json({ message: 'cut_start_time debe tener formato HH:MM' });
+        }
+        if (!legacyCutDurationMinutes || legacyCutDurationMinutes < 1 || legacyCutDurationMinutes > (24 * 60)) {
+          await connection.rollback();
+          return res.status(400).json({ message: 'cut_duration_minutes debe estar entre 1 y 1440' });
+        }
+        const startAt = toValidDate(`${legacyCutDate}T${legacyCutStartTime}:00`);
+        if (!startAt) {
+          await connection.rollback();
+          return res.status(400).json({ message: 'No se pudo interpretar la fecha/hora del corte final' });
+        }
+        const endAt = new Date(startAt.getTime() + (legacyCutDurationMinutes * 60000));
+        customCutWindow = {
+          dateIso: legacyCutDate,
+          fromDate: legacyCutDate,
+          fromTime: legacyCutStartTime,
+          toDate: endAt.toISOString().slice(0, 10),
+          toTime: `${String(endAt.getHours()).padStart(2, '0')}:${String(endAt.getMinutes()).padStart(2, '0')}`,
+          startAt,
+          endAt,
+          durationMinutes: legacyCutDurationMinutes,
+          cajaId: null,
+          cajeroId: null,
+        };
+      }
+
+      let salesRows = [];
+      if (selectedSaleIds.length > 0) {
+        const [rows] = await connection.query(
+          `SELECT id_venta, fecha, caja_id, usuario_id, turno_id
+           FROM ventas
+           WHERE id_venta IN (?)
+           FOR UPDATE`,
+          [selectedSaleIds]
+        );
+        salesRows = Array.isArray(rows) ? rows : [];
+        if (salesRows.length !== selectedSaleIds.length) {
+          await connection.rollback();
+          return res.status(404).json({ message: 'Una o mas ventas seleccionadas no existen' });
+        }
+      }
+
+      let cutRows = [];
+      if (uniqueCutIds.length > 0) {
+        const [rows] = await connection.query(
+          `SELECT id_corte, fecha, caja_id, sucursal_id, usuario_id,
+                  hora_apertura, hora_cierre, monto_inicial,
+                  monto_declarado, monto_declarado_tarjeta,
+                  diferencia_efectivo, diferencia_tarjeta,
+                  total_efectivo, total_tarjeta, total_mixto, total_ventas, transacciones,
+                  estado, observaciones
+           FROM corte_caja
+           WHERE id_corte IN (?)
+           ORDER BY COALESCE(hora_apertura, CONCAT(fecha, ' 00:00:00')) ASC, id_corte ASC
+           FOR UPDATE`,
+          [uniqueCutIds]
+        );
+        cutRows = Array.isArray(rows) ? rows : [];
+        if (cutRows.length !== uniqueCutIds.length) {
+          await connection.rollback();
+          return res.status(404).json({ message: 'Uno o mas cortes no existen o ya fueron eliminados' });
+        }
+      }
+
+      let salesContext = null;
+      if (salesRows.length > 0) {
+        const saleCajaIds = Array.from(new Set(
+          salesRows.map((row) => Number(row.caja_id || 0)).filter((id) => id > 0)
+        ));
+        const saleUserIds = Array.from(new Set(
+          salesRows.map((row) => Number(row.usuario_id || 0)).filter((id) => id > 0)
+        ));
+        const saleDateSet = Array.from(new Set(
+          salesRows.map((row) => toDateIso(row.fecha)).filter(Boolean)
+        )).sort();
+        if (saleCajaIds.length !== 1 || saleUserIds.length !== 1 || !saleDateSet.length) {
+          await connection.rollback();
+          return res.status(409).json({
+            message: 'Las ventas seleccionadas deben pertenecer al mismo cajero y misma caja',
+          });
+        }
+        if (saleDateSet.length > 1 && !customCutWindow) {
+          await connection.rollback();
+          return res.status(409).json({
+            message: 'Al seleccionar ventas de varias fechas debes definir cut_from_date, cut_from_time, cut_to_date y cut_to_time',
+          });
+        }
+        const firstSaleAt = salesRows.reduce((acc, row) => pickEarlier(acc, row.fecha), null);
+        const lastSaleAt = salesRows.reduce((acc, row) => pickLater(acc, row.fecha), null);
+        salesContext = {
+          cajaId: saleCajaIds[0],
+          userId: saleUserIds[0],
+          dateIso: saleDateSet[0],
+          firstSaleAt,
+          lastSaleAt,
+        };
+      }
+
+      const originalCutRows = cutRows.slice();
+      const firstCut = cutRows[0] || null;
+      let referenceCajaId = Number(customCutWindow?.cajaId || firstCut?.caja_id || 0);
+      let referenceUserId = Number(customCutWindow?.cajeroId || firstCut?.usuario_id || 0);
+      let referenceDate = toDateIso(firstCut?.fecha);
+      if (!referenceCajaId && salesContext) referenceCajaId = Number(salesContext.cajaId || 0);
+      if (!referenceUserId && salesContext) referenceUserId = Number(salesContext.userId || 0);
+      if (!referenceDate && salesContext) referenceDate = String(salesContext.dateIso || '');
+      if (!referenceCajaId || !referenceUserId || !referenceDate) {
+        await connection.rollback();
+        return res.status(400).json({ message: 'No se pudo determinar caja, cajero y fecha para la reconstruccion' });
+      }
+      if (salesContext) {
+        const mismatch = Number(salesContext.cajaId || 0) !== referenceCajaId
+          || Number(salesContext.userId || 0) !== referenceUserId
+          || (!customCutWindow && String(salesContext.dateIso || '') !== referenceDate);
+        if (mismatch) {
+          await connection.rollback();
+          return res.status(409).json({
+            message: 'Los cortes seleccionados no coinciden con el cajero/caja/fecha de las ventas',
+          });
+        }
+      }
+
+      const hasMixedContext = cutRows.some((row) => (
+        Number(row.caja_id || 0) !== referenceCajaId
+        || Number(row.usuario_id || 0) !== referenceUserId
+        || (!customCutWindow && toDateIso(row.fecha) !== referenceDate)
+      ));
+      if (hasMixedContext) {
+        await connection.rollback();
+        return res.status(409).json({
+          message: customCutWindow
+            ? 'Solo se pueden unificar cortes del mismo cajero y misma caja'
+            : 'Solo se pueden unificar cortes del mismo cajero, misma caja y misma fecha',
+        });
+      }
+      if (customCutWindow) {
+        referenceDate = customCutWindow.dateIso;
+      }
+
+      let keepCutId = 0;
+      let keeper = null;
+      let mergedCutIds = [];
+      let createdNewCut = false;
+      let baseInitialAmount = Number(firstCut?.monto_inicial || 0);
+
+      if (cutRows.length > 0) {
+        keepCutId = parsedKeepCutId && uniqueCutIds.includes(parsedKeepCutId)
+          ? parsedKeepCutId
+          : Number(firstCut.id_corte || 0);
+        keeper = cutRows.find((row) => Number(row.id_corte || 0) === keepCutId) || null;
+        if (!keeper) {
+          await connection.rollback();
+          return res.status(400).json({ message: 'No se pudo determinar el corte a conservar' });
+        }
+        mergedCutIds = uniqueCutIds.filter((id) => id !== keepCutId);
+      } else {
+        const [seedRows] = await connection.query(
+          `SELECT monto_inicial
+           FROM corte_caja
+           WHERE fecha = ? AND caja_id = ? AND usuario_id = ?
+           ORDER BY id_corte ASC
+           LIMIT 1
+           FOR UPDATE`,
+          [referenceDate, referenceCajaId, referenceUserId]
+        );
+        baseInitialAmount = Number(seedRows[0]?.monto_inicial || 0);
+        const suggestedOpenAt = customCutWindow?.startAt || salesContext?.firstSaleAt || new Date(`${referenceDate}T00:00:00`);
+        const suggestedCloseAt = customCutWindow?.endAt || salesContext?.lastSaleAt || suggestedOpenAt;
+        const newObservation = `Reconstruccion admin_sia ${new Date().toISOString()} (${selectedSaleIds.length} ventas)`;
+        const sucursalId = await resolveBranchForCaja(referenceCajaId, connection);
+        const [insertResult] = await connection.query(
+          `INSERT INTO corte_caja (
+            fecha, caja_id, sucursal_id, usuario_id, hora_apertura, hora_cierre,
+            monto_inicial, estado, observaciones
+          ) VALUES (
+            ?, ?, ?, ?, ?, ?, ?, 'cerrado', ?
+          )`,
+          [
+            referenceDate,
+            referenceCajaId,
+            sucursalId,
+            referenceUserId,
+            suggestedOpenAt || new Date(),
+            suggestedCloseAt || suggestedOpenAt || new Date(),
+            baseInitialAmount,
+            newObservation.slice(0, 255),
+          ]
+        );
+        keepCutId = Number(insertResult.insertId || 0);
+        if (!keepCutId) {
+          await connection.rollback();
+          return res.status(500).json({ message: 'No se pudo crear el nuevo corte reconstruido' });
+        }
+        createdNewCut = true;
+        keeper = {
+          id_corte: keepCutId,
+          fecha: referenceDate,
+          caja_id: referenceCajaId,
+          usuario_id: referenceUserId,
+          hora_apertura: suggestedOpenAt || new Date(),
+          hora_cierre: suggestedCloseAt || suggestedOpenAt || new Date(),
+          monto_inicial: baseInitialAmount,
+          estado: 'cerrado',
+          observaciones: newObservation.slice(0, 255),
+        };
+        cutRows = [keeper];
+      }
+
+      let mergedSalesResult = { affectedRows: 0 };
+      if (mergedCutIds.length > 0) {
+        const [updatedSales] = await connection.query(
+          `UPDATE ventas
+           SET turno_id = ?
+           WHERE turno_id IN (?)`,
+          [keepCutId, mergedCutIds]
+        );
+        mergedSalesResult = updatedSales;
+      }
+      let selectedSalesResult = { affectedRows: 0 };
+      if (selectedSaleIds.length > 0) {
+        const [updatedSelectedSales] = await connection.query(
+          `UPDATE ventas
+           SET turno_id = ?
+           WHERE id_venta IN (?)`,
+          [keepCutId, selectedSaleIds]
+        );
+        selectedSalesResult = updatedSelectedSales;
+      }
+
+      const salesTurnIds = parseCutIdList(salesRows.map((row) => row.turno_id));
+      const turnIdsToReassign = parseCutIdList([...mergedCutIds, ...salesTurnIds]).filter((id) => id !== keepCutId);
+
+      let movementResult = { affectedRows: 0 };
+      let sessionResult = { affectedRows: 0 };
+      if (turnIdsToReassign.length > 0) {
+        const [updatedMovements] = await connection.query(
+          `UPDATE cash_movements
+           SET turno_id = ?
+           WHERE turno_id IN (?)`,
+          [keepCutId, turnIdsToReassign]
+        );
+        movementResult = updatedMovements;
+        const [updatedSessions] = await connection.query(
+          `UPDATE user_auth_sessions
+           SET turno_id = ?
+           WHERE turno_id IN (?)
+             AND revoked_at IS NULL
+             AND expires_at > NOW()`,
+          [keepCutId, turnIdsToReassign]
+        );
+        sessionResult = updatedSessions;
+      }
+
+      const counterSourceIds = parseCutIdList([keepCutId, ...turnIdsToReassign]);
+      if (counterSourceIds.length > 0) {
+        const [counterRows] = await connection.query(
+          `SELECT turno_id, numero_actual, ultimo_ticket
+           FROM ticket_counter_state
+           WHERE turno_id IN (?)
+           FOR UPDATE`,
+          [counterSourceIds]
+        );
+        const maxNumeroActual = counterRows.reduce((acc, row) => Math.max(acc, Number(row.numero_actual || 1)), 1);
+        const maxUltimoTicket = counterRows.reduce((acc, row) => Math.max(acc, Number(row.ultimo_ticket || 0)), 0);
+        if (counterRows.length > 0) {
+          await connection.query(
+            `INSERT INTO ticket_counter_state (turno_id, caja_id, usuario_id, numero_actual, ultimo_ticket)
+             VALUES (?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE
+               caja_id = VALUES(caja_id),
+               usuario_id = VALUES(usuario_id),
+               numero_actual = GREATEST(numero_actual, VALUES(numero_actual)),
+               ultimo_ticket = GREATEST(ultimo_ticket, VALUES(ultimo_ticket)),
+               updated_at = CURRENT_TIMESTAMP`,
+            [keepCutId, referenceCajaId, referenceUserId, maxNumeroActual, maxUltimoTicket]
+          );
+        }
+        const counterDeleteIds = counterSourceIds.filter((id) => id !== keepCutId);
+        if (counterDeleteIds.length > 0) {
+          await connection.query(
+            `DELETE FROM ticket_counter_state
+             WHERE turno_id IN (?)`,
+            [counterDeleteIds]
+          );
+        }
+      }
+
+      const shiftTotals = await calculateShiftTotalsByTurno(keepCutId, connection);
+      const [salesRangeRows] = await connection.query(
+        `SELECT MIN(fecha) AS first_sale_at, MAX(fecha) AS last_sale_at
+         FROM ventas
+         WHERE turno_id = ?`,
+        [keepCutId]
+      );
+      const salesFirstAt = toValidDate(salesRangeRows[0]?.first_sale_at) || salesContext?.firstSaleAt || null;
+      const salesLastAt = toValidDate(salesRangeRows[0]?.last_sale_at) || salesContext?.lastSaleAt || null;
+      const forceClosedByConfig = Boolean(customCutWindow);
+      const anyOpenShift = !forceClosedByConfig && !createdNewCut && cutRows.some((row) => String(row.estado || '').toLowerCase() === 'abierto');
+      const firstOpenedAt = customCutWindow?.startAt
+        || [salesFirstAt, ...cutRows.map((row) => row.hora_apertura)].reduce((acc, value) => pickEarlier(acc, value), null);
+      const lastClosedAt = customCutWindow?.endAt
+        || [salesLastAt, ...cutRows.map((row) => row.hora_cierre)].reduce((acc, value) => pickLater(acc, value), null);
+      const efectivoEsperado = baseInitialAmount
+        + shiftTotals.totalEfectivo
+        + shiftTotals.abonosEfectivo
+        + shiftTotals.entradasDinero
+        - shiftTotals.salidasDinero;
+      const tarjetaEsperada = shiftTotals.totalTarjeta;
+      const mergeStamp = new Date().toISOString();
+      const observationBase = String(keeper.observaciones || '').trim();
+      const observationParts = [];
+      if (createdNewCut) {
+        observationParts.push(`Corte generado admin_sia ${mergeStamp}`);
+      }
+      if (mergedCutIds.length > 0) {
+        observationParts.push(`Unificacion admin_sia ${mergeStamp} [${mergedCutIds.join(',')}]`);
+      }
+      if (selectedSaleIds.length > 0) {
+        observationParts.push(`Ventas asignadas: ${selectedSaleIds.length}`);
+      }
+      if (customCutWindow) {
+        observationParts.push(`Tramo definido: ${customCutWindow.fromDate} ${customCutWindow.fromTime} -> ${customCutWindow.toDate} ${customCutWindow.toTime}`);
+      }
+      const nextObservation = [observationBase, ...observationParts]
+        .filter(Boolean)
+        .join(' | ')
+        .slice(0, 255);
+
+      await connection.query(
+        `UPDATE corte_caja
+         SET fecha = ?,
+             hora_apertura = ?,
+             hora_cierre = ?,
+             monto_inicial = ?,
+             monto_declarado = ?,
+             monto_declarado_tarjeta = ?,
+             diferencia_efectivo = 0,
+             diferencia_tarjeta = 0,
+             total_efectivo = ?,
+             total_tarjeta = ?,
+             total_mixto = ?,
+             total_ventas = ?,
+             transacciones = ?,
+             estado = ?,
+             observaciones = ?
+         WHERE id_corte = ?`,
+        [
+          referenceDate,
+          firstOpenedAt || keeper.hora_apertura || salesFirstAt || new Date(`${referenceDate}T00:00:00`),
+          anyOpenShift ? null : (lastClosedAt || keeper.hora_cierre || new Date()),
+          baseInitialAmount,
+          efectivoEsperado,
+          tarjetaEsperada,
+          shiftTotals.totalEfectivo,
+          shiftTotals.totalTarjeta,
+          shiftTotals.totalMixto,
+          shiftTotals.totalVentas,
+          shiftTotals.transacciones,
+          anyOpenShift ? 'abierto' : 'cerrado',
+          nextObservation || null,
+          keepCutId,
+        ]
+      );
+
+      if (mergedCutIds.length > 0) {
+        await connection.query(
+          `DELETE FROM corte_caja
+           WHERE id_corte IN (?)`,
+          [mergedCutIds]
+        );
+      }
+
+      const auditSnapshot = {
+        selected_cut_ids: uniqueCutIds,
+        selected_sale_ids: selectedSaleIds,
+        keep_cut_id: keepCutId,
+        merged_cut_ids: mergedCutIds,
+        created_new_cut: createdNewCut,
+        configured_window: customCutWindow ? {
+          from_date: customCutWindow.fromDate,
+          from_time: customCutWindow.fromTime,
+          to_date: customCutWindow.toDate,
+          to_time: customCutWindow.toTime,
+          duration_minutes: customCutWindow.durationMinutes,
+          caja_id: customCutWindow.cajaId || referenceCajaId,
+          cajero_id: customCutWindow.cajeroId || referenceUserId,
+        } : null,
+        reassigned_sales: Number((mergedSalesResult.affectedRows || 0) + (selectedSalesResult.affectedRows || 0)),
+        reassigned_movements: Number(movementResult.affectedRows || 0),
+        reassigned_sessions: Number(sessionResult.affectedRows || 0),
+        recalculated: {
+          total_ventas: shiftTotals.totalVentas,
+          transacciones: shiftTotals.transacciones,
+          total_efectivo: shiftTotals.totalEfectivo,
+          total_tarjeta: shiftTotals.totalTarjeta,
+          total_mixto: shiftTotals.totalMixto,
+          entradas_dinero: shiftTotals.entradasDinero,
+          salidas_dinero: shiftTotals.salidasDinero,
+          abonos_efectivo: shiftTotals.abonosEfectivo,
+          monto_inicial: baseInitialAmount,
+          monto_declarado: efectivoEsperado,
+          monto_declarado_tarjeta: tarjetaEsperada,
+          estado: anyOpenShift ? 'abierto' : 'cerrado',
+        },
+        previous_rows: originalCutRows.map((row) => ({
+          id_corte: Number(row.id_corte || 0),
+          fecha: row.fecha || null,
+          caja_id: Number(row.caja_id || 0),
+          usuario_id: Number(row.usuario_id || 0),
+          hora_apertura: row.hora_apertura || null,
+          hora_cierre: row.hora_cierre || null,
+          monto_inicial: Number(row.monto_inicial || 0),
+          total_ventas: Number(row.total_ventas || 0),
+          transacciones: Number(row.transacciones || 0),
+          estado: row.estado || '',
+        })),
+      };
+      await connection.query(
+        `INSERT INTO corte_merge_audit (
+          merged_at, merged_by_user_id, keeper_cut_id, merged_cut_ids,
+          caja_id, usuario_id, fecha, notes, snapshot_json
+        ) VALUES (
+          NOW(), ?, ?, ?, ?, ?, ?, ?, ?
+        )`,
+        [
+          requesterUserId,
+          keepCutId,
+          JSON.stringify(parseCutIdList([keepCutId, ...mergedCutIds])),
+          referenceCajaId,
+          referenceUserId,
+          referenceDate,
+          (createdNewCut
+            ? `Create ${keepCutId} (${selectedSaleIds.length} ventas)`
+            : `Merge ${keepCutId} <= ${mergedCutIds.join(',') || '-'}`).slice(0, 255),
+          JSON.stringify(auditSnapshot),
+        ]
+      );
+
+      await connection.commit();
+      const totalReassignedSales = Number((mergedSalesResult.affectedRows || 0) + (selectedSalesResult.affectedRows || 0));
+      return res.json({
+        message: createdNewCut
+          ? 'Corte reconstruido creado correctamente'
+          : (mergedCutIds.length > 0 ? 'Cortes unificados correctamente' : 'Corte actualizado correctamente'),
+        keep_cut_id: keepCutId,
+        created_new_cut: createdNewCut,
+        removed_cut_ids: mergedCutIds,
+        reassigned_sales: totalReassignedSales,
+        reassigned_movements: Number(movementResult.affectedRows || 0),
+        reassigned_sessions: Number(sessionResult.affectedRows || 0),
+        totals: {
+          total_ventas: shiftTotals.totalVentas,
+          transacciones: shiftTotals.transacciones,
+          total_efectivo: shiftTotals.totalEfectivo,
+          total_tarjeta: shiftTotals.totalTarjeta,
+          total_mixto: shiftTotals.totalMixto,
+          monto_inicial: baseInitialAmount,
+          monto_declarado: efectivoEsperado,
+          monto_declarado_tarjeta: tarjetaEsperada,
+          estado: anyOpenShift ? 'abierto' : 'cerrado',
+        },
+      });
+    } catch (mergeError) {
+      if (connection) {
+        try {
+          await connection.rollback();
+        } catch (_) {
+        }
+      }
+      throw mergeError;
+    } finally {
+      if (connection) connection.release();
+    }
+  } catch (error) {
+    console.error('Error al unificar cortes:', error);
+    return res.status(500).json({ message: 'No se pudo unificar los cortes seleccionados' });
   }
 });
 
@@ -5339,6 +9286,7 @@ app.get('/api/turno/estado', async (req, res) => {
   }
 
   try {
+    const sucursalId = await resolveBranchForCaja(cajaId);
     const [openRows] = await db.query(
       `SELECT id_corte, estado, monto_inicial, hora_apertura, hora_cierre
        FROM corte_caja
@@ -5402,7 +9350,7 @@ app.get('/api/sales/session-history', async (req, res) => {
       [authUserId]
     );
     if (!userRows.length) {
-      return res.status(401).json({ message: 'Usuario no válido' });
+      return res.status(401).json({ message: 'Usuario no vÃ¡lido' });
     }
     const isAdmin = Number(userRows[0].es_administrador || 0) === 1;
 
@@ -5428,8 +9376,8 @@ app.get('/api/sales/session-history', async (req, res) => {
       );
       if (openRows.length) {
         const turnoId = Number(openRows[0].id_corte || 0) || 0;
-        salesSql += ' AND v.caja_id = ? AND v.usuario_id = ? AND (v.turno_id = ? OR (v.turno_id IS NULL AND v.fecha >= ?))';
-        params.push(cajaId, cajeroId, turnoId, openRows[0].hora_apertura);
+        salesSql += ' AND v.caja_id = ? AND v.usuario_id = ? AND v.fecha >= ? AND (v.turno_id = ? OR v.turno_id IS NULL)';
+        params.push(cajaId, cajeroId, openRows[0].hora_apertura, turnoId);
       } else {
         salesSql += ' AND v.caja_id = ? AND v.usuario_id = ?';
         params.push(cajaId, cajeroId);
@@ -5499,6 +9447,7 @@ app.post('/api/turno/iniciar', async (req, res) => {
   }
 
   try {
+    const sucursalId = await resolveBranchForCaja(cajaId);
     const [openRows] = await db.query(
       `SELECT id_corte, estado, monto_inicial
        FROM corte_caja
@@ -5511,9 +9460,9 @@ app.post('/api/turno/iniciar', async (req, res) => {
     if (openRows.length > 0) {
       await db.query(
         `UPDATE user_auth_sessions
-         SET turno_id = ?
+         SET turno_id = ?, sucursal_id = ?
          WHERE user_id = ? AND caja_id = ? AND revoked_at IS NULL AND expires_at > NOW()`,
-        [openRows[0].id_corte, cajeroId, cajaId]
+        [openRows[0].id_corte, sucursalId, cajeroId, cajaId]
       );
       return res.json({
         message: 'Turno ya iniciado',
@@ -5525,18 +9474,18 @@ app.post('/api/turno/iniciar', async (req, res) => {
 
     const [result] = await db.query(
       `INSERT INTO corte_caja (
-        fecha, caja_id, usuario_id, hora_apertura, monto_inicial, estado
+        fecha, caja_id, sucursal_id, usuario_id, hora_apertura, monto_inicial, estado
       ) VALUES (
-        CURDATE(), ?, ?, NOW(), ?, 'abierto'
+        CURDATE(), ?, ?, ?, NOW(), ?, 'abierto'
       )`,
-      [cajaId, cajeroId, montoInicial]
+      [cajaId, sucursalId, cajeroId, montoInicial]
     );
 
     await db.query(
       `UPDATE user_auth_sessions
-       SET turno_id = ?
+       SET turno_id = ?, sucursal_id = ?
        WHERE user_id = ? AND caja_id = ? AND revoked_at IS NULL AND expires_at > NOW()`,
-      [result.insertId, cajeroId, cajaId]
+      [result.insertId, sucursalId, cajeroId, cajaId]
     );
 
     return res.json({
@@ -5581,16 +9530,17 @@ app.get('/api/turno/resumen', async (req, res) => {
     let salesWhere = `v.caja_id = ? AND v.usuario_id = ? AND DATE(v.fecha) = CURDATE()`;
     const salesParams = [cajaId, cajeroId];
     if (scope === 'session') {
-      salesWhere += ' AND (v.turno_id = ? OR (v.turno_id IS NULL AND v.fecha >= ?))';
-      salesParams.push(openShiftId, sessionStart);
+      salesWhere += ' AND v.fecha >= ? AND (v.turno_id = ? OR v.turno_id IS NULL)';
+      salesParams.push(sessionStart, openShiftId);
     }
 
     const [summaryRows] = await db.query(
-      `SELECT v.metodo_pago, COUNT(*) AS transacciones, COALESCE(SUM(v.total), 0) AS total
+      `SELECT vp.metodo_pago, COUNT(DISTINCT v.id_venta) AS transacciones, COALESCE(SUM(vp.monto), 0) AS total
        FROM ventas v
+       INNER JOIN venta_pagos vp ON vp.venta_id = v.id_venta
        WHERE ${salesWhere}
-       GROUP BY v.metodo_pago
-       ORDER BY v.metodo_pago ASC`,
+       GROUP BY vp.metodo_pago
+       ORDER BY FIELD(vp.metodo_pago, 'efectivo', 'tarjeta', 'dolares', 'transferencia', 'cheque', 'vale', 'otro'), vp.metodo_pago ASC`,
       salesParams
     );
 
@@ -5604,13 +9554,94 @@ app.get('/api/turno/resumen', async (req, res) => {
     const [detailRows] = await db.query(
       `SELECT v.id_venta, DATE_FORMAT(v.fecha, '%Y-%m-%d %H:%i:%s') AS fecha,
               COALESCE(NULLIF(v.folio_ticket, ''), CAST(v.numero_ticket AS CHAR)) AS numero_ticket,
-              v.metodo_pago, v.total
+              v.metodo_pago AS metodo_venta,
+              vp.metodo_pago, vp.monto AS total
        FROM ventas v
+       INNER JOIN venta_pagos vp ON vp.venta_id = v.id_venta
        WHERE ${salesWhere}
-       ORDER BY v.fecha ASC, v.id_venta ASC
-       LIMIT 500`,
+       ORDER BY v.fecha ASC, v.id_venta ASC,
+                FIELD(vp.metodo_pago, 'efectivo', 'tarjeta', 'dolares', 'transferencia', 'cheque', 'vale', 'otro')
+       LIMIT 1000`,
       salesParams
     );
+
+    const [mixedSalesRowsRaw] = await db.query(
+      `SELECT
+         v.id_venta,
+         v.folio_ticket,
+         v.monto_efectivo,
+         v.monto_tarjeta,
+         v.total
+       FROM ventas v
+       WHERE LOWER(v.metodo_pago) = 'mixto'
+         AND v.turno_id = ?
+       ORDER BY v.id_venta ASC
+       LIMIT 1000`,
+      [openShiftId]
+    );
+    const mixedSalesRows = (Array.isArray(mixedSalesRowsRaw) ? mixedSalesRowsRaw : []).map((row) => ({
+      id_venta: Number(row.id_venta || 0),
+      fecha: '',
+      numero_ticket: String(row.folio_ticket || '').trim(),
+      efectivo: toPositiveAmount(row.monto_efectivo, 0),
+      tarjeta: toPositiveAmount(row.monto_tarjeta, 0),
+      total: toPositiveAmount(row.total, 0),
+    }));
+    const [mixedSummaryRows] = await db.query(
+      `SELECT
+         COUNT(*) AS ventas_mixtas,
+         COALESCE(SUM(monto_efectivo), 0) AS efectivo_mixto,
+         COALESCE(SUM(monto_tarjeta), 0) AS tarjeta_mixto,
+         COALESCE(SUM(total), 0) AS total_mixto
+       FROM ventas
+       WHERE LOWER(metodo_pago) = 'mixto'
+         AND turno_id = ?`,
+      [openShiftId]
+    );
+    const mixedSummaryRow = Array.isArray(mixedSummaryRows) && mixedSummaryRows[0]
+      ? mixedSummaryRows[0]
+      : {};
+    const mixedSummary = {
+      count: toPositiveAmount(mixedSummaryRow.ventas_mixtas, 0),
+      efectivo: toPositiveAmount(mixedSummaryRow.efectivo_mixto, 0),
+      tarjeta: toPositiveAmount(mixedSummaryRow.tarjeta_mixto, 0),
+      total: toPositiveAmount(mixedSummaryRow.total_mixto, 0),
+      ventas_mixtas: toPositiveAmount(mixedSummaryRow.ventas_mixtas, 0),
+      efectivo_mixto: toPositiveAmount(mixedSummaryRow.efectivo_mixto, 0),
+      tarjeta_mixto: toPositiveAmount(mixedSummaryRow.tarjeta_mixto, 0),
+      total_mixto: toPositiveAmount(mixedSummaryRow.total_mixto, 0),
+    };
+    if (scope === 'session' && mixedSummary.count <= 0) {
+      const [mixedSummaryFallbackRows] = await db.query(
+        `SELECT
+           COUNT(*) AS ventas_mixtas,
+           COALESCE(SUM(v.monto_efectivo), 0) AS efectivo_mixto,
+           COALESCE(SUM(v.monto_tarjeta), 0) AS tarjeta_mixto,
+           COALESCE(SUM(v.total), 0) AS total_mixto
+         FROM ventas v
+         WHERE v.caja_id = ?
+           AND v.usuario_id = ?
+           AND DATE(v.fecha) = CURDATE()
+           AND v.fecha >= ?
+           AND (v.turno_id = ? OR v.turno_id IS NULL)
+           AND LOWER(v.metodo_pago) = 'mixto'`,
+        [cajaId, cajeroId, sessionStart, openShiftId]
+      );
+      const fallbackRow = Array.isArray(mixedSummaryFallbackRows) && mixedSummaryFallbackRows[0]
+        ? mixedSummaryFallbackRows[0]
+        : {};
+      const fallbackCount = toPositiveAmount(fallbackRow.ventas_mixtas, 0);
+      if (fallbackCount > 0) {
+        mixedSummary.count = fallbackCount;
+        mixedSummary.efectivo = toPositiveAmount(fallbackRow.efectivo_mixto, 0);
+        mixedSummary.tarjeta = toPositiveAmount(fallbackRow.tarjeta_mixto, 0);
+        mixedSummary.total = toPositiveAmount(fallbackRow.total_mixto, 0);
+        mixedSummary.ventas_mixtas = mixedSummary.count;
+        mixedSummary.efectivo_mixto = mixedSummary.efectivo;
+        mixedSummary.tarjeta_mixto = mixedSummary.tarjeta;
+        mixedSummary.total_mixto = mixedSummary.total;
+      }
+    }
 
     const [profitRows] = await db.query(
       `SELECT COALESCE(SUM((d.precio_unitario - COALESCE(p.costo, 0)) * d.cantidad), 0) AS ganancia
@@ -5622,7 +9653,7 @@ app.get('/api/turno/resumen', async (req, res) => {
     );
 
     const departmentParams = scope === 'session'
-      ? [cajaId, cajeroId, openShiftId, sessionStart]
+      ? [cajaId, cajeroId, sessionStart, openShiftId]
       : [cajaId, cajeroId];
     const [departmentRows] = await db.query(
       `SELECT dep.id_departamento,
@@ -5649,7 +9680,7 @@ app.get('/api/turno/resumen', async (req, res) => {
              AND v.caja_id = ?
              AND v.usuario_id = ?
              AND DATE(v.fecha) = CURDATE()
-             ${scope === 'session' ? 'AND (v.turno_id = ? OR (v.turno_id IS NULL AND v.fecha >= ?))' : ''}
+             ${scope === 'session' ? 'AND v.fecha >= ? AND (v.turno_id = ? OR v.turno_id IS NULL)' : ''}
        GROUP BY dep.id_departamento, dep.nombre
        ORDER BY dep.nombre ASC`,
       departmentParams
@@ -5696,56 +9727,33 @@ app.get('/api/turno/resumen', async (req, res) => {
       movementParams
     );
 
-    const [cashRows] = await db.query(
-      `SELECT COALESCE(SUM(
-          CASE
-            WHEN v.metodo_pago = 'efectivo' THEN v.total
-            WHEN v.metodo_pago = 'mixto' THEN
-              CASE
-                WHEN COALESCE(v.monto_efectivo, 0) > 0 THEN v.monto_efectivo
-                ELSE v.total / 2
-              END
-            ELSE 0
-          END
-        ), 0) AS total_efectivo
+    const [cashAndCardRows] = await db.query(
+      `SELECT
+         COALESCE(SUM(
+           CASE WHEN vp.metodo_pago = 'efectivo' THEN vp.monto ELSE 0 END
+         ), 0) AS total_efectivo,
+         COALESCE(SUM(
+           CASE WHEN ${buildCardLikeSqlList('vp')} THEN vp.monto ELSE 0 END
+         ), 0) AS total_tarjeta
        FROM ventas v
+       LEFT JOIN venta_pagos vp ON vp.venta_id = v.id_venta
        WHERE ${salesWhere}`,
       salesParams
     );
-    const efectivoVentas = Number(cashRows[0]?.total_efectivo || 0);
+    const efectivoVentas = Number(cashAndCardRows[0]?.total_efectivo || 0);
+    const tarjetaVentas = Number(cashAndCardRows[0]?.total_tarjeta || 0);
 
-    const [cardRows] = await db.query(
-      `SELECT COALESCE(SUM(
-          CASE
-            WHEN v.metodo_pago = 'tarjeta' THEN v.total
-            WHEN v.metodo_pago = 'mixto' THEN
-              CASE
-                WHEN COALESCE(v.monto_tarjeta, 0) > 0 THEN v.monto_tarjeta
-                ELSE v.total / 2
-              END
-            WHEN v.metodo_pago IN ('dolares', 'transferencia', 'cheque', 'vale') THEN v.total
-            ELSE 0
-          END
-        ), 0) AS total_tarjeta
-       FROM ventas v
-       WHERE ${salesWhere}`,
-      salesParams
-    );
-    const tarjetaVentas = Number(cardRows[0]?.total_tarjeta || 0);
-
-    const abonosEfectivo = movementDetailRows
-      .filter((row) => row.tipo === 'abono' && row.metodo === 'efectivo')
-      .reduce((acc, row) => acc + Number(row.monto || 0), 0);
-    const entradasDinero = movementSummaryRows
-      .filter((row) => row.tipo === 'entrada')
-      .reduce((acc, row) => acc + Number(row.total || 0), 0);
-    const salidasDinero = movementSummaryRows
-      .filter((row) => row.tipo === 'salida')
-      .reduce((acc, row) => acc + Number(row.total || 0), 0);
+    const abonosEfectivo = sumMovementAmounts(movementDetailRows, {
+      type: 'abono',
+      method: 'efectivo',
+      field: 'monto',
+    });
+    const entradasDinero = sumMovementAmounts(movementSummaryRows, { type: 'entrada', field: 'total' });
+    const salidasDinero = sumMovementAmounts(movementSummaryRows, { type: 'salida', field: 'total' });
 
     const totalVentas = Number(totalsRows[0]?.total || 0);
     const totalGanancia = Number(profitRows[0]?.ganancia || 0);
-    const esperadoEfectivo = Number(openShift.monto_inicial || 0) + efectivoVentas;
+    const esperadoEfectivo = Number(openShift.monto_inicial || 0) + efectivoVentas + abonosEfectivo + entradasDinero - salidasDinero;
     const dineroEnCaja = Number(openShift.monto_inicial || 0) + efectivoVentas + abonosEfectivo + entradasDinero - salidasDinero;
 
     return res.json({
@@ -5759,6 +9767,8 @@ app.get('/api/turno/resumen', async (req, res) => {
       resumen: summaryRows,
       totales: totalsRows[0] || { transacciones: 0, total: 0 },
       detalle: detailRows,
+      ventas_mixtas: mixedSalesRows,
+      resumen_mixto: mixedSummary,
       resumen_financiero: {
         fondo_caja: Number(openShift.monto_inicial || 0),
         ventas_efectivo: efectivoVentas,
@@ -5772,8 +9782,11 @@ app.get('/api/turno/resumen', async (req, res) => {
       },
       movimientos: {
         resumen: movementSummaryRows,
-        detalle_ingresos: movementDetailRows.filter((row) => row.tipo === 'abono' || row.tipo === 'entrada'),
-        detalle_salidas: movementDetailRows.filter((row) => row.tipo === 'salida'),
+        detalle_ingresos: movementDetailRows.filter((row) => {
+          const type = String(row.tipo || '').trim().toLowerCase();
+          return type === 'abono' || type === 'entrada';
+        }),
+        detalle_salidas: movementDetailRows.filter((row) => String(row.tipo || '').trim().toLowerCase() === 'salida'),
       },
       departamentos: departmentRows,
       top_productos_departamento: topProductsByDepartmentRows,
@@ -5812,8 +9825,8 @@ app.get('/api/turno/departamentos', async (req, res) => {
     let salesWhere = `v.caja_id = ? AND v.usuario_id = ? AND DATE(v.fecha) = CURDATE()`;
     const salesParams = [cajaId, cajeroId];
     if (scope === 'session') {
-      salesWhere += ' AND (v.turno_id = ? OR (v.turno_id IS NULL AND v.fecha >= ?))';
-      salesParams.push(openShiftId, sessionStart);
+      salesWhere += ' AND v.fecha >= ? AND (v.turno_id = ? OR v.turno_id IS NULL)';
+      salesParams.push(sessionStart, openShiftId);
     }
 
     const [departmentRows] = await db.query(
@@ -5851,7 +9864,7 @@ app.post('/api/cash-movements', async (req, res) => {
   const allowedMethods = new Set(['efectivo', 'tarjeta', 'dolares', 'transferencia', 'cheque', 'vale', 'otro']);
 
   if (!cajaId || !cajeroId || !allowedTypes.has(tipoRaw) || monto === null || monto <= 0) {
-    return res.status(400).json({ message: 'Datos inválidos para movimiento de caja' });
+    return res.status(400).json({ message: 'Datos invÃ¡lidos para movimiento de caja' });
   }
   if (tipoRaw === 'salida' && !descripcion) {
     return res.status(400).json({ message: 'La salida requiere descripcion' });
@@ -5915,13 +9928,15 @@ app.get('/api/reportes/ventas-detalle', async (req, res) => {
               v.usuario_id,
               COALESCE(u.nombre, '') AS cajero_nombre,
               v.caja_id,
-              v.metodo_pago,
-              v.total
+              vp.metodo_pago,
+              vp.monto AS total
        FROM ventas v
+       INNER JOIN venta_pagos vp ON vp.venta_id = v.id_venta
        LEFT JOIN usuarios u ON u.id = v.usuario_id
        WHERE ${filters.join(' AND ')}
-       ORDER BY v.fecha ASC, v.numero_ticket ASC
-       LIMIT 5000`,
+       ORDER BY v.fecha ASC, v.numero_ticket ASC,
+                FIELD(vp.metodo_pago, 'efectivo', 'tarjeta', 'dolares', 'transferencia', 'cheque', 'vale', 'otro')
+       LIMIT 6000`,
       values
     );
     return res.json(rows);
@@ -6132,12 +10147,14 @@ app.get('/api/reportes/chart-detail.csv', async (req, res) => {
         `SELECT DATE_FORMAT(v.fecha, '%Y-%m') AS periodo,
                 DATE_FORMAT(v.fecha, '%Y-%m-%d %H:%i:%s') AS fecha,
                 COALESCE(u.nombre, CONCAT('Cajero ', v.usuario_id)) AS cajero,
-                v.metodo_pago,
-                v.total
+                vp.metodo_pago,
+                vp.monto AS total
          FROM ventas v
+         INNER JOIN venta_pagos vp ON vp.venta_id = v.id_venta
          LEFT JOIN usuarios u ON u.id = v.usuario_id
          WHERE ${parsed.whereClause}
-         ORDER BY YEAR(v.fecha) ASC, MONTH(v.fecha) ASC, v.fecha ASC, v.id_venta ASC`,
+         ORDER BY YEAR(v.fecha) ASC, MONTH(v.fecha) ASC, v.fecha ASC, v.id_venta ASC,
+                  FIELD(vp.metodo_pago, 'efectivo', 'tarjeta', 'dolares', 'transferencia', 'cheque', 'vale', 'otro')`,
         parsed.values
       );
       headers = ['periodo', 'fecha', 'cajero', 'metodo_pago', 'total'];
@@ -6352,12 +10369,14 @@ app.get('/api/export/ventas.csv', async (req, res) => {
               v.usuario_id,
               COALESCE(u.nombre, '') AS cajero_nombre,
               v.caja_id,
-              v.metodo_pago,
-              v.total
+              vp.metodo_pago,
+              vp.monto AS total
        FROM ventas v
+       INNER JOIN venta_pagos vp ON vp.venta_id = v.id_venta
        LEFT JOIN usuarios u ON u.id = v.usuario_id
        WHERE ${filters.join(' AND ')}
-       ORDER BY v.fecha ASC, v.numero_ticket ASC`,
+       ORDER BY v.fecha ASC, v.numero_ticket ASC,
+                FIELD(vp.metodo_pago, 'efectivo', 'tarjeta', 'dolares', 'transferencia', 'cheque', 'vale', 'otro')`,
       values
     );
 
@@ -6723,45 +10742,39 @@ app.post('/api/corte/cerrar', async (req, res) => {
     const shiftStart = existing[0].hora_apertura;
 
     const [byPayment] = await db.query(
-      `SELECT metodo_pago, COUNT(*) AS transacciones, COALESCE(SUM(total), 0) AS total
-       FROM ventas
-       WHERE caja_id = ? AND usuario_id = ?
-         AND (turno_id = ? OR (turno_id IS NULL AND fecha >= ?))
-       GROUP BY metodo_pago`,
-      [cajaId, cajeroId, shiftId, shiftStart]
+      `SELECT vp.metodo_pago, COUNT(DISTINCT v.id_venta) AS transacciones, COALESCE(SUM(vp.monto), 0) AS total
+       FROM ventas v
+       INNER JOIN venta_pagos vp ON vp.venta_id = v.id_venta
+       WHERE v.caja_id = ? AND v.usuario_id = ?
+         AND v.fecha >= ?
+         AND (v.turno_id = ? OR v.turno_id IS NULL)
+       GROUP BY vp.metodo_pago`,
+      [cajaId, cajeroId, shiftStart, shiftId]
     );
 
     const [totals] = await db.query(
       `SELECT COUNT(*) AS transacciones, COALESCE(SUM(total), 0) AS total
        FROM ventas
        WHERE caja_id = ? AND usuario_id = ?
-         AND (turno_id = ? OR (turno_id IS NULL AND fecha >= ?))`,
-      [cajaId, cajeroId, shiftId, shiftStart]
+         AND fecha >= ?
+         AND (turno_id = ? OR turno_id IS NULL)`,
+      [cajaId, cajeroId, shiftStart, shiftId]
     );
 
     const [cashAndCardRows] = await db.query(
       `SELECT
          COALESCE(SUM(
-           CASE
-             WHEN metodo_pago = 'efectivo' THEN total
-             WHEN metodo_pago = 'mixto' THEN
-               CASE WHEN COALESCE(monto_efectivo, 0) > 0 THEN monto_efectivo ELSE total / 2 END
-             ELSE 0
-           END
+           CASE WHEN vp.metodo_pago = 'efectivo' THEN vp.monto ELSE 0 END
          ), 0) AS total_efectivo,
          COALESCE(SUM(
-           CASE
-             WHEN metodo_pago = 'tarjeta' THEN total
-             WHEN metodo_pago = 'mixto' THEN
-               CASE WHEN COALESCE(monto_tarjeta, 0) > 0 THEN monto_tarjeta ELSE total / 2 END
-             WHEN metodo_pago IN ('dolares', 'transferencia', 'cheque', 'vale') THEN total
-             ELSE 0
-           END
+           CASE WHEN ${buildCardLikeSqlList('vp')} THEN vp.monto ELSE 0 END
          ), 0) AS total_tarjeta
-       FROM ventas
-       WHERE caja_id = ? AND usuario_id = ?
-         AND (turno_id = ? OR (turno_id IS NULL AND fecha >= ?))`,
-      [cajaId, cajeroId, shiftId, shiftStart]
+       FROM ventas v
+       LEFT JOIN venta_pagos vp ON vp.venta_id = v.id_venta
+       WHERE v.caja_id = ? AND v.usuario_id = ?
+         AND v.fecha >= ?
+         AND (v.turno_id = ? OR v.turno_id IS NULL)`,
+      [cajaId, cajeroId, shiftStart, shiftId]
     );
 
     const [movementRows] = await db.query(
@@ -6769,24 +10782,19 @@ app.post('/api/corte/cerrar', async (req, res) => {
        FROM cash_movements
        WHERE caja_id = ?
          AND usuario_id = ?
-         AND DATE(fecha) = CURDATE()
-         AND (turno_id = ? OR (turno_id IS NULL AND fecha >= ?))
+         AND fecha >= ?
+         AND (turno_id = ? OR turno_id IS NULL)
+         AND fecha <= NOW()
        GROUP BY tipo`,
-      [cajaId, cajeroId, shiftId, shiftStart]
+      [cajaId, cajeroId, shiftStart, shiftId]
     );
 
     let totalEfectivo = Number(cashAndCardRows[0]?.total_efectivo || 0);
     let totalTarjeta = Number(cashAndCardRows[0]?.total_tarjeta || 0);
     let totalMixto = 0;
-    const entradasDinero = movementRows
-      .filter((row) => row.tipo === 'entrada')
-      .reduce((acc, row) => acc + Number(row.total || 0), 0);
-    const salidasDinero = movementRows
-      .filter((row) => row.tipo === 'salida')
-      .reduce((acc, row) => acc + Number(row.total || 0), 0);
-    const abonosEfectivo = movementRows
-      .filter((row) => row.tipo === 'abono')
-      .reduce((acc, row) => acc + Number(row.total || 0), 0);
+    const entradasDinero = sumMovementAmounts(movementRows, { type: 'entrada', field: 'total' });
+    const salidasDinero = sumMovementAmounts(movementRows, { type: 'salida', field: 'total' });
+    const abonosEfectivo = sumMovementAmounts(movementRows, { type: 'abono', field: 'total' });
 
     for (const row of byPayment) {
       const amount = Number(row.total) || 0;
@@ -6894,7 +10902,7 @@ app.post('/api/auth/refresh', async (req, res) => {
   try {
     const tokenHash = hashRefreshToken(refreshToken);
     const [sessionRows] = await db.query(
-      `SELECT id, user_id, caja_id, turno_id
+      `SELECT id, user_id, caja_id, sucursal_id, turno_id
        FROM user_auth_sessions
        WHERE token_hash = ?
          AND revoked_at IS NULL
@@ -6954,6 +10962,7 @@ app.post('/api/auth/refresh', async (req, res) => {
       refresh_token: newRefreshToken,
       token_expires_in: ACCESS_TOKEN_TTL_SECONDS,
       refresh_expires_in: REFRESH_TOKEN_TTL_SECONDS,
+      sucursal_id: toInt(authSession.sucursal_id) || 1,
     });
   } catch (error) {
     console.error('Error en refresh de sesion:', error);
@@ -6977,6 +10986,120 @@ app.post('/api/auth/logout', async (req, res) => {
   } catch (error) {
     console.error('Error al cerrar sesion por refresh token:', error);
     return res.status(500).json({ message: 'No se pudo cerrar sesion' });
+  }
+});
+
+app.post('/api/auth/verify-admin', async (req, res) => {
+  const usernameInput = toText(req.body?.username, 80);
+  const passwordInput = typeof req.body?.password === 'string' ? req.body.password : '';
+  const rawSectionId = toText(req.body?.section_id, 40);
+  const sectionId = rawSectionId ? rawSectionId.toLowerCase() : '';
+
+  if (!usernameInput || !passwordInput) {
+    return res.status(400).json({ message: 'Debes ingresar usuario y contraseña.' });
+  }
+
+  const sectionPermissionMap = {
+    configuration: ['configuracion_acceso'],
+    reports: ['reportes_ver'],
+    cut: ['corte_turno', 'corte_dia', 'corte_todos_turnos'],
+    product: ['productos_crear', 'productos_modificar', 'productos_eliminar', 'productos_reporte_ventas', 'productos_crear_promociones', 'productos_modificar_varios'],
+    inventory: ['inventario_agregar_mercancia', 'inventario_reportes_existencia', 'inventario_movimientos', 'inventario_ajustar'],
+    shopping: ['compras_crear_orden', 'compras_recibir_orden'],
+  };
+  const requiredPermissions = sectionPermissionMap[sectionId] || [];
+  const permissionSelect = requiredPermissions.length
+    ? `, ${requiredPermissions.map((field) => `COALESCE(p.\`${field}\`, 0) AS \`${field}\``).join(', ')}`
+    : '';
+
+  for (const field of requiredPermissions) {
+    if (!CASHIER_PERMISSION_FIELDS.includes(field)) {
+      return res.status(400).json({ message: 'Sección inválida para autorización.' });
+    }
+  }
+
+  try {
+    let rows = [];
+    let usedPermissionFallback = false;
+
+    try {
+      const [permissionRows] = await db.query(
+        `SELECT u.id, u.user, u.nombre, u.contrasena, u.es_administrador${permissionSelect}
+         FROM usuarios u
+         LEFT JOIN cajero_permisos p ON p.usuario_id = u.id
+         WHERE LOWER(u.user) = LOWER(?) OR LOWER(u.nombre) = LOWER(?)
+         ORDER BY u.id ASC
+         LIMIT 1`,
+        [usernameInput, usernameInput]
+      );
+      rows = permissionRows;
+    } catch (permissionQueryError) {
+      // Fallback defensivo: permite validar admin aunque la tabla/permisos esté desfasada.
+      usedPermissionFallback = true;
+      console.error('Fallback en verify-admin (consulta permisos):', permissionQueryError?.message || permissionQueryError);
+      const [basicRows] = await db.query(
+        `SELECT u.id, u.user, u.nombre, u.contrasena, u.es_administrador
+         FROM usuarios u
+         WHERE LOWER(u.user) = LOWER(?) OR LOWER(u.nombre) = LOWER(?)
+         ORDER BY u.id ASC
+         LIMIT 1`,
+        [usernameInput, usernameInput]
+      );
+      rows = basicRows;
+    }
+
+    if (!rows.length) {
+      return res.status(401).json({ message: 'Credenciales de administrador inválidas.' });
+    }
+
+    const user = rows[0];
+    const storedPassword = String(user.contrasena || '');
+    let passwordOk = false;
+    let shouldUpgradeHash = false;
+
+    if (storedPassword.startsWith('$2')) {
+      passwordOk = await bcrypt.compare(passwordInput, storedPassword);
+    } else {
+      passwordOk = storedPassword === passwordInput;
+      shouldUpgradeHash = passwordOk;
+    }
+
+    if (!passwordOk) {
+      return res.status(401).json({ message: 'Credenciales de administrador inválidas.' });
+    }
+
+    const isAdmin = Number(user.es_administrador || 0) === 1;
+    const hasSectionPermission = usedPermissionFallback
+      ? false
+      : requiredPermissions.some((field) => Number(user[field] || 0) === 1);
+    if (!isAdmin && !hasSectionPermission) {
+      if (requiredPermissions.length) {
+        if (usedPermissionFallback) {
+          return res.status(403).json({
+            message: 'No fue posible validar permisos por sección. Usa una cuenta administrador para autorizar.',
+          });
+        }
+        return res.status(403).json({ message: 'El usuario no tiene permisos para autorizar esta sección.' });
+      }
+      return res.status(403).json({ message: 'El usuario ingresado no tiene perfil administrador.' });
+    }
+
+    if (shouldUpgradeHash) {
+      const hashed = await bcrypt.hash(passwordInput, 12);
+      await db.query('UPDATE usuarios SET contrasena = ? WHERE id = ?', [hashed, user.id]);
+    }
+
+    return res.json({
+      success: true,
+      id: Number(user.id || 0),
+      username: String(user.user || '').trim(),
+      nombre: String(user.nombre || '').trim(),
+      is_admin: isAdmin,
+      section_authorized: isAdmin || hasSectionPermission,
+    });
+  } catch (error) {
+    console.error('Error verificando credenciales de administrador:', error);
+    return res.status(500).json({ message: 'No se pudo validar credenciales de administrador.' });
   }
 });
 
@@ -7026,6 +11149,27 @@ app.post('/api/login', async (req, res) => {
     }
 
     if (cajaId) {
+      const [boxRows] = await db.query(
+        `SELECT c.estado, s.activa AS sucursal_activa
+         FROM cajas c
+         LEFT JOIN sucursales s ON s.id_sucursal = c.sucursal_id
+         WHERE c.n_caja = ?
+         LIMIT 1`,
+        [cajaId]
+      );
+      if (!boxRows.length) {
+        return res.status(400).json({ message: `Caja ${cajaId} no registrada.` });
+      }
+      const boxActive = Number(boxRows[0]?.estado || 0) === 1;
+      const branchActive = Number(boxRows[0]?.sucursal_activa ?? 1) === 1;
+      if (!boxActive || !branchActive) {
+        return res.status(409).json({
+          message: `La caja numero Nro ${cajaId} ha sido desactivada, contactar al administrador para dar de alta la caja.`,
+          code: 'CAJA_DESACTIVADA',
+          caja_id: cajaId,
+        });
+      }
+
       const [openShiftRows] = await db.query(
         `SELECT c.usuario_id, u.nombre AS cajero_nombre
          FROM corte_caja c
@@ -7057,6 +11201,7 @@ app.post('/api/login', async (req, res) => {
     }
 
     let turnoId = null;
+    let sucursalId = 1;
     if (cajaId) {
       const [ownOpenShiftRows] = await db.query(
         `SELECT id_corte
@@ -7072,12 +11217,14 @@ app.post('/api/login', async (req, res) => {
       if (ownOpenShiftRows.length > 0) {
         turnoId = Number(ownOpenShiftRows[0].id_corte || 0) || null;
       }
+      sucursalId = await resolveBranchForCaja(cajaId);
     }
 
     const token = issueAccessToken(user.id, user.nombre);
     const refreshSession = await createRefreshSession({
       userId: Number(user.id),
       cajaId: cajaId || null,
+      sucursalId: sucursalId || 1,
       turnoId,
       deviceHash: deviceHash || null,
     });
@@ -7097,6 +11244,7 @@ app.post('/api/login', async (req, res) => {
       id: user.id,
       username: user.nombre,
       es_administrador: Number(user.es_administrador || 0),
+      sucursal_id: sucursalId || 1,
       permisos: permissions,
     });
   } catch (error) {
@@ -7166,15 +11314,11 @@ app.post('/api/productos', async (req, res) => {
       });
     }
 
-    const [formatoRows] = await db.query(
-      'SELECT id_formato FROM formato_venta WHERE LOWER(descripcion) = ? LIMIT 1',
-      [formatName]
-    );
-
-    if (formatoRows.length === 0) {
+    const resolvedFormatId = await resolveSaleFormatId(db, formatName);
+    if (!resolvedFormatId) {
       return res.status(400).json({ message: 'Formato de venta no valido' });
     }
-    const id_formato = formatoRows[0].id_formato;
+    const id_formato = resolvedFormatId;
 
     const [departamentoRows] = await db.query(
       'SELECT id_departamento FROM departamento WHERE nombre = ?',
@@ -7205,7 +11349,7 @@ app.post('/api/productos', async (req, res) => {
         costoNum,
         gananciaNum,
         priceNum,
-        invFlag,
+        invFlag ? 1 : 0,
         actualQty,
         minQty,
         maxQty,
@@ -7345,9 +11489,15 @@ app.post('/api/sales', async (req, res) => {
     const id = toInt(item.id_producto);
     const qty = toNumber(item.quantity);
     const unitPrice = toNumber(item.precio_venta);
+    const saleFormat = normalizeSaleFormatName(item.formato_venta || item.sale_format || item.formatoVenta || '');
+    const isBulk = saleFormat === 'granel';
+    const lineSubtotalInput = toNumber(
+      item.line_subtotal_clp ?? item.line_subtotal ?? item.subtotal_clp ?? item.subtotal
+    );
+    const lineSubtotal = lineSubtotalInput === null ? null : Math.max(0, toClpAmount(lineSubtotalInput, 0));
     const desc = typeof item.descripcion === 'string' ? item.descripcion.trim() : '';
     const isCommon = !id;
-    return { id, qty, unitPrice, desc, isCommon };
+    return { id, qty, unitPrice, lineSubtotal, isBulk, desc, isCommon };
   });
 
   if (items.some((item) => !Number.isFinite(item.qty) || item.qty <= 0)) {
@@ -7434,12 +11584,15 @@ app.post('/api/sales', async (req, res) => {
 
     for (const item of items) {
       if (item.isCommon) {
-        const subtotalCommon = item.unitPrice * item.qty;
+        const subtotalCommon = Number.isFinite(item.lineSubtotal)
+          ? item.lineSubtotal
+          : Math.max(0, toClpAmount(item.unitPrice * item.qty, 0));
+        const commonUnitPrice = Math.max(0, toClpAmount(item.unitPrice, 0));
         total += subtotalCommon;
         resolvedItems.push({
           ...item,
           subtotal: subtotalCommon,
-          effectiveUnitPrice: item.unitPrice,
+          effectiveUnitPrice: commonUnitPrice,
           promoLabel: null,
         });
         continue;
@@ -7454,23 +11607,26 @@ app.post('/api/sales', async (req, res) => {
         return res.status(409).json({ error: 'Stock insuficiente' });
       }
 
-      const basePrice = Number(record.precio_venta || 0);
+      const basePrice = Math.max(0, toClpAmount(record.precio_venta || 0, 0));
       let effectiveUnitPrice = basePrice;
       let promoLabel = null;
       const promoCandidates = singlePromotionRulesByProduct.get(item.id) || [];
-      if (promoCandidates.length) {
+      const shouldUseProvidedBulkSubtotal = item.isBulk && Number.isFinite(item.lineSubtotal) && item.lineSubtotal > 0;
+      if (promoCandidates.length && !shouldUseProvidedBulkSubtotal) {
         const applicable = promoCandidates
           .filter((promo) => promo.minQty > 0 && item.qty >= promo.minQty && promo.discountPercent > 0)
           .sort((a, b) => b.discountPercent - a.discountPercent)[0];
         if (applicable) {
-          const discountedUnit = Number((basePrice * (1 - (applicable.discountPercent / 100))).toFixed(2));
+          const discountedUnit = Math.max(0, toClpAmount(basePrice * (1 - (applicable.discountPercent / 100)), 0));
           if (discountedUnit >= 0) {
             effectiveUnitPrice = discountedUnit;
             promoLabel = `PROMOCION ${applicable.promotionName} (-${applicable.discountPercent}%)`;
           }
         }
       }
-      const subtotal = effectiveUnitPrice * item.qty;
+      const subtotal = shouldUseProvidedBulkSubtotal
+        ? item.lineSubtotal
+        : Math.max(0, toClpAmount(effectiveUnitPrice * item.qty, 0));
       total += subtotal;
       resolvedItems.push({
         ...item,
@@ -7513,15 +11669,19 @@ app.post('/api/sales', async (req, res) => {
           continue;
         }
 
-        const totalDiscount = Number((discountPerBundle * bundleCount).toFixed(2));
-        const sharePerProductPerBundle = totalDiscount / (required.length * bundleCount);
+        const totalDiscount = Math.max(0, toClpAmount(discountPerBundle * bundleCount, 0));
+        const discountPerProduct = required.length > 0 ? Math.floor(totalDiscount / required.length) : 0;
+        let discountRemainder = Math.max(0, totalDiscount - (discountPerProduct * required.length));
 
         required.forEach((id) => {
           availableUnits.set(id, Math.max(0, Number(availableUnits.get(id) || 0) - bundleCount));
           const item = itemByProductId.get(id);
           if (!item) return;
-          const addDiscount = Number((sharePerProductPerBundle * bundleCount).toFixed(2));
-          item.comboDiscount = Number((Number(item.comboDiscount || 0) + addDiscount).toFixed(2));
+          const addDiscount = discountPerProduct + (discountRemainder > 0 ? 1 : 0);
+          if (discountRemainder > 0) {
+            discountRemainder -= 1;
+          }
+          item.comboDiscount = Math.max(0, toClpAmount(Number(item.comboDiscount || 0), 0) + addDiscount);
           const comboLabel = `COMBO ${combo.promotionName}`;
           if (item.promoLabel) {
             if (!item.promoLabel.includes(comboLabel)) {
@@ -7532,34 +11692,38 @@ app.post('/api/sales', async (req, res) => {
           }
         });
 
-        total = Number((Math.max(0, total - totalDiscount)).toFixed(2));
+        total = Math.max(0, toClpAmount(total - totalDiscount, 0));
       }
     }
 
-    let montoEfectivo = 0;
-    let montoTarjeta = 0;
-    if (paymentMethod === 'efectivo') {
-      montoEfectivo = total;
-    } else if (paymentMethod === 'tarjeta') {
-      montoTarjeta = total;
-    } else if (paymentMethod === 'mixto') {
-      if (Number.isFinite(efectivoIn) && Number.isFinite(tarjetaIn) && efectivoIn >= 0 && tarjetaIn >= 0) {
-        const paid = efectivoIn + tarjetaIn;
-        if (paid > 0) {
-          const factor = total / paid;
-          montoEfectivo = Number((efectivoIn * factor).toFixed(2));
-          montoTarjeta = Number((total - montoEfectivo).toFixed(2));
-        } else {
-          montoEfectivo = Number((total / 2).toFixed(2));
-          montoTarjeta = Number((total - montoEfectivo).toFixed(2));
-        }
-      } else {
-        montoEfectivo = Number((total / 2).toFixed(2));
-        montoTarjeta = Number((total - montoEfectivo).toFixed(2));
+    total = Math.max(0, toClpAmount(total, 0));
+
+    if (paymentMethod === 'mixto') {
+      const tarjetaIngresada = Number.isFinite(tarjetaIn) && tarjetaIn >= 0
+        ? Math.max(0, toClpAmount(tarjetaIn, 0))
+        : 0;
+      const efectivoIngresado = Number.isFinite(efectivoIn) && efectivoIn >= 0
+        ? Math.max(0, toClpAmount(efectivoIn, 0))
+        : 0;
+      if (tarjetaIngresada > total) {
+        await connection.rollback();
+        return res.status(400).json({ error: 'Pago mixto invalido: tarjeta supera total de la venta' });
       }
-    } else {
-      montoTarjeta = total;
+      const efectivoRequerido = Math.max(0, total - tarjetaIngresada);
+      if (efectivoIngresado < efectivoRequerido) {
+        await connection.rollback();
+        return res.status(400).json({ error: `Pago mixto invalido: faltan ${efectivoRequerido - efectivoIngresado} en efectivo` });
+      }
     }
+
+    const paymentSplit = buildSalePaymentAllocationsFromLegacyRow({
+      metodo_pago: paymentMethod,
+      total,
+      monto_efectivo: efectivoIn,
+      monto_tarjeta: tarjetaIn,
+    });
+    const montoEfectivo = paymentSplit.montoEfectivo;
+    const montoTarjeta = paymentSplit.montoTarjeta;
 
     const openShiftId = Number(turnRows[0].id_corte);
     const openShiftStart = turnRows[0].hora_apertura;
@@ -7569,29 +11733,33 @@ app.post('/api/sales', async (req, res) => {
       cajeroId,
       horaApertura: openShiftStart,
     });
+    const sucursalId = await resolveBranchForCaja(cajaId, connection);
     const expectedTicket = Math.max(1, Number(ticketState.numero_actual || 1) || 1);
     const ticketToUse = Math.max(ticketNumber, expectedTicket);
     const [folioRows] = await connection.query('SELECT prefix, digits FROM folio_settings WHERE id = 1 LIMIT 1');
     const folioSettings = folioRows[0] || { prefix: '', digits: 1 };
     const formattedTicket = buildFormattedTicketNumber(ticketToUse, folioSettings);
     const [result] = await connection.query(
-      'INSERT INTO ventas (fecha, numero_ticket, folio_ticket, usuario_id, metodo_pago, caja_id, turno_id, total, monto_efectivo, monto_tarjeta) VALUES (now(), ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [ticketToUse, formattedTicket, cajeroId, paymentMethod, cajaId, openShiftId, total, montoEfectivo, montoTarjeta]
+      'INSERT INTO ventas (fecha, numero_ticket, folio_ticket, usuario_id, metodo_pago, caja_id, sucursal_id, turno_id, total, monto_efectivo, monto_tarjeta) VALUES (now(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [ticketToUse, formattedTicket, cajeroId, paymentMethod, cajaId, sucursalId, openShiftId, total, montoEfectivo, montoTarjeta]
     );
 
     const ventaId = result.insertId;
+    await insertSalePaymentAllocations(connection, ventaId, paymentSplit.allocations);
 
     for (const item of resolvedItems) {
       if (item.isCommon) {
+        const commonSubtotal = Math.max(0, toClpAmount(item.subtotal || 0, 0));
+        const commonUnitPrice = Math.max(0, toClpAmount(item.effectiveUnitPrice || item.unitPrice || 0, 0));
         await connection.query(
           'INSERT INTO detalle_venta (venta_id, producto_id, cantidad, precio_unitario, subtotal, descripcion) VALUES (?, NULL, ?, ?, ?, ?)',
-          [ventaId, item.qty, item.unitPrice, item.subtotal, item.desc]
+          [ventaId, item.qty, commonUnitPrice, commonSubtotal, item.desc]
         );
         continue;
       }
       const record = productMap.get(item.id);
-      const adjustedSubtotal = Number(Math.max(0, Number(item.subtotal || 0) - Number(item.comboDiscount || 0)).toFixed(2));
-      const adjustedUnitPrice = Number((adjustedSubtotal / Number(item.qty || 1)).toFixed(2));
+      const adjustedSubtotal = Math.max(0, toClpAmount(Number(item.subtotal || 0) - Number(item.comboDiscount || 0), 0));
+      const adjustedUnitPrice = Math.max(0, toClpAmount(adjustedSubtotal / Number(item.qty || 1), 0));
       const detailDescription = item.promoLabel
         ? `${item.productDescription || ''} (${item.promoLabel})`.trim()
         : null;
@@ -7643,8 +11811,8 @@ app.post('/api/sales', async (req, res) => {
       if (shouldOpenDrawer) {
         let drawerPrinter = String(drawer.drawer_printer_name || '').trim();
         if (!drawerPrinter) {
-          const [ticketRows] = await db.query('SELECT printer_name FROM ticket_settings WHERE id = 1 LIMIT 1');
-          drawerPrinter = String(ticketRows[0]?.printer_name || '').trim();
+          const ticketSettings = await getTicketSettingsForCaja(cajaId);
+          drawerPrinter = String(ticketSettings?.printer_name || '').trim();
         }
         await sendCashDrawerPulse({
           connectionType: String(drawer.drawer_connection || 'printer_usb'),
@@ -7775,30 +11943,40 @@ app.post('/api/addCaja', async (req, res) => {
   const cajaName = toText(nombre_caja, 120);
   const boxState = toBool(estado);
   const deviceHash = normalizeDeviceHash(fingerprint);
+  const requestedBranchId = toInt(req.body?.sucursal_id);
 
   if (!isValidCajaNumber(cajaId) || !cajaName || boxState === null) {
     return res.status(400).json({ error: 'Datos incompletos o invalidos' });
   }
 
   try {
+    const branchId = requestedBranchId || 1;
+    const [branchRows] = await db.query(
+      'SELECT id_sucursal, activa FROM sucursales WHERE id_sucursal = ? LIMIT 1',
+      [branchId]
+    );
+    if (!branchRows.length) {
+      return res.status(400).json({ error: 'Sucursal no valida' });
+    }
     await db.query(
-      'INSERT INTO cajas (n_caja, nombre_caja, estado ) VALUES (?, ?, ?)',
-      [cajaId, cajaName, boxState]
+      'INSERT INTO cajas (n_caja, nombre_caja, sucursal_id, estado ) VALUES (?, ?, ?, ?)',
+      [cajaId, cajaName, branchId, boxState]
     );
 
     if (deviceHash) {
       await db.query(
-        `INSERT INTO device_caja_bindings (device_hash, numero_caja, nombre_caja, source, last_seen)
-         VALUES (?, ?, ?, 'addCaja', NOW())
+        `INSERT INTO device_caja_bindings (device_hash, numero_caja, sucursal_id, nombre_caja, source, last_seen)
+         VALUES (?, ?, ?, ?, 'addCaja', NOW())
          ON DUPLICATE KEY UPDATE
            numero_caja = VALUES(numero_caja),
+           sucursal_id = VALUES(sucursal_id),
            nombre_caja = VALUES(nombre_caja),
            source = 'addCaja',
            last_seen = NOW()`,
-        [deviceHash, cajaId, cajaName]
+        [deviceHash, cajaId, branchId, cajaName]
       );
     }
-    res.json({ success: true });
+    res.json({ success: true, sucursal_id: branchId });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Error al registrar la caja nueva del local' });
@@ -7810,6 +11988,7 @@ app.post('/api/cajas/upsert', async (req, res) => {
   const cajaName = toText(req.body?.nombre_caja, 120);
   const boxState = toBool(req.body?.estado);
   const deviceHash = normalizeDeviceHash(req.body?.fingerprint);
+  const requestedBranchId = toInt(req.body?.sucursal_id);
 
   if (!isValidCajaNumber(cajaId) || !cajaName || boxState === null) {
     return res.status(400).json({ error: 'Datos de caja incompletos o invalidos' });
@@ -7829,6 +12008,16 @@ app.post('/api/cajas/upsert', async (req, res) => {
       return res.status(409).json({ error: 'El nombre de caja ya esta en uso' });
     }
 
+    const branchId = requestedBranchId || 1;
+    const [branchRows] = await connection.query(
+      'SELECT id_sucursal FROM sucursales WHERE id_sucursal = ? LIMIT 1',
+      [branchId]
+    );
+    if (!branchRows.length) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Sucursal no valida' });
+    }
+
     const [existsRows] = await connection.query(
       'SELECT id_caja FROM cajas WHERE n_caja = ? LIMIT 1',
       [cajaId]
@@ -7837,8 +12026,8 @@ app.post('/api/cajas/upsert', async (req, res) => {
     let mode = 'updated';
     if (existsRows.length > 0) {
       await connection.query(
-        'UPDATE cajas SET nombre_caja = ?, estado = ? WHERE n_caja = ?',
-        [cajaName, boxState, cajaId]
+        'UPDATE cajas SET nombre_caja = ?, sucursal_id = ?, estado = ? WHERE n_caja = ?',
+        [cajaName, branchId, boxState, cajaId]
       );
     } else {
       const [countRows] = await connection.query(
@@ -7851,22 +12040,23 @@ app.post('/api/cajas/upsert', async (req, res) => {
       }
 
       await connection.query(
-        'INSERT INTO cajas (n_caja, nombre_caja, estado) VALUES (?, ?, ?)',
-        [cajaId, cajaName, boxState]
+        'INSERT INTO cajas (n_caja, nombre_caja, sucursal_id, estado) VALUES (?, ?, ?, ?)',
+        [cajaId, cajaName, branchId, boxState]
       );
       mode = 'created';
     }
 
     if (deviceHash) {
       await connection.query(
-        `INSERT INTO device_caja_bindings (device_hash, numero_caja, nombre_caja, source, last_seen)
-         VALUES (?, ?, ?, 'cajas_upsert', NOW())
+        `INSERT INTO device_caja_bindings (device_hash, numero_caja, sucursal_id, nombre_caja, source, last_seen)
+         VALUES (?, ?, ?, ?, 'cajas_upsert', NOW())
          ON DUPLICATE KEY UPDATE
            numero_caja = VALUES(numero_caja),
+           sucursal_id = VALUES(sucursal_id),
            nombre_caja = VALUES(nombre_caja),
            source = 'cajas_upsert',
            last_seen = NOW()`,
-        [deviceHash, cajaId, cajaName]
+        [deviceHash, cajaId, branchId, cajaName]
       );
     }
 
@@ -7877,6 +12067,7 @@ app.post('/api/cajas/upsert', async (req, res) => {
       caja: {
         n_caja: cajaId,
         nombre_caja: cajaName,
+        sucursal_id: branchId,
         estado: boxState ? 1 : 0,
       },
     });
@@ -7891,12 +12082,193 @@ app.post('/api/cajas/upsert', async (req, res) => {
   }
 });
 
+app.delete('/api/cajas/:numero', async (req, res) => {
+  const cajaId = toInt(req.params?.numero);
+  if (!isValidCajaNumber(cajaId)) {
+    return res.status(400).json({ error: 'Numero de caja invalido' });
+  }
+
+  let connection;
+  try {
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+
+    const [existsRows] = await connection.query(
+      'SELECT id_caja, nombre_caja, estado FROM cajas WHERE n_caja = ? LIMIT 1',
+      [cajaId]
+    );
+    if (!existsRows.length) {
+      await connection.rollback();
+      return res.status(404).json({ error: 'Caja no encontrada' });
+    }
+
+    const [openTurnRows] = await connection.query(
+      `SELECT id_corte
+       FROM corte_caja
+       WHERE caja_id = ? AND fecha = CURDATE() AND estado = 'abierto'
+       LIMIT 1`,
+      [cajaId]
+    );
+    if (openTurnRows.length) {
+      await connection.rollback();
+      return res.status(409).json({ error: 'No se puede eliminar: la caja tiene un turno abierto' });
+    }
+
+    const currentState = Number(existsRows[0]?.estado || 0) === 1 ? 1 : 0;
+    if (currentState === 0) {
+      await connection.commit();
+      return res.json({ success: true, mode: 'already_inactive' });
+    }
+
+    await connection.query(
+      'UPDATE cajas SET estado = 0 WHERE n_caja = ?',
+      [cajaId]
+    );
+
+    await connection.commit();
+    return res.json({ success: true, mode: 'deactivated' });
+  } catch (err) {
+    if (connection) {
+      try { await connection.rollback(); } catch (_) {}
+    }
+    console.error('Error al eliminar caja:', err);
+    return res.status(500).json({ error: 'No se pudo eliminar la caja' });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
 //----------------------------PUTs----------------------------------------------------
+
+// actualiza solo inventario de un producto por codigo de barras
+app.put('/api/productos/:code/inventory', async (req, res) => {
+  const { code } = req.params;
+  const body = req.body || {};
+  const qty = toNumber(body.cantidad_actual);
+  const minQty = toNumber(body.cantidad_minima);
+  const maxQty = toNumber(body.cantidad_maxima);
+  const useInventory = toBool(body.utiliza_inventario);
+  const cost = toNumber(body.costo);
+  const salePrice = toNumber(body.precio_venta);
+  const profit = roundToDecimals(body.ganancia ?? 0, 2);
+  const movementTypeInput = normalizeInventoryMovementType(body.movement_type);
+  const movementNoteRaw = typeof body.especificacion === 'string'
+    ? body.especificacion.trim().slice(0, 255)
+    : '';
+  const movementNote = movementNoteRaw || null;
+  const requestedCajaId = toInt(body.caja_id);
+  const authUserId = toInt(req.user?.sub) || null;
+
+  if (qty === null || qty < 0) {
+    return res.status(400).json({ error: 'Cantidad invalida' });
+  }
+  if (minQty !== null && minQty < 0) {
+    return res.status(400).json({ error: 'Stock minimo invalido' });
+  }
+  if (maxQty !== null && maxQty < 0) {
+    return res.status(400).json({ error: 'Stock maximo invalido' });
+  }
+  if (minQty !== null && maxQty !== null && maxQty > 0 && minQty > maxQty) {
+    return res.status(400).json({ error: 'Stock minimo no puede ser mayor al maximo' });
+  }
+
+  try {
+    const [rows] = await db.query(
+      `SELECT id_producto, codigo_barras, descripcion, cantidad_actual
+       FROM productos
+       WHERE codigo_barras = ?
+       LIMIT 1`,
+      [code]
+    );
+    if (!rows.length) {
+      return res.status(404).json({ error: 'Producto no encontrado' });
+    }
+    const product = rows[0];
+    const previousQty = Number(product.cantidad_actual || 0);
+    const safePreviousQty = Number.isFinite(previousQty) ? previousQty : 0;
+    const safeNewQty = Number.isFinite(qty) ? Number(qty.toFixed(3)) : 0;
+
+    const updates = ['cantidad_actual = ?'];
+    const params = [qty];
+
+    if (minQty !== null) {
+      updates.push('cantidad_minima = ?');
+      params.push(minQty);
+    }
+    if (maxQty !== null) {
+      updates.push('cantidad_maxima = ?');
+      params.push(maxQty);
+    }
+    if (useInventory !== null) {
+      updates.push('utiliza_inventario = ?');
+      params.push(useInventory ? 1 : 0);
+    }
+    if (cost !== null) {
+      updates.push('costo = ?');
+      params.push(cost);
+    }
+    if (salePrice !== null) {
+      updates.push('precio_venta = ?');
+      params.push(salePrice);
+    }
+    if (profit !== null) {
+      updates.push('ganancia = ?');
+      params.push(profit);
+    }
+
+    params.push(code);
+    await db.query(
+      `UPDATE productos SET ${updates.join(', ')} WHERE codigo_barras = ?`,
+      params
+    );
+
+    const qtyDelta = Number((safeNewQty - safePreviousQty).toFixed(3));
+    const movementType = movementTypeInput || (qtyDelta < 0 ? 'ajuste' : 'modificacion');
+    let movementLogged = false;
+    try {
+      const resolvedCajaId = requestedCajaId && requestedCajaId > 0
+        ? requestedCajaId
+        : await resolveCurrentCajaIdForUser(authUserId, db);
+      await db.query(
+        `INSERT INTO inventory_movements (
+          fecha, producto_id, codigo_barras, producto_descripcion, tipo_movimiento,
+          cantidad_anterior, cambio_cantidad, cantidad_nueva, especificacion, caja_id, usuario_id
+        ) VALUES (
+          NOW(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        )`,
+        [
+          Number(product.id_producto || 0),
+          String(product.codigo_barras || code),
+          String(product.descripcion || ''),
+          movementType,
+          safePreviousQty,
+          qtyDelta,
+          safeNewQty,
+          movementNote,
+          resolvedCajaId,
+          authUserId,
+        ]
+      );
+      movementLogged = true;
+    } catch (movementError) {
+      console.error('No se pudo registrar movimiento de inventario:', movementError);
+    }
+
+    return res.json({
+      message: 'Inventario actualizado correctamente',
+      movement_logged: movementLogged,
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Base de datos error' });
+  }
+});
 
 // actualiza producto por codigo de barras
 app.put('/api/productos/:code', async (req, res) => {
   const { code } = req.params;
   const body = req.body || {};
+  const newBarcode = toText(body.codigo_barras, 80);
   const description = toText(body.descripcion, 255);
   const formatName = normalizeSaleFormatName(body.formato_venta);
   const salePrice = toNumber(body.precio_venta);
@@ -7912,7 +12284,7 @@ app.put('/api/productos/:code', async (req, res) => {
     : toInt(body.supplier_id);
   const taxExempt = toBool(body.exento_iva);
 
-  if (!description || !formatName || salePrice === null || cost === null || profit === null || qty === null || minQty === null || maxQty === null || useInventory === null || taxExempt === null || !departmentName) {
+  if (!newBarcode || !description || !formatName || salePrice === null || cost === null || profit === null || qty === null || minQty === null || maxQty === null || useInventory === null || taxExempt === null || !departmentName) {
     return res.status(400).json({ error: 'Datos incompletos o invalidos' });
   }
   if ([salePrice, cost, profit, qty, minQty, maxQty].some((value) => value < 0)) {
@@ -7923,11 +12295,8 @@ app.put('/api/productos/:code', async (req, res) => {
   }
 
   try {
-    const [formatRows] = await db.query(
-      'SELECT id_formato FROM formato_venta WHERE LOWER(descripcion) = ? LIMIT 1',
-      [formatName]
-    );
-    if (!formatRows.length) {
+    const resolvedFormatId = await resolveSaleFormatId(db, formatName);
+    if (!resolvedFormatId) {
       return res.status(400).json({ error: 'Formato de venta no encontrado' });
     }
 
@@ -7944,15 +12313,27 @@ app.put('/api/productos/:code', async (req, res) => {
         return res.status(400).json({ error: 'Proveedor no encontrado' });
       }
     }
+    const [duplicateRows] = await db.query(
+      `SELECT id_producto
+       FROM productos
+       WHERE TRIM(codigo_barras) = TRIM(?)
+         AND TRIM(codigo_barras) <> TRIM(?)
+       LIMIT 1`,
+      [newBarcode, code]
+    );
+    if (duplicateRows.length) {
+      return res.status(409).json({ error: 'El codigo de barras ya esta en uso', code: 'PRODUCT_CODE_EXISTS' });
+    }
     const [result] = await db.query(
       `UPDATE productos
-           SET descripcion = ?, id_formato = ?, precio_venta = ?, costo = ?, ganancia = ?,
+           SET codigo_barras = ?, descripcion = ?, id_formato = ?, precio_venta = ?, costo = ?, ganancia = ?,
            cantidad_actual = ?, cantidad_minima = ?, cantidad_maxima = ?, utiliza_inventario = ?,
            id_departamento = ?, supplier_id = ?, exento_iva = ?
        WHERE codigo_barras = ?`,
       [
+        newBarcode,
         description,
-        formatRows[0].id_formato,
+        resolvedFormatId,
         salePrice,
         cost,
         profit,

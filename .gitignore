@@ -17,11 +17,14 @@ server/node_modules/
 .env
 .env.*
 server/.env
+server/.jwt_secret
 
 # Build / installer outputs
 installer_bundle/payload/
 installer_bundle/dist/
+installer_bundle/installers/*.exe
+installer_bundle/installers/*.msi
+!installer_bundle/installers/README.md
 
 # Runtime / storage
 server/storage/
-
