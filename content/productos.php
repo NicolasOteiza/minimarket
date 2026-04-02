@@ -127,7 +127,7 @@
         <h3>Promociones</h3>
         <div class="promo-layout">
             <div class="promo-column">
-                <h4 class="panel-upcoming-title" style="margin-bottom:8px;">Crear promoci&oacute;n</h4>
+                <h4 id="promo-form-title" class="panel-upcoming-title" style="margin-bottom:8px;">Crear promoci&oacute;n</h4>
                 <div class="form-row"><label>Nombre promoci&oacute;n</label><input type="text" id="promo-name" placeholder="Ej: 3x2 Bebidas"></div>
                 <div class="form-row">
                     <label>Tipo de promoci&oacute;n</label>
@@ -148,8 +148,9 @@
                     <ul id="promo-selected-products" class="product-list"></ul>
                 </div>
                 <div class="form-row form-actions promo-actions-row">
-                    <button class="btn" type="button" onclick="createPromotion()">Guardar promoci&oacute;n</button>
-                    <button class="btn" type="button" onclick="clearPromotionSelection()">Limpiar selecci&oacute;n</button>
+                    <button id="promo-save-btn" class="btn" type="button" onclick="createPromotion()">Guardar promoci&oacute;n</button>
+                    <button class="btn" type="button" onclick="clearPromotionForm()">Limpiar formulario</button>
+                    <button id="promo-cancel-edit-btn" class="btn hidden" type="button" onclick="cancelPromotionEdit()">Cancelar edici&oacute;n</button>
                 </div>
             </div>
             <div class="promo-column">

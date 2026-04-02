@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
@@ -132,6 +132,31 @@ function toClpAmount(value, fallback = 0) {
   const num = toNumber(value);
   if (num === null) return fallback;
   return Math.round(num);
+}
+
+function roundPromoAmountToNearestTen(value, fallback = 0) {
+  const roundedInteger = toClpAmount(value, fallback);
+  return Math.round(roundedInteger / 10) * 10;
+}
+
+function parseSinglePromotionPattern(name = '') {
+  const raw = String(name || '').trim();
+  if (!raw) return null;
+  const match = raw.match(/(\d+)\s*x\s*(\d+)/i);
+  if (!match) return null;
+  const buyQty = Number(match[1] || 0);
+  const payQty = Number(match[2] || 0);
+  if (!Number.isFinite(buyQty) || !Number.isFinite(payQty) || buyQty < 2 || payQty < 1 || payQty >= buyQty) {
+    return null;
+  }
+  const discountPercent = Math.round(((1 - (payQty / buyQty)) * 100) * 100) / 100;
+  if (!Number.isFinite(discountPercent) || discountPercent <= 0 || discountPercent >= 100) {
+    return null;
+  }
+  return {
+    minQty: Math.trunc(buyQty),
+    discountPercent,
+  };
 }
 
 function toBool(value) {
@@ -360,7 +385,7 @@ function isIsoDate(value) {
 function normalizeInventoryMovementType(value) {
   const raw = String(value || '').trim().toLowerCase();
   if (raw === 'ajuste') return 'ajuste';
-  if (raw === 'modificacion' || raw === 'modificaciÃ³n') return 'modificacion';
+  if (raw === 'modificacion' || raw === 'modificaciÃƒÂ³n') return 'modificacion';
   return null;
 }
 
@@ -2852,6 +2877,15 @@ async function ensureOperationalTables() {
   if (!salesCurrentLegacy.has('folio_ticket')) {
     await db.query('ALTER TABLE ventas ADD COLUMN folio_ticket VARCHAR(16) NULL AFTER numero_ticket');
   }
+  if (!salesCurrentLegacy.has('pago_modificado')) {
+    await db.query('ALTER TABLE ventas ADD COLUMN pago_modificado TINYINT(1) NOT NULL DEFAULT 0 AFTER monto_tarjeta');
+  }
+  if (!salesCurrentLegacy.has('pago_modificado_at')) {
+    await db.query('ALTER TABLE ventas ADD COLUMN pago_modificado_at DATETIME NULL AFTER pago_modificado');
+  }
+  if (!salesCurrentLegacy.has('pago_modificado_por')) {
+    await db.query('ALTER TABLE ventas ADD COLUMN pago_modificado_por INT NULL AFTER pago_modificado_at');
+  }
 
   await db.query(`
     CREATE TABLE IF NOT EXISTS venta_pagos (
@@ -4106,7 +4140,7 @@ app.post('/api/cajeros', async (req, res) => {
   const permisos = buildCashierPermissions(req.body?.permisos || {});
 
   if (!username || !nombre || !plainPassword || plainPassword.length < 4) {
-    return res.status(400).json({ error: 'Datos de cajero invÃ¡lidos' });
+    return res.status(400).json({ error: 'Datos de cajero invÃƒÂ¡lidos' });
   }
 
   let connection;
@@ -4159,7 +4193,7 @@ app.put('/api/cajeros/:id', async (req, res) => {
   const permisos = buildCashierPermissions(req.body?.permisos || {});
 
   if (!userId || !username || !nombre) {
-    return res.status(400).json({ error: 'Datos de cajero invÃ¡lidos' });
+    return res.status(400).json({ error: 'Datos de cajero invÃƒÂ¡lidos' });
   }
 
   let connection;
@@ -4181,7 +4215,7 @@ app.put('/api/cajeros/:id', async (req, res) => {
 
     if (plainPassword && plainPassword.length < 4) {
       await connection.rollback();
-      return res.status(400).json({ error: 'La contraseÃ±a debe tener al menos 4 caracteres' });
+      return res.status(400).json({ error: 'La contraseÃƒÂ±a debe tener al menos 4 caracteres' });
     }
 
     if (plainPassword) {
@@ -4226,7 +4260,7 @@ app.put('/api/cajeros/:id', async (req, res) => {
 app.delete('/api/cajeros/:id', async (req, res) => {
   const userId = toInt(req.params?.id);
   if (!userId) {
-    return res.status(400).json({ error: 'ID de cajero invÃ¡lido' });
+    return res.status(400).json({ error: 'ID de cajero invÃƒÂ¡lido' });
   }
 
   let connection;
@@ -5605,7 +5639,7 @@ app.post('/api/purchase-order/close', async (req, res) => {
     );
     if (missingRows.length && !forceClose) {
       return res.status(409).json({
-        message: 'AÃºn faltan productos por ingresar en este pedido.',
+        message: 'AÃƒÂºn faltan productos por ingresar en este pedido.',
         missing_items: missingRows,
       });
     }
@@ -5676,7 +5710,7 @@ app.get('/api/purchase-orders/summary', async (req, res) => {
 app.get('/api/purchase-order/:id/detail', async (req, res) => {
   const orderId = toInt(req.params?.id);
   if (!orderId) {
-    return res.status(400).json({ message: 'Orden invÃ¡lida' });
+    return res.status(400).json({ message: 'Orden invÃƒÂ¡lida' });
   }
   try {
     const [orderRows] = await db.query(
@@ -5807,7 +5841,7 @@ app.post('/api/purchase-order/items', async (req, res) => {
 app.delete('/api/purchase-order/items/:itemId', async (req, res) => {
   const itemId = toInt(req.params?.itemId);
   if (!itemId) {
-    return res.status(400).json({ message: 'Item invÃ¡lido para eliminar' });
+    return res.status(400).json({ message: 'Item invÃƒÂ¡lido para eliminar' });
   }
 
   try {
@@ -5960,13 +5994,13 @@ app.post('/api/purchase-order/assign-email', async (req, res) => {
             <div style="font-size:12px; opacity:.95;">Solicitada por: ${String(requesterName || 'Usuario del sistema').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>
           </div>
           <div style="padding:14px 18px; color:#0f172a; font-size:13px;">
-            ${note ? `<div style="margin-bottom:10px;"><strong>ObservaciÃ³n:</strong> ${String(note).replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>` : ''}
+            ${note ? `<div style="margin-bottom:10px;"><strong>ObservaciÃƒÂ³n:</strong> ${String(note).replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>` : ''}
             <table role="presentation" cellspacing="0" cellpadding="0" style="width:100%; border-collapse:collapse; border:1px solid #e2e8f0;">
               <thead>
                 <tr style="background:#e2e8f0;">
                   <th style="padding:10px 8px; font-size:12px; text-align:left; color:#0f172a;">#</th>
                   <th style="padding:10px 8px; font-size:12px; text-align:left; color:#0f172a;">Producto</th>
-                  <th style="padding:10px 8px; font-size:12px; text-align:left; color:#0f172a;">CÃ³digo</th>
+                  <th style="padding:10px 8px; font-size:12px; text-align:left; color:#0f172a;">CÃƒÂ³digo</th>
                   <th style="padding:10px 8px; font-size:12px; text-align:right; color:#0f172a;">Solicitado</th>
                   <th style="padding:10px 8px; font-size:12px; text-align:right; color:#0f172a;">Recibido</th>
                   <th style="padding:10px 8px; font-size:12px; text-align:right; color:#0f172a;">Pendiente</th>
@@ -6523,6 +6557,89 @@ app.post('/api/promociones', async (req, res) => {
       try { await connection.rollback(); } catch (_) {}
     }
     return res.status(500).json({ message: 'No se pudo guardar promocion' });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+app.put('/api/promociones/:id', async (req, res) => {
+  const promotionId = toInt(req.params?.id);
+  const name = toText(req.body?.nombre, 120);
+  const promoTypeRaw = String(req.body?.promo_type || 'single').trim().toLowerCase();
+  const promoType = promoTypeRaw === 'combo' ? 'combo' : 'single';
+  const minQty = toInt(req.body?.min_qty);
+  const discount = toNumber(req.body?.discount_percent);
+  const comboPrice = req.body?.combo_price === null || typeof req.body?.combo_price === 'undefined'
+    ? null
+    : toNumber(req.body?.combo_price);
+  const productIds = Array.isArray(req.body?.product_ids)
+    ? [...new Set(req.body.product_ids.map((id) => toInt(id)).filter((id) => id && id > 0))]
+    : [];
+
+  if (!promotionId || !name || !productIds.length) {
+    return res.status(400).json({ message: 'Datos de promocion invalidos' });
+  }
+  if (promoType === 'single' && (!minQty || minQty < 2 || discount === null || discount <= 0 || discount > 100)) {
+    return res.status(400).json({ message: 'Datos de promocion por cantidad invalidos' });
+  }
+  if (promoType === 'combo' && (productIds.length < 2 || comboPrice === null || comboPrice <= 0)) {
+    return res.status(400).json({ message: 'Datos de promocion invalidos' });
+  }
+
+  let connection;
+  try {
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+
+    const [existingRows] = await connection.query(
+      `SELECT id
+       FROM product_promotions
+       WHERE id = ? AND is_active = 1
+       LIMIT 1`,
+      [promotionId]
+    );
+    if (!existingRows.length) {
+      await connection.rollback();
+      return res.status(404).json({ message: 'Promocion no encontrada o inactiva' });
+    }
+
+    await connection.query(
+      `UPDATE product_promotions
+       SET nombre = ?,
+           promo_type = ?,
+           min_qty = ?,
+           discount_percent = ?,
+           combo_price = ?
+       WHERE id = ?`,
+      [
+        name,
+        promoType,
+        promoType === 'combo' ? 1 : minQty,
+        promoType === 'combo' ? 0 : discount,
+        promoType === 'combo' ? comboPrice : null,
+        promotionId,
+      ]
+    );
+
+    await connection.query(
+      'DELETE FROM product_promotion_items WHERE promotion_id = ?',
+      [promotionId]
+    );
+
+    for (const productId of productIds) {
+      await connection.query(
+        'INSERT INTO product_promotion_items (promotion_id, product_id) VALUES (?, ?)',
+        [promotionId, productId]
+      );
+    }
+
+    await connection.commit();
+    return res.json({ message: 'Promocion actualizada', id: promotionId });
+  } catch (err) {
+    if (connection) {
+      try { await connection.rollback(); } catch (_) {}
+    }
+    return res.status(500).json({ message: 'No se pudo actualizar promocion' });
   } finally {
     if (connection) connection.release();
   }
@@ -8115,6 +8232,33 @@ async function fetchSalePaymentAllocations(executor, ventaId, fallbackSaleRow = 
   return buildSalePaymentAllocationsFromLegacyRow(fallbackSaleRow).allocations;
 }
 
+function normalizeSalePaymentAllocationsForCompare(allocations = []) {
+  return (Array.isArray(allocations) ? allocations : [])
+    .map((entry) => ({
+      metodo_pago: normalizeSalePaymentMethod(entry?.metodo_pago),
+      monto: Math.max(0, toClpAmount(entry?.monto || 0, 0)),
+    }))
+    .filter((entry) => entry.monto > 0)
+    .sort((a, b) => {
+      const byMethod = String(a.metodo_pago || '').localeCompare(String(b.metodo_pago || ''));
+      if (byMethod !== 0) return byMethod;
+      return Number(a.monto || 0) - Number(b.monto || 0);
+    });
+}
+
+function areSalePaymentAllocationsEqual(current = [], next = []) {
+  const normalizedCurrent = normalizeSalePaymentAllocationsForCompare(current);
+  const normalizedNext = normalizeSalePaymentAllocationsForCompare(next);
+  if (normalizedCurrent.length !== normalizedNext.length) return false;
+  for (let i = 0; i < normalizedCurrent.length; i += 1) {
+    const left = normalizedCurrent[i];
+    const right = normalizedNext[i];
+    if (left.metodo_pago !== right.metodo_pago) return false;
+    if (Number(left.monto || 0) !== Number(right.monto || 0)) return false;
+  }
+  return true;
+}
+
 async function backfillSalePaymentAllocations(executor = db) {
   const batchSize = 500;
   while (true) {
@@ -8429,14 +8573,14 @@ app.get('/api/corte/historial', async (req, res) => {
     return res.status(400).json({ message: 'Parametros desde y hasta son obligatorios en formato YYYY-MM-DD' });
   }
 
-  const filters = ['fecha BETWEEN ? AND ?'];
+  const filters = ['c.fecha BETWEEN ? AND ?'];
   const values = [startDate, endDate];
   if (cajaId) {
-    filters.push('caja_id = ?');
+    filters.push('c.caja_id = ?');
     values.push(cajaId);
   }
   if (cajeroId) {
-    filters.push('usuario_id = ?');
+    filters.push('c.usuario_id = ?');
     values.push(cajeroId);
   }
 
@@ -9319,15 +9463,16 @@ app.get('/api/turno/estado', async (req, res) => {
 
 app.get('/api/sales/session-history', async (req, res) => {
   const cajaId = toInt(req.query?.caja);
-  const cajeroId = toInt(req.query?.cajero);
+  const requestedCajeroId = toInt(req.query?.cajero);
+  const requestedTurnoId = toInt(req.query?.turno);
   const limit = Math.min(1000, Math.max(1, toInt(req.query?.limit) || 300));
   const authUserId = toInt(req.user?.sub);
 
   if (!authUserId) {
     return res.status(401).json({ message: 'Sesion invalida' });
   }
-  if (!cajaId || !cajeroId) {
-    return res.status(400).json({ message: 'Caja y cajero son obligatorios' });
+  if (!cajaId) {
+    return res.status(400).json({ message: 'Caja es obligatoria' });
   }
 
   try {
@@ -9336,22 +9481,101 @@ app.get('/api/sales/session-history', async (req, res) => {
       [authUserId]
     );
     if (!userRows.length) {
-      return res.status(401).json({ message: 'Usuario no vÃ¡lido' });
+      return res.status(401).json({ message: 'Usuario no valido' });
     }
     const isAdmin = Number(userRows[0].es_administrador || 0) === 1;
+    const effectiveCajeroId = requestedCajeroId || authUserId;
+    if (!effectiveCajeroId || effectiveCajeroId !== authUserId) {
+      return res.status(403).json({ message: 'No autorizado para consultar ventas de otro cajero' });
+    }
+
+    const [openRows] = await db.query(
+      `SELECT id_corte, hora_apertura
+       FROM corte_caja
+       WHERE fecha = CURDATE() AND caja_id = ? AND usuario_id = ? AND estado = 'abierto'
+       ORDER BY id_corte DESC
+       LIMIT 1`,
+      [cajaId, effectiveCajeroId]
+    );
+
+    if (!openRows.length) {
+      return res.json({
+        is_admin: isAdmin ? 1 : 0,
+        caja_id: cajaId,
+        usuario_id: effectiveCajeroId,
+        turno_id: null,
+        ventas: [],
+      });
+    }
+
+    const currentTurnoId = Number(openRows[0].id_corte || 0) || 0;
+    if (requestedTurnoId && requestedTurnoId !== currentTurnoId) {
+      return res.json({
+        is_admin: isAdmin ? 1 : 0,
+        caja_id: cajaId,
+        usuario_id: effectiveCajeroId,
+        turno_id: currentTurnoId || null,
+        ventas: [],
+      });
+    }
 
     let salesSql = `
       SELECT v.id_venta, DATE_FORMAT(v.fecha, '%Y-%m-%d %H:%i:%s') AS fecha,
-             v.numero_ticket, v.folio_ticket, v.caja_id, v.usuario_id,
+             v.numero_ticket, v.folio_ticket, v.caja_id, v.usuario_id, v.turno_id,
              COALESCE(u.nombre, CONCAT('Usuario ', v.usuario_id)) AS cajero_nombre,
-             v.metodo_pago, v.total
+             v.metodo_pago, v.total,
+             COALESCE(v.pago_modificado, 0) AS pago_modificado
       FROM ventas v
       LEFT JOIN usuarios u ON u.id = v.usuario_id
       WHERE DATE(v.fecha) = CURDATE()
+        AND v.caja_id = ?
+        AND v.usuario_id = ?
+        AND (v.turno_id = ? OR (v.turno_id IS NULL AND v.fecha >= ?))
     `;
-    const params = [];
+    const params = [cajaId, effectiveCajeroId, currentTurnoId, openRows[0].hora_apertura];
 
+    salesSql += ' ORDER BY v.fecha DESC, v.id_venta DESC LIMIT ?';
+    params.push(limit);
+
+    const [rows] = await db.query(salesSql, params);
+    return res.json({
+      is_admin: isAdmin ? 1 : 0,
+      caja_id: cajaId,
+      usuario_id: effectiveCajeroId,
+      turno_id: currentTurnoId || null,
+      ventas: rows,
+    });
+  } catch (error) {
+    console.error('Error al obtener historial de ventas de sesion:', error);
+    return res.status(500).json({ message: 'No se pudo obtener historial de ventas' });
+  }
+});
+app.get('/api/sales/:saleId/detail', async (req, res) => {
+  const saleId = toInt(req.params?.saleId);
+  const cajaId = toInt(req.query?.caja);
+  const cajeroId = toInt(req.query?.cajero);
+  const authUserId = toInt(req.user?.sub);
+
+  if (!authUserId) {
+    return res.status(401).json({ message: 'Sesion invalida' });
+  }
+  if (!saleId) {
+    return res.status(400).json({ message: 'Venta invalida' });
+  }
+
+  try {
+    const [userRows] = await db.query(
+      'SELECT id, es_administrador FROM usuarios WHERE id = ? LIMIT 1',
+      [authUserId]
+    );
+    if (!userRows.length) {
+      return res.status(401).json({ message: 'Usuario no valido' });
+    }
+    const isAdmin = Number(userRows[0].es_administrador || 0) === 1;
     if (!isAdmin) {
+      if (!cajaId || !cajeroId || authUserId !== cajeroId) {
+        return res.status(403).json({ message: 'No autorizado para consultar esta venta' });
+      }
       const [openRows] = await db.query(
         `SELECT id_corte, hora_apertura
          FROM corte_caja
@@ -9360,27 +9584,279 @@ app.get('/api/sales/session-history', async (req, res) => {
          LIMIT 1`,
         [cajaId, cajeroId]
       );
+      let accessSql = `
+        SELECT 1 AS ok
+        FROM ventas v
+        WHERE v.id_venta = ?
+          AND v.caja_id = ?
+          AND v.usuario_id = ?
+          AND DATE(v.fecha) = CURDATE()
+      `;
+      const accessParams = [saleId, cajaId, cajeroId];
       if (openRows.length) {
-        const turnoId = Number(openRows[0].id_corte || 0) || 0;
-        salesSql += ' AND v.caja_id = ? AND v.usuario_id = ? AND (v.turno_id = ? OR (v.turno_id IS NULL AND v.fecha >= ?))';
-        params.push(cajaId, cajeroId, turnoId, openRows[0].hora_apertura);
-      } else {
-        salesSql += ' AND v.caja_id = ? AND v.usuario_id = ?';
-        params.push(cajaId, cajeroId);
+        accessSql += ' AND (v.turno_id = ? OR (v.turno_id IS NULL AND v.fecha >= ?))';
+        accessParams.push(Number(openRows[0].id_corte || 0), openRows[0].hora_apertura);
+      }
+      accessSql += ' LIMIT 1';
+      const [allowedRows] = await db.query(accessSql, accessParams);
+      if (!allowedRows.length) {
+        return res.status(403).json({ message: 'No autorizado para consultar esta venta' });
       }
     }
 
-    salesSql += ' ORDER BY v.fecha DESC, v.id_venta DESC LIMIT ?';
-    params.push(limit);
+    const [saleRows] = await db.query(
+      `SELECT v.id_venta,
+              DATE_FORMAT(v.fecha, '%Y-%m-%d %H:%i:%s') AS fecha,
+              COALESCE(NULLIF(v.folio_ticket, ''), CAST(v.numero_ticket AS CHAR)) AS numero_ticket,
+              v.numero_ticket AS numero_ticket_raw,
+              v.folio_ticket,
+              v.caja_id,
+              v.usuario_id,
+              COALESCE(u.nombre, CONCAT('Usuario ', v.usuario_id)) AS cajero_nombre,
+              v.metodo_pago,
+              v.total,
+              v.monto_efectivo,
+              v.monto_tarjeta,
+              COALESCE(v.pago_modificado, 0) AS pago_modificado,
+              DATE_FORMAT(v.pago_modificado_at, '%Y-%m-%d %H:%i:%s') AS pago_modificado_at,
+              v.pago_modificado_por,
+              COALESCE(um.nombre, CONCAT('Usuario ', v.pago_modificado_por)) AS pago_modificado_por_nombre
+       FROM ventas v
+       LEFT JOIN usuarios u ON u.id = v.usuario_id
+       LEFT JOIN usuarios um ON um.id = v.pago_modificado_por
+       WHERE v.id_venta = ?
+       LIMIT 1`,
+      [saleId]
+    );
+    if (!saleRows.length) {
+      return res.status(404).json({ message: 'Venta no encontrada' });
+    }
+    const sale = saleRows[0];
 
-    const [rows] = await db.query(salesSql, params);
+    const [itemRows] = await db.query(
+      `SELECT d.id_detalle,
+              COALESCE(d.producto_id, 0) AS producto_id,
+              COALESCE(NULLIF(d.descripcion, ''), p.descripcion, 'Producto') AS descripcion,
+              COALESCE(d.cantidad, 0) AS cantidad,
+              COALESCE(d.precio_unitario, 0) AS precio_unitario,
+              COALESCE(d.subtotal, 0) AS subtotal
+       FROM detalle_venta d
+       LEFT JOIN productos p ON p.id_producto = d.producto_id
+       WHERE d.venta_id = ?
+       ORDER BY d.id_detalle ASC`,
+      [saleId]
+    );
+
+    const paymentBreakdown = await fetchSalePaymentAllocations(db, saleId, sale);
     return res.json({
-      is_admin: isAdmin ? 1 : 0,
-      ventas: rows,
+      sale: {
+        id_venta: Number(sale.id_venta || 0),
+        fecha: String(sale.fecha || '').trim(),
+        numero_ticket: String(sale.numero_ticket || sale.numero_ticket_raw || '').trim(),
+        folio_ticket: String(sale.folio_ticket || '').trim(),
+        caja_id: Number(sale.caja_id || 0),
+        usuario_id: Number(sale.usuario_id || 0),
+        cajero_nombre: String(sale.cajero_nombre || '').trim(),
+        metodo_pago: String(sale.metodo_pago || '').trim().toLowerCase(),
+        total: Math.max(0, Number(sale.total || 0)),
+        monto_efectivo: Math.max(0, Number(sale.monto_efectivo || 0)),
+        monto_tarjeta: Math.max(0, Number(sale.monto_tarjeta || 0)),
+        pago_modificado: Number(sale.pago_modificado || 0) === 1 ? 1 : 0,
+        pago_modificado_at: sale.pago_modificado_at || null,
+        pago_modificado_por: sale.pago_modificado_por ? Number(sale.pago_modificado_por) : null,
+        pago_modificado_por_nombre: String(sale.pago_modificado_por_nombre || '').trim(),
+      },
+      items: (Array.isArray(itemRows) ? itemRows : []).map((row) => ({
+        id_detalle: Number(row.id_detalle || 0),
+        producto_id: Number(row.producto_id || 0),
+        descripcion: String(row.descripcion || '').trim() || 'Producto',
+        cantidad: Number(row.cantidad || 0),
+        precio_unitario: Math.max(0, Number(row.precio_unitario || 0)),
+        subtotal: Math.max(0, Number(row.subtotal || 0)),
+      })),
+      payment_breakdown: (Array.isArray(paymentBreakdown) ? paymentBreakdown : []).map((row) => ({
+        metodo_pago: normalizeSalePaymentMethod(row.metodo_pago),
+        monto: Math.max(0, Number(row.monto || 0)),
+      })),
     });
   } catch (error) {
-    console.error('Error al obtener historial de ventas de sesion:', error);
-    return res.status(500).json({ message: 'No se pudo obtener historial de ventas' });
+    console.error('Error al obtener detalle de venta:', error);
+    return res.status(500).json({ message: 'No se pudo obtener detalle de la venta' });
+  }
+});
+
+app.put('/api/sales/:saleId/payment', async (req, res) => {
+  const saleId = toInt(req.params?.saleId);
+  const cajaId = toInt(req.body?.caja ?? req.query?.caja);
+  const cajeroId = toInt(req.body?.cajero ?? req.query?.cajero);
+  const authUserId = toInt(req.user?.sub);
+  const methodRaw = String(req.body?.metodo_pago || '').trim().toLowerCase();
+  const allowedMethods = new Set(['efectivo', 'tarjeta', 'mixto', 'dolares', 'transferencia', 'cheque', 'vale']);
+  const efectivoIn = toNumber(req.body?.monto_efectivo);
+  const tarjetaIn = toNumber(req.body?.monto_tarjeta);
+
+  if (!authUserId) {
+    return res.status(401).json({ message: 'Sesion invalida' });
+  }
+  if (!saleId) {
+    return res.status(400).json({ message: 'Venta invalida' });
+  }
+  if (!allowedMethods.has(methodRaw)) {
+    return res.status(400).json({ message: 'Metodo de pago invalido' });
+  }
+
+  let connection;
+  try {
+    const [userRows] = await db.query(
+      'SELECT id, es_administrador FROM usuarios WHERE id = ? LIMIT 1',
+      [authUserId]
+    );
+    if (!userRows.length) {
+      return res.status(401).json({ message: 'Usuario no valido' });
+    }
+    const isAdmin = Number(userRows[0].es_administrador || 0) === 1;
+    if (!isAdmin && (!cajaId || !cajeroId || authUserId !== cajeroId)) {
+      return res.status(403).json({ message: 'No autorizado para editar esta venta' });
+    }
+
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+
+    const [saleRows] = await connection.query(
+      `SELECT id_venta, fecha, caja_id, usuario_id, turno_id, metodo_pago, total, monto_efectivo, monto_tarjeta,
+              COALESCE(pago_modificado, 0) AS pago_modificado
+       FROM ventas
+       WHERE id_venta = ?
+       LIMIT 1`,
+      [saleId]
+    );
+    if (!saleRows.length) {
+      await connection.rollback();
+      return res.status(404).json({ message: 'Venta no encontrada' });
+    }
+    const sale = saleRows[0];
+
+    if (!isAdmin) {
+      const [openRows] = await connection.query(
+        `SELECT id_corte, hora_apertura
+         FROM corte_caja
+         WHERE fecha = CURDATE() AND caja_id = ? AND usuario_id = ? AND estado = 'abierto'
+         ORDER BY id_corte DESC
+         LIMIT 1`,
+        [cajaId, cajeroId]
+      );
+      let accessSql = `
+        SELECT 1 AS ok
+        FROM ventas v
+        WHERE v.id_venta = ?
+          AND v.caja_id = ?
+          AND v.usuario_id = ?
+          AND DATE(v.fecha) = CURDATE()
+      `;
+      const accessParams = [saleId, cajaId, cajeroId];
+      if (openRows.length) {
+        accessSql += ' AND (v.turno_id = ? OR (v.turno_id IS NULL AND v.fecha >= ?))';
+        accessParams.push(Number(openRows[0].id_corte || 0), openRows[0].hora_apertura);
+      }
+      accessSql += ' LIMIT 1';
+      const [allowedRows] = await connection.query(accessSql, accessParams);
+      if (!allowedRows.length) {
+        await connection.rollback();
+        return res.status(403).json({ message: 'No autorizado para editar esta venta' });
+      }
+    }
+
+    const total = Math.max(0, toClpAmount(sale.total || 0, 0));
+    if (!Number.isFinite(total) || total <= 0) {
+      await connection.rollback();
+      return res.status(400).json({ message: 'No se puede editar una venta con total invalido' });
+    }
+
+    let allocations = [];
+    let normalizedMethod = methodRaw;
+    let montoEfectivo = 0;
+    let montoTarjeta = 0;
+
+    if (normalizedMethod === 'mixto') {
+      const tarjetaIngresada = Number.isFinite(tarjetaIn) && tarjetaIn >= 0
+        ? Math.max(0, toClpAmount(tarjetaIn, 0))
+        : 0;
+      const efectivoIngresado = Number.isFinite(efectivoIn) && efectivoIn >= 0
+        ? Math.max(0, toClpAmount(efectivoIn, 0))
+        : 0;
+      if (tarjetaIngresada > total) {
+        await connection.rollback();
+        return res.status(400).json({ message: 'Pago mixto invalido: tarjeta supera total de la venta' });
+      }
+      const efectivoRequerido = Math.max(0, total - tarjetaIngresada);
+      if (efectivoIngresado < efectivoRequerido) {
+        await connection.rollback();
+        return res.status(400).json({ message: 'Pago mixto invalido: efectivo insuficiente' });
+      }
+      montoTarjeta = tarjetaIngresada;
+      montoEfectivo = efectivoRequerido;
+      if (montoEfectivo > 0) allocations.push({ metodo_pago: 'efectivo', monto: montoEfectivo });
+      if (montoTarjeta > 0) allocations.push({ metodo_pago: 'tarjeta', monto: montoTarjeta });
+      if (!allocations.length) {
+        normalizedMethod = 'efectivo';
+        montoEfectivo = total;
+        montoTarjeta = 0;
+        allocations = [{ metodo_pago: 'efectivo', monto: total }];
+      }
+    } else {
+      const normalizedSingleMethod = normalizeSalePaymentMethod(normalizedMethod);
+      allocations = [{ metodo_pago: normalizedSingleMethod, monto: total }];
+      if (normalizedSingleMethod === 'efectivo') {
+        montoEfectivo = total;
+      } else if (normalizedSingleMethod === 'tarjeta' || CARD_LIKE_PAYMENT_METHODS.includes(normalizedSingleMethod)) {
+        montoTarjeta = total;
+      }
+    }
+
+    const previousAllocations = await fetchSalePaymentAllocations(connection, saleId, sale);
+    const methodChanged = String(sale.metodo_pago || '').trim().toLowerCase() !== normalizedMethod;
+    const efectivoChanged = Math.abs(Number(sale.monto_efectivo || 0) - montoEfectivo) > 0.0001;
+    const tarjetaChanged = Math.abs(Number(sale.monto_tarjeta || 0) - montoTarjeta) > 0.0001;
+    const allocationsChanged = !areSalePaymentAllocationsEqual(previousAllocations, allocations);
+    const hasChanged = methodChanged || efectivoChanged || tarjetaChanged || allocationsChanged;
+
+    await connection.query('DELETE FROM venta_pagos WHERE venta_id = ?', [saleId]);
+    await insertSalePaymentAllocations(connection, saleId, allocations);
+
+    await connection.query(
+      `UPDATE ventas
+       SET metodo_pago = ?,
+           monto_efectivo = ?,
+           monto_tarjeta = ?,
+           pago_modificado = CASE WHEN ? = 1 THEN 1 ELSE pago_modificado END,
+           pago_modificado_at = CASE WHEN ? = 1 THEN NOW() ELSE pago_modificado_at END,
+           pago_modificado_por = CASE WHEN ? = 1 THEN ? ELSE pago_modificado_por END
+       WHERE id_venta = ?`,
+      [
+        normalizedMethod,
+        montoEfectivo,
+        montoTarjeta,
+        hasChanged ? 1 : 0,
+        hasChanged ? 1 : 0,
+        hasChanged ? 1 : 0,
+        authUserId,
+        saleId,
+      ]
+    );
+
+    await connection.commit();
+    return res.json({
+      message: hasChanged ? 'Forma de pago actualizada' : 'Sin cambios en forma de pago',
+      updated: hasChanged ? 1 : 0,
+    });
+  } catch (error) {
+    if (connection) {
+      try { await connection.rollback(); } catch (_) {}
+    }
+    console.error('Error al editar forma de pago de venta:', error);
+    return res.status(500).json({ message: 'No se pudo editar la forma de pago' });
+  } finally {
+    if (connection) connection.release();
   }
 });
 
@@ -9852,7 +10328,7 @@ app.post('/api/cash-movements', async (req, res) => {
   const allowedMethods = new Set(['efectivo', 'tarjeta', 'dolares', 'transferencia', 'cheque', 'vale', 'otro']);
 
   if (!cajaId || !cajeroId || !allowedTypes.has(tipoRaw) || monto === null || monto <= 0) {
-    return res.status(400).json({ message: 'Datos invÃ¡lidos para movimiento de caja' });
+    return res.status(400).json({ message: 'Datos invÃƒÂ¡lidos para movimiento de caja' });
   }
   if (tipoRaw === 'salida' && !descripcion) {
     return res.status(400).json({ message: 'La salida requiere descripcion' });
@@ -10985,7 +11461,7 @@ app.post('/api/auth/verify-admin', async (req, res) => {
   const sectionId = rawSectionId ? rawSectionId.toLowerCase() : '';
 
   if (!usernameInput || !passwordInput) {
-    return res.status(400).json({ message: 'Debes ingresar usuario y contraseña.' });
+    return res.status(400).json({ message: 'Debes ingresar usuario y contraseÃ±a.' });
   }
 
   const sectionPermissionMap = {
@@ -11003,7 +11479,7 @@ app.post('/api/auth/verify-admin', async (req, res) => {
 
   for (const field of requiredPermissions) {
     if (!CASHIER_PERMISSION_FIELDS.includes(field)) {
-      return res.status(400).json({ message: 'Sección inválida para autorización.' });
+      return res.status(400).json({ message: 'SecciÃ³n invÃ¡lida para autorizaciÃ³n.' });
     }
   }
 
@@ -11023,7 +11499,7 @@ app.post('/api/auth/verify-admin', async (req, res) => {
       );
       rows = permissionRows;
     } catch (permissionQueryError) {
-      // Fallback defensivo: permite validar admin aunque la tabla/permisos esté desfasada.
+      // Fallback defensivo: permite validar admin aunque la tabla/permisos estÃ© desfasada.
       usedPermissionFallback = true;
       console.error('Fallback en verify-admin (consulta permisos):', permissionQueryError?.message || permissionQueryError);
       const [basicRows] = await db.query(
@@ -11038,7 +11514,7 @@ app.post('/api/auth/verify-admin', async (req, res) => {
     }
 
     if (!rows.length) {
-      return res.status(401).json({ message: 'Credenciales de administrador inválidas.' });
+      return res.status(401).json({ message: 'Credenciales de administrador invÃ¡lidas.' });
     }
 
     const user = rows[0];
@@ -11054,7 +11530,7 @@ app.post('/api/auth/verify-admin', async (req, res) => {
     }
 
     if (!passwordOk) {
-      return res.status(401).json({ message: 'Credenciales de administrador inválidas.' });
+      return res.status(401).json({ message: 'Credenciales de administrador invÃ¡lidas.' });
     }
 
     const isAdmin = Number(user.es_administrador || 0) === 1;
@@ -11065,10 +11541,10 @@ app.post('/api/auth/verify-admin', async (req, res) => {
       if (requiredPermissions.length) {
         if (usedPermissionFallback) {
           return res.status(403).json({
-            message: 'No fue posible validar permisos por sección. Usa una cuenta administrador para autorizar.',
+            message: 'No fue posible validar permisos por secciÃ³n. Usa una cuenta administrador para autorizar.',
           });
         }
-        return res.status(403).json({ message: 'El usuario no tiene permisos para autorizar esta sección.' });
+        return res.status(403).json({ message: 'El usuario no tiene permisos para autorizar esta secciÃ³n.' });
       }
       return res.status(403).json({ message: 'El usuario ingresado no tiene perfil administrador.' });
     }
@@ -11560,11 +12036,20 @@ app.post('/api/sales', async (req, res) => {
         if (!singlePromotionRulesByProduct.has(productId)) {
           singlePromotionRulesByProduct.set(productId, []);
         }
+        const fallbackSingleRule = parseSinglePromotionPattern(row.promotion_name || '');
+        const minQtyRaw = Number(row.min_qty || 0);
+        const discountRaw = Number(row.discount_percent || 0);
+        const normalizedMinQty = (Number.isFinite(minQtyRaw) && minQtyRaw > 0)
+          ? minQtyRaw
+          : Number(fallbackSingleRule?.minQty || 0);
+        const normalizedDiscount = (Number.isFinite(discountRaw) && discountRaw > 0)
+          ? discountRaw
+          : Number(fallbackSingleRule?.discountPercent || 0);
         singlePromotionRulesByProduct.get(productId).push({
           promotionId,
           promotionName: row.promotion_name || 'Promocion',
-          minQty: Number(row.min_qty || 0),
-          discountPercent: Number(row.discount_percent || 0),
+          minQty: normalizedMinQty,
+          discountPercent: normalizedDiscount,
         });
       });
     }
@@ -11606,7 +12091,10 @@ app.post('/api/sales', async (req, res) => {
           .filter((promo) => promo.minQty > 0 && item.qty >= promo.minQty && promo.discountPercent > 0)
           .sort((a, b) => b.discountPercent - a.discountPercent)[0];
         if (applicable) {
-          const discountedUnit = Math.max(0, toClpAmount(basePrice * (1 - (applicable.discountPercent / 100)), 0));
+          const discountedUnit = Math.max(
+            0,
+            roundPromoAmountToNearestTen(basePrice * (1 - (applicable.discountPercent / 100)), 0)
+          );
           if (discountedUnit >= 0) {
             effectiveUnitPrice = discountedUnit;
             promoLabel = `PROMOCION ${applicable.promotionName} (-${applicable.discountPercent}%)`;
@@ -12411,4 +12899,6 @@ process.on('uncaughtException', (error) => {
     stack: error?.stack || '',
   });
 });
+
+
 

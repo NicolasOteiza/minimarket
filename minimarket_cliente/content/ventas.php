@@ -45,6 +45,7 @@
                             <th>Descripción</th>
                             <th>Precio Unit.</th>
                             <th>Cant.</th>
+                            <th>Monto descuento (% aprox)</th>
                             <th>Subtotal</th>
                         </tr>
                     </thead>
@@ -60,6 +61,7 @@
                         <td style="width:300px; min-width:300px;">
                             <div class="sales-action-stack">
                                 <div id="total-amount"><b>$0</b></div>
+                                <div id="total-savings" class="hidden" style="font-size:12px; color:#1a7f37; margin-top:4px;"></div>
                             </div>
                         </td>
                     </tr>
@@ -67,15 +69,15 @@
                 <div class="sales-bottom-actions">
                     <button id="open-finalize-popup-btn" data-permission-key="ventas_cobrar_ticket" data-permission-mode="disable" class="btn btn2 finalize-main-btn" onclick="mostrarPopUp('miPopUp')" disabled><b>F12 - Cobrar</b></button>
                     <button id="sales-reprint-last-btn" data-permission-key="ventas_cobrar_ticket" data-permission-mode="disable" class="btn btn2 finalize-main-btn" type="button" onclick="reprintLastSaleTicketOrInvoice()">Reimprimir &uacute;ltimo</button>
-                    <button id="sales-session-history-btn" data-permission-key="ventas_historial" data-permission-mode="disable" class="btn btn2 finalize-main-btn" type="button" onclick="openSalesSessionHistoryPopup()">Ventas sesi&oacute;n</button>
+                    <button id="sales-session-history-btn" data-permission-key="ventas_historial" data-permission-mode="disable" class="btn btn2 finalize-main-btn" type="button" onclick="openSalesSessionHistoryPopup()">Ultimas ventas</button>
                 </div>
                 <div id="sales-last-ticket-card" class="sales-last-ticket-card">
-                    <p class="sales-last-ticket-title">Ultimo ticket vendido</p>
-                    <div class="sales-last-ticket-grid">
-                        <div class="sales-last-ticket-item"><span>Ticket</span><strong id="sales-last-ticket-folio">-</strong></div>
-                        <div class="sales-last-ticket-item"><span>Forma de pago</span><strong id="sales-last-ticket-method">-</strong></div>
-                        <div class="sales-last-ticket-item"><span>Monto</span><strong id="sales-last-ticket-amount">$0</strong></div>
-                        <div class="sales-last-ticket-item"><span>Vuelto</span><strong id="sales-last-ticket-change">$0</strong></div>
+                    <span class="sales-last-ticket-title">Ultimo ticket vendido</span>
+                    <div class="sales-last-ticket-inline">
+                        <span class="sales-last-ticket-inline-item"><span class="sales-last-ticket-label">Ticket:</span><strong id="sales-last-ticket-folio">-</strong></span>
+                        <span class="sales-last-ticket-inline-item"><span class="sales-last-ticket-label">Forma de pago:</span><strong id="sales-last-ticket-method">-</strong></span>
+                        <span class="sales-last-ticket-inline-item"><span class="sales-last-ticket-label">Monto:</span><strong id="sales-last-ticket-amount">$0</strong></span>
+                        <span class="sales-last-ticket-inline-item"><span class="sales-last-ticket-label">Vuelto:</span><strong id="sales-last-ticket-change">$0</strong></span>
                     </div>
                 </div>
             </div>
@@ -421,34 +423,109 @@
         </div>
     </div>
     <div id="salesHistoryPopUp" class="hidden" style="position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:9999; align-items:center; justify-content:center;">
-        <div class="contenidoPopUp" style="width:min(980px,96vw); max-width:980px; margin:0; display:flex; flex-direction:column;">
+        <div class="contenidoPopUp sales-history-popup-shell">
             <div class="popup-titulo">
-                <p class="popup-titulo-texto">Ventas de la sesi&oacute;n</p>
+                <p class="popup-titulo-texto">Ultimas ventas</p>
                 <button class="popup-cerrar" type="button" onclick="closeSalesSessionHistoryPopup()">
                     <p>X</p>
                 </button>
             </div>
-            <div class="popup-body" style="padding:10px 12px; display:flex; flex-direction:column; gap:8px;">
-                <div id="sales-history-summary" class="product-status-box">Cargando ventas...</div>
-                <div style="max-height:min(62vh,520px); overflow:auto; border:1px solid #d1d5db; border-radius:8px;">
-                    <table class="venta-table" style="margin:0;">
-                        <thead>
-                            <tr>
-                                <th>Fecha</th>
-                                <th>Venta</th>
-                                <th>Caja</th>
-                                <th>Cajero</th>
-                                <th>M&eacute;todo</th>
-                                <th>Total</th>
-                            </tr>
-                        </thead>
-                        <tbody id="sales-history-body">
-                            <tr><td colspan="6" style="text-align:center;">Sin datos.</td></tr>
-                        </tbody>
-                    </table>
+            <div class="popup-body sales-history-popup-body">
+                <div id="sales-history-summary" class="sales-history-feedback">Cargando ventas...</div>
+                <div class="sales-history-layout">
+                    <div class="sales-history-list-panel">
+                        <div class="sales-history-list-wrap">
+                            <table class="venta-table sales-history-table" style="margin:0;">
+                                <thead>
+                                    <tr>
+                                        <th>Fecha/Hora</th>
+                                        <th>N&deg; Ticket</th>
+                                        <th>M&eacute;todo</th>
+                                        <th>Total</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="sales-history-body">
+                                    <tr><td colspan="4" style="text-align:center;">Sin datos.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div class="sales-history-detail-panel">
+                        <div id="sales-history-detail-empty" class="sales-history-feedback">
+                            Selecciona una venta para ver el detalle y editar su forma de pago.
+                        </div>
+                        <div id="sales-history-detail-card" class="sales-history-detail-card hidden">
+                            <div id="sales-history-modified-ribbon" class="sales-history-modified-ribbon hidden">
+                                VENTA MODIFICADA
+                            </div>
+                            <div class="sales-history-detail-head">
+                                <div class="sales-history-detail-meta"><span>Fecha/Hora</span><strong id="sales-history-detail-datetime">-</strong></div>
+                                <div class="sales-history-detail-meta"><span>Ticket</span><strong id="sales-history-detail-ticket">-</strong></div>
+                                <div class="sales-history-detail-meta"><span>Caja</span><strong id="sales-history-detail-caja">-</strong></div>
+                                <div class="sales-history-detail-meta"><span>Cajero</span><strong id="sales-history-detail-cajero">-</strong></div>
+                                <div class="sales-history-detail-meta"><span>M&eacute;todo</span><strong id="sales-history-detail-method">-</strong></div>
+                                <div class="sales-history-detail-meta"><span>Total venta</span><strong id="sales-history-detail-total">$0</strong></div>
+                            </div>
+                            <div class="sales-history-products-wrap">
+                                <table class="venta-table sales-history-products-table" style="margin:0;">
+                                    <thead>
+                                        <tr>
+                                            <th>Producto</th>
+                                            <th>Cant.</th>
+                                            <th>Precio</th>
+                                            <th>Subtotal</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="sales-history-detail-products-body">
+                                        <tr><td colspan="4" style="text-align:center;">Sin detalles.</td></tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                            <div class="sales-history-payments-box">
+                                <p class="sales-history-section-title">Detalle de pago</p>
+                                <div id="sales-history-detail-payments" class="sales-history-payments-list">
+                                    <p class="sales-history-payment-item">Sin desglose de pago.</p>
+                                </div>
+                            </div>
+                            <div id="sales-history-edit-box" class="sales-history-edit-box hidden">
+                                <p class="sales-history-section-title">Editar forma de pago</p>
+                                <div class="sales-history-edit-grid">
+                                    <label for="sales-history-payment-method">M&eacute;todo</label>
+                                    <select id="sales-history-payment-method" class="form-input" onchange="handleSalesHistoryPaymentMethodChange()">
+                                        <option value="efectivo">Efectivo</option>
+                                        <option value="tarjeta">Tarjeta</option>
+                                        <option value="mixto">Mixto</option>
+                                        <option value="dolares">D&oacute;lares</option>
+                                        <option value="transferencia">Transferencia</option>
+                                        <option value="cheque">Cheque</option>
+                                        <option value="vale">Vale</option>
+                                    </select>
+                                </div>
+                                <div id="sales-history-mixed-fields" class="sales-history-mixed-fields hidden">
+                                    <div class="sales-history-edit-grid">
+                                        <label for="sales-history-payment-card">Monto tarjeta</label>
+                                        <input id="sales-history-payment-card" class="form-input" type="text" inputmode="numeric" autocomplete="off" placeholder="0" oninput="if (typeof handleBarcodeInputSanitize === 'function') { handleBarcodeInputSanitize(this); }">
+                                    </div>
+                                    <div class="sales-history-edit-grid">
+                                        <label for="sales-history-payment-cash">Monto efectivo (pagado)</label>
+                                        <input id="sales-history-payment-cash" class="form-input" type="text" inputmode="numeric" autocomplete="off" placeholder="0" oninput="if (typeof handleBarcodeInputSanitize === 'function') { handleBarcodeInputSanitize(this); }">
+                                    </div>
+                                </div>
+                            </div>
+                            <div id="sales-history-view-actions" class="sales-history-detail-actions">
+                                <button id="sales-history-reprint-btn" class="btn2" type="button" onclick="reprintSalesHistorySelectedSale()">Reimprimir</button>
+                                <button id="sales-history-enter-edit-btn" class="btn2" type="button" onclick="enterSalesHistoryEditMode()">Editar</button>
+                            </div>
+                            <div id="sales-history-edit-actions" class="sales-history-detail-actions hidden">
+                                <button id="sales-history-save-payment-btn" class="btn2" type="button" onclick="saveSalesHistoryPaymentUpdate()">Guardar cambios</button>
+                                <button id="sales-history-cancel-edit-btn" class="btn2" type="button" onclick="cancelSalesHistoryEditMode()">Cancelar</button>
+                            </div>
+                            <div id="sales-history-edit-feedback" class="sales-history-feedback hidden"></div>
+                        </div>
+                    </div>
                 </div>
-                <div style="display:flex; justify-content:flex-end;">
-                    <button class="btn2" type="button" onclick="closeSalesSessionHistoryPopup()" style="height:32px; min-width:120px;">Cerrar</button>
+                <div class="sales-history-footer-actions">
+                    <button class="btn2" type="button" onclick="closeSalesSessionHistoryPopup()" style="height:36px; min-width:130px;">Cerrar</button>
                 </div>
             </div>
         </div>

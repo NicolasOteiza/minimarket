@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
@@ -149,6 +149,58 @@ function toClpAmount(value, fallback = 0) {
   const num = toNumber(value);
   if (num === null) return fallback;
   return Math.round(num);
+}
+
+function roundPromoAmountToNearestTen(value, fallback = 0) {
+  const roundedInteger = toClpAmount(value, fallback);
+  return Math.round(roundedInteger / 10) * 10;
+}
+
+function parseSinglePromotionPattern(name = '') {
+  const raw = String(name || '').trim();
+  if (!raw) return null;
+  const match = raw.match(/(\d+)\s*x\s*(\d+)/i);
+  if (!match) return null;
+  const buyQty = Number(match[1] || 0);
+  const payQty = Number(match[2] || 0);
+  if (!Number.isFinite(buyQty) || !Number.isFinite(payQty) || buyQty < 2 || payQty < 1 || payQty >= buyQty) {
+    return null;
+  }
+  const discountPercent = Math.round(((1 - (payQty / buyQty)) * 100) * 100) / 100;
+  if (!Number.isFinite(discountPercent) || discountPercent <= 0 || discountPercent >= 100) {
+    return null;
+  }
+  return {
+    minQty: Math.trunc(buyQty),
+    discountPercent,
+  };
+}
+
+async function getTableColumnSet(executor, tableName) {
+  const safeTableName = String(tableName || '').trim();
+  if (!/^[a-zA-Z0-9_]+$/.test(safeTableName)) {
+    return new Set();
+  }
+
+  try {
+    const [rows] = await executor.query(
+      `SELECT COLUMN_NAME
+       FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?`,
+      [config.db.database, safeTableName]
+    );
+    return new Set((Array.isArray(rows) ? rows : []).map((row) => String(row.COLUMN_NAME || '').trim()).filter(Boolean));
+  } catch (_) {
+    try {
+      const [rows] = await executor.query(`SHOW COLUMNS FROM \`${safeTableName}\``);
+      return new Set((Array.isArray(rows) ? rows : []).map((row) => String(row.Field || '').trim()).filter(Boolean));
+    } catch (fallbackErr) {
+      if (fallbackErr?.code === 'ER_NO_SUCH_TABLE') {
+        return new Set();
+      }
+      throw fallbackErr;
+    }
+  }
 }
 
 function toBool(value) {
@@ -377,7 +429,7 @@ function isIsoDate(value) {
 function normalizeInventoryMovementType(value) {
   const raw = String(value || '').trim().toLowerCase();
   if (raw === 'ajuste') return 'ajuste';
-  if (raw === 'modificacion' || raw === 'modificaciÃ³n') return 'modificacion';
+  if (raw === 'modificacion' || raw === 'modificaciÃƒÂ³n') return 'modificacion';
   return null;
 }
 
@@ -2869,6 +2921,15 @@ async function ensureOperationalTables() {
   if (!salesCurrentLegacy.has('folio_ticket')) {
     await db.query('ALTER TABLE ventas ADD COLUMN folio_ticket VARCHAR(16) NULL AFTER numero_ticket');
   }
+  if (!salesCurrentLegacy.has('pago_modificado')) {
+    await db.query('ALTER TABLE ventas ADD COLUMN pago_modificado TINYINT(1) NOT NULL DEFAULT 0 AFTER monto_tarjeta');
+  }
+  if (!salesCurrentLegacy.has('pago_modificado_at')) {
+    await db.query('ALTER TABLE ventas ADD COLUMN pago_modificado_at DATETIME NULL AFTER pago_modificado');
+  }
+  if (!salesCurrentLegacy.has('pago_modificado_por')) {
+    await db.query('ALTER TABLE ventas ADD COLUMN pago_modificado_por INT NULL AFTER pago_modificado_at');
+  }
 
   await db.query(`
     CREATE TABLE IF NOT EXISTS venta_pagos (
@@ -4139,7 +4200,7 @@ app.post('/api/cajeros', async (req, res) => {
   const permisos = buildCashierPermissions(req.body?.permisos || {});
 
   if (!username || !nombre || !plainPassword || plainPassword.length < 4) {
-    return res.status(400).json({ error: 'Datos de cajero invÃ¡lidos' });
+    return res.status(400).json({ error: 'Datos de cajero invÃƒÂ¡lidos' });
   }
 
   let connection;
@@ -4192,7 +4253,7 @@ app.put('/api/cajeros/:id', async (req, res) => {
   const permisos = buildCashierPermissions(req.body?.permisos || {});
 
   if (!userId || !username || !nombre) {
-    return res.status(400).json({ error: 'Datos de cajero invÃ¡lidos' });
+    return res.status(400).json({ error: 'Datos de cajero invÃƒÂ¡lidos' });
   }
 
   let connection;
@@ -4214,7 +4275,7 @@ app.put('/api/cajeros/:id', async (req, res) => {
 
     if (plainPassword && plainPassword.length < 4) {
       await connection.rollback();
-      return res.status(400).json({ error: 'La contraseÃ±a debe tener al menos 4 caracteres' });
+      return res.status(400).json({ error: 'La contraseÃƒÂ±a debe tener al menos 4 caracteres' });
     }
 
     if (plainPassword) {
@@ -4259,7 +4320,7 @@ app.put('/api/cajeros/:id', async (req, res) => {
 app.delete('/api/cajeros/:id', async (req, res) => {
   const userId = toInt(req.params?.id);
   if (!userId) {
-    return res.status(400).json({ error: 'ID de cajero invÃ¡lido' });
+    return res.status(400).json({ error: 'ID de cajero invÃƒÂ¡lido' });
   }
 
   let connection;
@@ -4890,20 +4951,55 @@ app.put('/api/logo-settings', async (req, res) => {
   }
 });
 
+const scannerSettingsDefaults = Object.freeze({
+  scanner_mode: 'keyboard',
+  serial_port: null,
+  baud_rate: 9600,
+  data_bits: 8,
+  parity: 'none',
+  stop_bits: '1',
+  flow_control: 'none',
+  scanner_suffix: 'enter',
+  scanner_prefix_to_strip: '',
+  scanner_prefix_trim: 1,
+  scanner_only_numeric: 1,
+  scanner_auto_focus: 1,
+  scanner_beep_on_scan: 0,
+});
+
 app.get('/api/scanner-settings', async (req, res) => {
   try {
+    const deviceColumns = await getTableColumnSet(db, 'device_settings');
+    if (!deviceColumns.size) {
+      return res.json({ ...scannerSettingsDefaults });
+    }
+
+    const selectableColumns = Object.keys(scannerSettingsDefaults).filter((columnName) => deviceColumns.has(columnName));
+    if (!selectableColumns.length) {
+      return res.json({ ...scannerSettingsDefaults });
+    }
+
     const [rows] = await db.query(
-      `SELECT scanner_mode, serial_port, baud_rate, data_bits, parity, stop_bits, flow_control,
-              scanner_suffix, scanner_prefix_to_strip, scanner_prefix_trim, scanner_only_numeric, scanner_auto_focus, scanner_beep_on_scan
+      `SELECT ${selectableColumns.map((columnName) => `\`${columnName}\``).join(', ')}
        FROM device_settings
        WHERE id = 1
        LIMIT 1`
     );
-    if (!rows.length) {
-      return res.status(404).json({ message: 'Configuracion de lector no disponible' });
+
+    const payload = { ...scannerSettingsDefaults };
+    if (rows.length) {
+      Object.assign(payload, rows[0]);
+    } else if (deviceColumns.has('id')) {
+      await db.query(
+        `INSERT INTO device_settings (id)
+         VALUES (1)
+         ON DUPLICATE KEY UPDATE id = id`
+      );
     }
-    return res.json(rows[0]);
+
+    return res.json(payload);
   } catch (err) {
+    console.error('Error al obtener configuracion de lector:', err);
     return res.status(500).json({ message: 'Error al obtener configuracion de lector' });
   }
 });
@@ -4929,29 +5025,48 @@ app.put('/api/scanner-settings', async (req, res) => {
   const scannerBeepOnScan = normalizeBool(payload.scanner_beep_on_scan, false);
 
   try {
+    const deviceColumns = await getTableColumnSet(db, 'device_settings');
+    if (!deviceColumns.size) {
+      return res.status(404).json({ message: 'Tabla device_settings no disponible' });
+    }
+
+    const updateValuesByColumn = {
+      scanner_mode: scannerMode,
+      serial_port: serialPort,
+      baud_rate: baudRate,
+      data_bits: dataBits,
+      parity,
+      stop_bits: stopBits,
+      flow_control: flowControl,
+      scanner_suffix: scannerSuffix,
+      scanner_prefix_to_strip: scannerPrefixToStrip,
+      scanner_prefix_trim: scannerPrefixTrim,
+      scanner_only_numeric: scannerOnlyNumeric,
+      scanner_auto_focus: scannerAutoFocus,
+      scanner_beep_on_scan: scannerBeepOnScan,
+    };
+    const updatableEntries = Object.entries(updateValuesByColumn).filter(([columnName]) => deviceColumns.has(columnName));
+    if (!updatableEntries.length) {
+      return res.status(409).json({ message: 'No hay columnas de lector disponibles para actualizar' });
+    }
+
+    if (deviceColumns.has('id')) {
+      await db.query(
+        `INSERT INTO device_settings (id)
+         VALUES (1)
+         ON DUPLICATE KEY UPDATE id = id`
+      );
+    }
+
     await db.query(
       `UPDATE device_settings
-       SET scanner_mode = ?, serial_port = ?, baud_rate = ?, data_bits = ?, parity = ?, stop_bits = ?, flow_control = ?,
-           scanner_suffix = ?, scanner_prefix_to_strip = ?, scanner_prefix_trim = ?, scanner_only_numeric = ?, scanner_auto_focus = ?, scanner_beep_on_scan = ?
-       WHERE id = 1`,
-      [
-        scannerMode,
-        serialPort,
-        baudRate,
-        dataBits,
-        parity,
-        stopBits,
-        flowControl,
-        scannerSuffix,
-        scannerPrefixToStrip,
-        scannerPrefixTrim,
-        scannerOnlyNumeric,
-        scannerAutoFocus,
-        scannerBeepOnScan,
-      ]
+       SET ${updatableEntries.map(([columnName]) => `\`${columnName}\` = ?`).join(', ')}
+       ${deviceColumns.has('id') ? 'WHERE id = 1' : 'LIMIT 1'}`,
+      updatableEntries.map(([, value]) => value)
     );
     return res.json({ message: 'Configuracion de lector guardada' });
   } catch (err) {
+    console.error('Error al guardar configuracion de lector:', err);
     return res.status(500).json({ message: 'Error al guardar configuracion de lector' });
   }
 });
@@ -5638,7 +5753,7 @@ app.post('/api/purchase-order/close', async (req, res) => {
     );
     if (missingRows.length && !forceClose) {
       return res.status(409).json({
-        message: 'AÃºn faltan productos por ingresar en este pedido.',
+        message: 'AÃƒÂºn faltan productos por ingresar en este pedido.',
         missing_items: missingRows,
       });
     }
@@ -5709,7 +5824,7 @@ app.get('/api/purchase-orders/summary', async (req, res) => {
 app.get('/api/purchase-order/:id/detail', async (req, res) => {
   const orderId = toInt(req.params?.id);
   if (!orderId) {
-    return res.status(400).json({ message: 'Orden invÃ¡lida' });
+    return res.status(400).json({ message: 'Orden invÃƒÂ¡lida' });
   }
   try {
     const [orderRows] = await db.query(
@@ -5840,7 +5955,7 @@ app.post('/api/purchase-order/items', async (req, res) => {
 app.delete('/api/purchase-order/items/:itemId', async (req, res) => {
   const itemId = toInt(req.params?.itemId);
   if (!itemId) {
-    return res.status(400).json({ message: 'Item invÃ¡lido para eliminar' });
+    return res.status(400).json({ message: 'Item invÃƒÂ¡lido para eliminar' });
   }
 
   try {
@@ -5993,13 +6108,13 @@ app.post('/api/purchase-order/assign-email', async (req, res) => {
             <div style="font-size:12px; opacity:.95;">Solicitada por: ${String(requesterName || 'Usuario del sistema').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>
           </div>
           <div style="padding:14px 18px; color:#0f172a; font-size:13px;">
-            ${note ? `<div style="margin-bottom:10px;"><strong>ObservaciÃ³n:</strong> ${String(note).replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>` : ''}
+            ${note ? `<div style="margin-bottom:10px;"><strong>ObservaciÃƒÂ³n:</strong> ${String(note).replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>` : ''}
             <table role="presentation" cellspacing="0" cellpadding="0" style="width:100%; border-collapse:collapse; border:1px solid #e2e8f0;">
               <thead>
                 <tr style="background:#e2e8f0;">
                   <th style="padding:10px 8px; font-size:12px; text-align:left; color:#0f172a;">#</th>
                   <th style="padding:10px 8px; font-size:12px; text-align:left; color:#0f172a;">Producto</th>
-                  <th style="padding:10px 8px; font-size:12px; text-align:left; color:#0f172a;">CÃ³digo</th>
+                  <th style="padding:10px 8px; font-size:12px; text-align:left; color:#0f172a;">CÃƒÂ³digo</th>
                   <th style="padding:10px 8px; font-size:12px; text-align:right; color:#0f172a;">Solicitado</th>
                   <th style="padding:10px 8px; font-size:12px; text-align:right; color:#0f172a;">Recibido</th>
                   <th style="padding:10px 8px; font-size:12px; text-align:right; color:#0f172a;">Pendiente</th>
@@ -6561,6 +6676,89 @@ app.post('/api/promociones', async (req, res) => {
   }
 });
 
+app.put('/api/promociones/:id', async (req, res) => {
+  const promotionId = toInt(req.params?.id);
+  const name = toText(req.body?.nombre, 120);
+  const promoTypeRaw = String(req.body?.promo_type || 'single').trim().toLowerCase();
+  const promoType = promoTypeRaw === 'combo' ? 'combo' : 'single';
+  const minQty = toInt(req.body?.min_qty);
+  const discount = toNumber(req.body?.discount_percent);
+  const comboPrice = req.body?.combo_price === null || typeof req.body?.combo_price === 'undefined'
+    ? null
+    : toNumber(req.body?.combo_price);
+  const productIds = Array.isArray(req.body?.product_ids)
+    ? [...new Set(req.body.product_ids.map((id) => toInt(id)).filter((id) => id && id > 0))]
+    : [];
+
+  if (!promotionId || !name || !productIds.length) {
+    return res.status(400).json({ message: 'Datos de promocion invalidos' });
+  }
+  if (promoType === 'single' && (!minQty || minQty < 2 || discount === null || discount <= 0 || discount > 100)) {
+    return res.status(400).json({ message: 'Datos de promocion por cantidad invalidos' });
+  }
+  if (promoType === 'combo' && (productIds.length < 2 || comboPrice === null || comboPrice <= 0)) {
+    return res.status(400).json({ message: 'Datos de promocion invalidos' });
+  }
+
+  let connection;
+  try {
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+
+    const [existingRows] = await connection.query(
+      `SELECT id
+       FROM product_promotions
+       WHERE id = ? AND is_active = 1
+       LIMIT 1`,
+      [promotionId]
+    );
+    if (!existingRows.length) {
+      await connection.rollback();
+      return res.status(404).json({ message: 'Promocion no encontrada o inactiva' });
+    }
+
+    await connection.query(
+      `UPDATE product_promotions
+       SET nombre = ?,
+           promo_type = ?,
+           min_qty = ?,
+           discount_percent = ?,
+           combo_price = ?
+       WHERE id = ?`,
+      [
+        name,
+        promoType,
+        promoType === 'combo' ? 1 : minQty,
+        promoType === 'combo' ? 0 : discount,
+        promoType === 'combo' ? comboPrice : null,
+        promotionId,
+      ]
+    );
+
+    await connection.query(
+      'DELETE FROM product_promotion_items WHERE promotion_id = ?',
+      [promotionId]
+    );
+
+    for (const productId of productIds) {
+      await connection.query(
+        'INSERT INTO product_promotion_items (promotion_id, product_id) VALUES (?, ?)',
+        [promotionId, productId]
+      );
+    }
+
+    await connection.commit();
+    return res.json({ message: 'Promocion actualizada', id: promotionId });
+  } catch (err) {
+    if (connection) {
+      try { await connection.rollback(); } catch (_) {}
+    }
+    return res.status(500).json({ message: 'No se pudo actualizar promocion' });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
 app.post('/api/productos/import', async (req, res) => {
   const format = String(req.body?.format || '').toLowerCase();
   const rawData = req.body?.data;
@@ -7112,11 +7310,8 @@ app.post('/api/print/cut-session-ticket', async (req, res) => {
       movementParams
     );
     const [cashRows] = await db.query(
-      `SELECT COALESCE(SUM(
-          CASE WHEN vp.metodo_pago = 'efectivo' THEN vp.monto ELSE 0 END
-        ), 0) AS total_efectivo
+      `SELECT COALESCE(SUM(${buildCashAmountSql('v')}), 0) AS total_efectivo
        FROM ventas v
-       LEFT JOIN venta_pagos vp ON vp.venta_id = v.id_venta
        WHERE ${salesWhere}`,
       salesParams
     );
@@ -7366,17 +7561,7 @@ app.post('/api/print/cut-rebuilt-ticket', async (req, res) => {
       movementFilter.params
     );
     const [cashRows] = await db.query(
-      `SELECT COALESCE(SUM(
-          CASE
-            WHEN v.metodo_pago = 'efectivo' THEN v.total
-            WHEN v.metodo_pago = 'mixto' THEN
-              CASE
-                WHEN COALESCE(v.monto_efectivo, 0) > 0 THEN v.monto_efectivo
-                ELSE v.total / 2
-              END
-            ELSE 0
-          END
-        ), 0) AS total_efectivo
+      `SELECT COALESCE(SUM(${buildCashAmountSql('v')}), 0) AS total_efectivo
        FROM ventas v
        WHERE ${salesFilter.whereClause}`,
       salesFilter.params
@@ -8135,6 +8320,33 @@ async function fetchSalePaymentAllocations(executor, ventaId, fallbackSaleRow = 
   return buildSalePaymentAllocationsFromLegacyRow(fallbackSaleRow).allocations;
 }
 
+function normalizeSalePaymentAllocationsForCompare(allocations = []) {
+  return (Array.isArray(allocations) ? allocations : [])
+    .map((entry) => ({
+      metodo_pago: normalizeSalePaymentMethod(entry?.metodo_pago),
+      monto: Math.max(0, toClpAmount(entry?.monto || 0, 0)),
+    }))
+    .filter((entry) => entry.monto > 0)
+    .sort((a, b) => {
+      const byMethod = String(a.metodo_pago || '').localeCompare(String(b.metodo_pago || ''));
+      if (byMethod !== 0) return byMethod;
+      return Number(a.monto || 0) - Number(b.monto || 0);
+    });
+}
+
+function areSalePaymentAllocationsEqual(current = [], next = []) {
+  const normalizedCurrent = normalizeSalePaymentAllocationsForCompare(current);
+  const normalizedNext = normalizeSalePaymentAllocationsForCompare(next);
+  if (normalizedCurrent.length !== normalizedNext.length) return false;
+  for (let i = 0; i < normalizedCurrent.length; i += 1) {
+    const left = normalizedCurrent[i];
+    const right = normalizedNext[i];
+    if (left.metodo_pago !== right.metodo_pago) return false;
+    if (Number(left.monto || 0) !== Number(right.monto || 0)) return false;
+  }
+  return true;
+}
+
 async function backfillSalePaymentAllocations(executor = db) {
   const batchSize = 500;
   while (true) {
@@ -8190,6 +8402,30 @@ function buildCardLikeSqlList(alias = 'vp') {
   return `${alias}.metodo_pago IN ('tarjeta', 'dolares', 'transferencia', 'cheque', 'vale')`;
 }
 
+function buildMixedSaleConditionSql(alias = 'v') {
+  return `
+    (
+      LOWER(${alias}.metodo_pago) = 'mixto'
+      OR (
+        EXISTS (
+          SELECT 1
+          FROM venta_pagos vp_mix_cash
+          WHERE vp_mix_cash.venta_id = ${alias}.id_venta
+            AND vp_mix_cash.metodo_pago = 'efectivo'
+            AND COALESCE(vp_mix_cash.monto, 0) > 0
+        )
+        AND EXISTS (
+          SELECT 1
+          FROM venta_pagos vp_mix_card
+          WHERE vp_mix_card.venta_id = ${alias}.id_venta
+            AND ${buildCardLikeSqlList('vp_mix_card')}
+            AND COALESCE(vp_mix_card.monto, 0) > 0
+        )
+      )
+    )
+  `;
+}
+
 function buildCashAmountSql(alias = 'v') {
   return `
     CASE
@@ -8197,16 +8433,33 @@ function buildCashAmountSql(alias = 'v') {
         SELECT 1
         FROM venta_pagos vp_exists
         WHERE vp_exists.venta_id = ${alias}.id_venta
-      ) THEN COALESCE((
-        SELECT SUM(vp_cash.monto)
-        FROM venta_pagos vp_cash
-        WHERE vp_cash.venta_id = ${alias}.id_venta
-          AND vp_cash.metodo_pago = 'efectivo'
-      ), 0)
-      WHEN ${alias}.metodo_pago = 'efectivo' THEN ${alias}.total
-      WHEN ${alias}.metodo_pago = 'mixto' THEN
+      ) THEN
         CASE
-          WHEN COALESCE(${alias}.monto_efectivo, 0) > 0 THEN ${alias}.monto_efectivo
+          WHEN COALESCE((
+            SELECT SUM(vp_cash.monto)
+            FROM venta_pagos vp_cash
+            WHERE vp_cash.venta_id = ${alias}.id_venta
+              AND vp_cash.metodo_pago = 'efectivo'
+          ), 0) > 0 THEN COALESCE((
+            SELECT SUM(vp_cash.monto)
+            FROM venta_pagos vp_cash
+            WHERE vp_cash.venta_id = ${alias}.id_venta
+              AND vp_cash.metodo_pago = 'efectivo'
+          ), 0)
+          WHEN LOWER(${alias}.metodo_pago) = 'mixto' THEN
+            CASE
+              WHEN COALESCE(${alias}.monto_efectivo, 0) > 0 THEN COALESCE(${alias}.monto_efectivo, 0)
+              WHEN COALESCE(${alias}.monto_tarjeta, 0) > 0 THEN GREATEST(${alias}.total - COALESCE(${alias}.monto_tarjeta, 0), 0)
+              ELSE ${alias}.total / 2
+            END
+          WHEN LOWER(${alias}.metodo_pago) = 'efectivo' THEN ${alias}.total
+          ELSE 0
+        END
+      WHEN LOWER(${alias}.metodo_pago) = 'efectivo' THEN ${alias}.total
+      WHEN LOWER(${alias}.metodo_pago) = 'mixto' THEN
+        CASE
+          WHEN COALESCE(${alias}.monto_efectivo, 0) > 0 THEN COALESCE(${alias}.monto_efectivo, 0)
+          WHEN COALESCE(${alias}.monto_tarjeta, 0) > 0 THEN GREATEST(${alias}.total - COALESCE(${alias}.monto_tarjeta, 0), 0)
           ELSE ${alias}.total / 2
         END
       ELSE 0
@@ -8221,19 +8474,36 @@ function buildCardAmountSql(alias = 'v') {
         SELECT 1
         FROM venta_pagos vp_exists
         WHERE vp_exists.venta_id = ${alias}.id_venta
-      ) THEN COALESCE((
-        SELECT SUM(vp_card.monto)
-        FROM venta_pagos vp_card
-        WHERE vp_card.venta_id = ${alias}.id_venta
-          AND ${buildCardLikeSqlList('vp_card')}
-      ), 0)
-      WHEN ${alias}.metodo_pago = 'tarjeta' THEN ${alias}.total
-      WHEN ${alias}.metodo_pago = 'mixto' THEN
+      ) THEN
         CASE
-          WHEN COALESCE(${alias}.monto_tarjeta, 0) > 0 THEN ${alias}.monto_tarjeta
+          WHEN COALESCE((
+            SELECT SUM(vp_card.monto)
+            FROM venta_pagos vp_card
+            WHERE vp_card.venta_id = ${alias}.id_venta
+              AND ${buildCardLikeSqlList('vp_card')}
+          ), 0) > 0 THEN COALESCE((
+            SELECT SUM(vp_card.monto)
+            FROM venta_pagos vp_card
+            WHERE vp_card.venta_id = ${alias}.id_venta
+              AND ${buildCardLikeSqlList('vp_card')}
+          ), 0)
+          WHEN LOWER(${alias}.metodo_pago) = 'mixto' THEN
+            CASE
+              WHEN COALESCE(${alias}.monto_tarjeta, 0) > 0 THEN COALESCE(${alias}.monto_tarjeta, 0)
+              WHEN COALESCE(${alias}.monto_efectivo, 0) > 0 THEN GREATEST(${alias}.total - COALESCE(${alias}.monto_efectivo, 0), 0)
+              ELSE ${alias}.total / 2
+            END
+          WHEN LOWER(${alias}.metodo_pago) IN ('tarjeta', 'dolares', 'transferencia', 'cheque', 'vale') THEN ${alias}.total
+          ELSE 0
+        END
+      WHEN LOWER(${alias}.metodo_pago) = 'tarjeta' THEN ${alias}.total
+      WHEN LOWER(${alias}.metodo_pago) = 'mixto' THEN
+        CASE
+          WHEN COALESCE(${alias}.monto_tarjeta, 0) > 0 THEN COALESCE(${alias}.monto_tarjeta, 0)
+          WHEN COALESCE(${alias}.monto_efectivo, 0) > 0 THEN GREATEST(${alias}.total - COALESCE(${alias}.monto_efectivo, 0), 0)
           ELSE ${alias}.total / 2
         END
-      WHEN ${alias}.metodo_pago IN ('dolares', 'transferencia', 'cheque', 'vale') THEN ${alias}.total
+      WHEN LOWER(${alias}.metodo_pago) IN ('dolares', 'transferencia', 'cheque', 'vale') THEN ${alias}.total
       ELSE 0
     END
   `;
@@ -8271,15 +8541,17 @@ async function calculateShiftTotalsByTurno(turnoId, executor = db) {
   );
   const [cashAndCardRows] = await executor.query(
     `SELECT
-       COALESCE(SUM(
-         CASE WHEN vp.metodo_pago = 'efectivo' THEN vp.monto ELSE 0 END
-       ), 0) AS total_efectivo,
-       COALESCE(SUM(
-         CASE WHEN ${buildCardLikeSqlList('vp')} THEN vp.monto ELSE 0 END
-       ), 0) AS total_tarjeta
+       COALESCE(SUM(${buildCashAmountSql('v')}), 0) AS total_efectivo,
+       COALESCE(SUM(${buildCardAmountSql('v')}), 0) AS total_tarjeta
      FROM ventas v
-     LEFT JOIN venta_pagos vp ON vp.venta_id = v.id_venta
      WHERE v.turno_id = ?`,
+    [safeTurnoId]
+  );
+  const [mixedTotalRows] = await executor.query(
+    `SELECT COALESCE(SUM(v.total), 0) AS total_mixto
+     FROM ventas v
+     WHERE v.turno_id = ?
+       AND ${buildMixedSaleConditionSql('v')}`,
     [safeTurnoId]
   );
   const [movementRows] = await executor.query(
@@ -8290,11 +8562,7 @@ async function calculateShiftTotalsByTurno(turnoId, executor = db) {
     [safeTurnoId]
   );
 
-  let totalMixto = 0;
-  (Array.isArray(byPayment) ? byPayment : []).forEach((row) => {
-    if (String(row.metodo_pago || '').toLowerCase() !== 'mixto') return;
-    totalMixto += Number(row.total || 0);
-  });
+  const totalMixto = Number(mixedTotalRows[0]?.total_mixto || 0);
 
   const entradasDinero = sumMovementAmounts(movementRows, { type: 'entrada', field: 'total' });
   const salidasDinero = sumMovementAmounts(movementRows, { type: 'salida', field: 'total' });
@@ -8443,14 +8711,14 @@ app.get('/api/corte/historial', async (req, res) => {
     return res.status(400).json({ message: 'Parametros desde y hasta son obligatorios en formato YYYY-MM-DD' });
   }
 
-  const filters = ['fecha BETWEEN ? AND ?'];
+  const filters = ['c.fecha BETWEEN ? AND ?'];
   const values = [startDate, endDate];
   if (cajaId) {
-    filters.push('caja_id = ?');
+    filters.push('c.caja_id = ?');
     values.push(cajaId);
   }
   if (cajeroId) {
-    filters.push('usuario_id = ?');
+    filters.push('c.usuario_id = ?');
     values.push(cajeroId);
   }
 
@@ -9333,55 +9601,104 @@ app.get('/api/turno/estado', async (req, res) => {
 
 app.get('/api/sales/session-history', async (req, res) => {
   const cajaId = toInt(req.query?.caja);
-  const cajeroId = toInt(req.query?.cajero);
+  const requestedCajeroId = toInt(req.query?.cajero);
+  const requestedTurnoId = toInt(req.query?.turno);
   const limit = Math.min(1000, Math.max(1, toInt(req.query?.limit) || 300));
   const authUserId = toInt(req.user?.sub);
 
   if (!authUserId) {
     return res.status(401).json({ message: 'Sesion invalida' });
   }
-  if (!cajaId || !cajeroId) {
-    return res.status(400).json({ message: 'Caja y cajero son obligatorios' });
+  if (!cajaId) {
+    return res.status(400).json({ message: 'Caja es obligatoria' });
   }
 
   try {
+    const salesColumns = await getTableColumnSet(db, 'ventas');
+    const hasTurnoId = salesColumns.has('turno_id');
+    const hasFolioTicket = salesColumns.has('folio_ticket');
+    const hasNumeroTicket = salesColumns.has('numero_ticket');
+
     const [userRows] = await db.query(
       'SELECT id, es_administrador, nombre FROM usuarios WHERE id = ? LIMIT 1',
       [authUserId]
     );
     if (!userRows.length) {
-      return res.status(401).json({ message: 'Usuario no vÃ¡lido' });
+      return res.status(401).json({ message: 'Usuario no valido' });
     }
     const isAdmin = Number(userRows[0].es_administrador || 0) === 1;
+    const effectiveCajeroId = requestedCajeroId || authUserId;
+    if (!effectiveCajeroId || effectiveCajeroId !== authUserId) {
+      return res.status(403).json({ message: 'No autorizado para consultar ventas de otro cajero' });
+    }
 
-    let salesSql = `
-      SELECT v.id_venta, DATE_FORMAT(v.fecha, '%Y-%m-%d %H:%i:%s') AS fecha,
-             v.numero_ticket, v.folio_ticket, v.caja_id, v.usuario_id,
-             COALESCE(u.nombre, CONCAT('Usuario ', v.usuario_id)) AS cajero_nombre,
-             v.metodo_pago, v.total
-      FROM ventas v
-      LEFT JOIN usuarios u ON u.id = v.usuario_id
-      WHERE DATE(v.fecha) = CURDATE()
-    `;
-    const params = [];
-
-    if (!isAdmin) {
-      const [openRows] = await db.query(
+    let openRows = [];
+    try {
+      [openRows] = await db.query(
         `SELECT id_corte, hora_apertura
          FROM corte_caja
          WHERE fecha = CURDATE() AND caja_id = ? AND usuario_id = ? AND estado = 'abierto'
          ORDER BY id_corte DESC
          LIMIT 1`,
-        [cajaId, cajeroId]
+        [cajaId, effectiveCajeroId]
       );
-      if (openRows.length) {
-        const turnoId = Number(openRows[0].id_corte || 0) || 0;
-        salesSql += ' AND v.caja_id = ? AND v.usuario_id = ? AND v.fecha >= ? AND (v.turno_id = ? OR v.turno_id IS NULL)';
-        params.push(cajaId, cajeroId, openRows[0].hora_apertura, turnoId);
-      } else {
-        salesSql += ' AND v.caja_id = ? AND v.usuario_id = ?';
-        params.push(cajaId, cajeroId);
+    } catch (openShiftError) {
+      if (openShiftError?.code !== 'ER_NO_SUCH_TABLE') {
+        throw openShiftError;
       }
+    }
+
+    if (!openRows.length) {
+      return res.json({
+        is_admin: isAdmin ? 1 : 0,
+        caja_id: cajaId,
+        usuario_id: effectiveCajeroId,
+        turno_id: null,
+        ventas: [],
+      });
+    }
+
+    const currentTurnoId = Number(openRows[0].id_corte || 0) || 0;
+    if (requestedTurnoId && requestedTurnoId !== currentTurnoId) {
+      return res.json({
+        is_admin: isAdmin ? 1 : 0,
+        caja_id: cajaId,
+        usuario_id: effectiveCajeroId,
+        turno_id: currentTurnoId || null,
+        ventas: [],
+      });
+    }
+
+    const ticketSelect = hasFolioTicket
+      ? `COALESCE(NULLIF(v.folio_ticket, ''), ${hasNumeroTicket ? 'CAST(v.numero_ticket AS CHAR)' : 'CAST(v.id_venta AS CHAR)'}) AS numero_ticket,
+         v.folio_ticket`
+      : `${hasNumeroTicket ? 'CAST(v.numero_ticket AS CHAR)' : 'CAST(v.id_venta AS CHAR)'} AS numero_ticket,
+         NULL AS folio_ticket`;
+    const shiftSelect = hasTurnoId
+      ? 'v.turno_id AS turno_id'
+      : 'NULL AS turno_id';
+
+    let salesSql = `
+      SELECT v.id_venta, DATE_FORMAT(v.fecha, '%Y-%m-%d %H:%i:%s') AS fecha,
+             ${ticketSelect},
+             v.caja_id, v.usuario_id, ${shiftSelect},
+             COALESCE(u.nombre, CONCAT('Usuario ', v.usuario_id)) AS cajero_nombre,
+             v.metodo_pago, v.total,
+             COALESCE(v.pago_modificado, 0) AS pago_modificado
+      FROM ventas v
+      LEFT JOIN usuarios u ON u.id = v.usuario_id
+      WHERE DATE(v.fecha) = CURDATE()
+        AND v.caja_id = ?
+        AND v.usuario_id = ?
+    `;
+    const params = [cajaId, effectiveCajeroId];
+
+    if (hasTurnoId) {
+      salesSql += ' AND (v.turno_id = ? OR (v.turno_id IS NULL AND v.fecha >= ?))';
+      params.push(currentTurnoId, openRows[0].hora_apertura);
+    } else {
+      salesSql += ' AND v.fecha >= ?';
+      params.push(openRows[0].hora_apertura);
     }
 
     salesSql += ' ORDER BY v.fecha DESC, v.id_venta DESC LIMIT ?';
@@ -9390,11 +9707,323 @@ app.get('/api/sales/session-history', async (req, res) => {
     const [rows] = await db.query(salesSql, params);
     return res.json({
       is_admin: isAdmin ? 1 : 0,
+      caja_id: cajaId,
+      usuario_id: effectiveCajeroId,
+      turno_id: currentTurnoId || null,
       ventas: rows,
     });
   } catch (error) {
     console.error('Error al obtener historial de ventas de sesion:', error);
     return res.status(500).json({ message: 'No se pudo obtener historial de ventas' });
+  }
+});
+app.get('/api/sales/:saleId/detail', async (req, res) => {
+  const saleId = toInt(req.params?.saleId);
+  const cajaId = toInt(req.query?.caja);
+  const cajeroId = toInt(req.query?.cajero);
+  const authUserId = toInt(req.user?.sub);
+
+  if (!authUserId) {
+    return res.status(401).json({ message: 'Sesion invalida' });
+  }
+  if (!saleId) {
+    return res.status(400).json({ message: 'Venta invalida' });
+  }
+
+  try {
+    const [userRows] = await db.query(
+      'SELECT id, es_administrador FROM usuarios WHERE id = ? LIMIT 1',
+      [authUserId]
+    );
+    if (!userRows.length) {
+      return res.status(401).json({ message: 'Usuario no valido' });
+    }
+    const isAdmin = Number(userRows[0].es_administrador || 0) === 1;
+    if (!isAdmin) {
+      if (!cajaId || !cajeroId || authUserId !== cajeroId) {
+        return res.status(403).json({ message: 'No autorizado para consultar esta venta' });
+      }
+      const [openRows] = await db.query(
+        `SELECT id_corte, hora_apertura
+         FROM corte_caja
+         WHERE fecha = CURDATE() AND caja_id = ? AND usuario_id = ? AND estado = 'abierto'
+         ORDER BY id_corte DESC
+         LIMIT 1`,
+        [cajaId, cajeroId]
+      );
+      let accessSql = `
+        SELECT 1 AS ok
+        FROM ventas v
+        WHERE v.id_venta = ?
+          AND v.caja_id = ?
+          AND v.usuario_id = ?
+          AND DATE(v.fecha) = CURDATE()
+      `;
+      const accessParams = [saleId, cajaId, cajeroId];
+      if (openRows.length) {
+        accessSql += ' AND (v.turno_id = ? OR (v.turno_id IS NULL AND v.fecha >= ?))';
+        accessParams.push(Number(openRows[0].id_corte || 0), openRows[0].hora_apertura);
+      }
+      accessSql += ' LIMIT 1';
+      const [allowedRows] = await db.query(accessSql, accessParams);
+      if (!allowedRows.length) {
+        return res.status(403).json({ message: 'No autorizado para consultar esta venta' });
+      }
+    }
+
+    const [saleRows] = await db.query(
+      `SELECT v.id_venta,
+              DATE_FORMAT(v.fecha, '%Y-%m-%d %H:%i:%s') AS fecha,
+              COALESCE(NULLIF(v.folio_ticket, ''), CAST(v.numero_ticket AS CHAR)) AS numero_ticket,
+              v.numero_ticket AS numero_ticket_raw,
+              v.folio_ticket,
+              v.caja_id,
+              v.usuario_id,
+              COALESCE(u.nombre, CONCAT('Usuario ', v.usuario_id)) AS cajero_nombre,
+              v.metodo_pago,
+              v.total,
+              v.monto_efectivo,
+              v.monto_tarjeta,
+              COALESCE(v.pago_modificado, 0) AS pago_modificado,
+              DATE_FORMAT(v.pago_modificado_at, '%Y-%m-%d %H:%i:%s') AS pago_modificado_at,
+              v.pago_modificado_por,
+              COALESCE(um.nombre, CONCAT('Usuario ', v.pago_modificado_por)) AS pago_modificado_por_nombre
+       FROM ventas v
+       LEFT JOIN usuarios u ON u.id = v.usuario_id
+       LEFT JOIN usuarios um ON um.id = v.pago_modificado_por
+       WHERE v.id_venta = ?
+       LIMIT 1`,
+      [saleId]
+    );
+    if (!saleRows.length) {
+      return res.status(404).json({ message: 'Venta no encontrada' });
+    }
+    const sale = saleRows[0];
+
+    const [itemRows] = await db.query(
+      `SELECT d.id_detalle,
+              COALESCE(d.producto_id, 0) AS producto_id,
+              COALESCE(NULLIF(d.descripcion, ''), p.descripcion, 'Producto') AS descripcion,
+              COALESCE(d.cantidad, 0) AS cantidad,
+              COALESCE(d.precio_unitario, 0) AS precio_unitario,
+              COALESCE(d.subtotal, 0) AS subtotal
+       FROM detalle_venta d
+       LEFT JOIN productos p ON p.id_producto = d.producto_id
+       WHERE d.venta_id = ?
+       ORDER BY d.id_detalle ASC`,
+      [saleId]
+    );
+
+    const paymentBreakdown = await fetchSalePaymentAllocations(db, saleId, sale);
+    return res.json({
+      sale: {
+        id_venta: Number(sale.id_venta || 0),
+        fecha: String(sale.fecha || '').trim(),
+        numero_ticket: String(sale.numero_ticket || sale.numero_ticket_raw || '').trim(),
+        folio_ticket: String(sale.folio_ticket || '').trim(),
+        caja_id: Number(sale.caja_id || 0),
+        usuario_id: Number(sale.usuario_id || 0),
+        cajero_nombre: String(sale.cajero_nombre || '').trim(),
+        metodo_pago: String(sale.metodo_pago || '').trim().toLowerCase(),
+        total: Math.max(0, Number(sale.total || 0)),
+        monto_efectivo: Math.max(0, Number(sale.monto_efectivo || 0)),
+        monto_tarjeta: Math.max(0, Number(sale.monto_tarjeta || 0)),
+        pago_modificado: Number(sale.pago_modificado || 0) === 1 ? 1 : 0,
+        pago_modificado_at: sale.pago_modificado_at || null,
+        pago_modificado_por: sale.pago_modificado_por ? Number(sale.pago_modificado_por) : null,
+        pago_modificado_por_nombre: String(sale.pago_modificado_por_nombre || '').trim(),
+      },
+      items: (Array.isArray(itemRows) ? itemRows : []).map((row) => ({
+        id_detalle: Number(row.id_detalle || 0),
+        producto_id: Number(row.producto_id || 0),
+        descripcion: String(row.descripcion || '').trim() || 'Producto',
+        cantidad: Number(row.cantidad || 0),
+        precio_unitario: Math.max(0, Number(row.precio_unitario || 0)),
+        subtotal: Math.max(0, Number(row.subtotal || 0)),
+      })),
+      payment_breakdown: (Array.isArray(paymentBreakdown) ? paymentBreakdown : []).map((row) => ({
+        metodo_pago: normalizeSalePaymentMethod(row.metodo_pago),
+        monto: Math.max(0, Number(row.monto || 0)),
+      })),
+    });
+  } catch (error) {
+    console.error('Error al obtener detalle de venta:', error);
+    return res.status(500).json({ message: 'No se pudo obtener detalle de la venta' });
+  }
+});
+
+app.put('/api/sales/:saleId/payment', async (req, res) => {
+  const saleId = toInt(req.params?.saleId);
+  const cajaId = toInt(req.body?.caja ?? req.query?.caja);
+  const cajeroId = toInt(req.body?.cajero ?? req.query?.cajero);
+  const authUserId = toInt(req.user?.sub);
+  const methodRaw = String(req.body?.metodo_pago || '').trim().toLowerCase();
+  const allowedMethods = new Set(['efectivo', 'tarjeta', 'mixto', 'dolares', 'transferencia', 'cheque', 'vale']);
+  const efectivoIn = toNumber(req.body?.monto_efectivo);
+  const tarjetaIn = toNumber(req.body?.monto_tarjeta);
+
+  if (!authUserId) {
+    return res.status(401).json({ message: 'Sesion invalida' });
+  }
+  if (!saleId) {
+    return res.status(400).json({ message: 'Venta invalida' });
+  }
+  if (!allowedMethods.has(methodRaw)) {
+    return res.status(400).json({ message: 'Metodo de pago invalido' });
+  }
+
+  let connection;
+  try {
+    const [userRows] = await db.query(
+      'SELECT id, es_administrador FROM usuarios WHERE id = ? LIMIT 1',
+      [authUserId]
+    );
+    if (!userRows.length) {
+      return res.status(401).json({ message: 'Usuario no valido' });
+    }
+    const isAdmin = Number(userRows[0].es_administrador || 0) === 1;
+    if (!isAdmin && (!cajaId || !cajeroId || authUserId !== cajeroId)) {
+      return res.status(403).json({ message: 'No autorizado para editar esta venta' });
+    }
+
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+
+    const [saleRows] = await connection.query(
+      `SELECT id_venta, fecha, caja_id, usuario_id, turno_id, metodo_pago, total, monto_efectivo, monto_tarjeta,
+              COALESCE(pago_modificado, 0) AS pago_modificado
+       FROM ventas
+       WHERE id_venta = ?
+       LIMIT 1`,
+      [saleId]
+    );
+    if (!saleRows.length) {
+      await connection.rollback();
+      return res.status(404).json({ message: 'Venta no encontrada' });
+    }
+    const sale = saleRows[0];
+
+    if (!isAdmin) {
+      const [openRows] = await connection.query(
+        `SELECT id_corte, hora_apertura
+         FROM corte_caja
+         WHERE fecha = CURDATE() AND caja_id = ? AND usuario_id = ? AND estado = 'abierto'
+         ORDER BY id_corte DESC
+         LIMIT 1`,
+        [cajaId, cajeroId]
+      );
+      let accessSql = `
+        SELECT 1 AS ok
+        FROM ventas v
+        WHERE v.id_venta = ?
+          AND v.caja_id = ?
+          AND v.usuario_id = ?
+          AND DATE(v.fecha) = CURDATE()
+      `;
+      const accessParams = [saleId, cajaId, cajeroId];
+      if (openRows.length) {
+        accessSql += ' AND (v.turno_id = ? OR (v.turno_id IS NULL AND v.fecha >= ?))';
+        accessParams.push(Number(openRows[0].id_corte || 0), openRows[0].hora_apertura);
+      }
+      accessSql += ' LIMIT 1';
+      const [allowedRows] = await connection.query(accessSql, accessParams);
+      if (!allowedRows.length) {
+        await connection.rollback();
+        return res.status(403).json({ message: 'No autorizado para editar esta venta' });
+      }
+    }
+
+    const total = Math.max(0, toClpAmount(sale.total || 0, 0));
+    if (!Number.isFinite(total) || total <= 0) {
+      await connection.rollback();
+      return res.status(400).json({ message: 'No se puede editar una venta con total invalido' });
+    }
+
+    let allocations = [];
+    let normalizedMethod = methodRaw;
+    let montoEfectivo = 0;
+    let montoTarjeta = 0;
+
+    if (normalizedMethod === 'mixto') {
+      const tarjetaIngresada = Number.isFinite(tarjetaIn) && tarjetaIn >= 0
+        ? Math.max(0, toClpAmount(tarjetaIn, 0))
+        : 0;
+      const efectivoIngresado = Number.isFinite(efectivoIn) && efectivoIn >= 0
+        ? Math.max(0, toClpAmount(efectivoIn, 0))
+        : 0;
+      if (tarjetaIngresada > total) {
+        await connection.rollback();
+        return res.status(400).json({ message: 'Pago mixto invalido: tarjeta supera total de la venta' });
+      }
+      const efectivoRequerido = Math.max(0, total - tarjetaIngresada);
+      if (efectivoIngresado < efectivoRequerido) {
+        await connection.rollback();
+        return res.status(400).json({ message: 'Pago mixto invalido: efectivo insuficiente' });
+      }
+      montoTarjeta = tarjetaIngresada;
+      montoEfectivo = efectivoRequerido;
+      if (montoEfectivo > 0) allocations.push({ metodo_pago: 'efectivo', monto: montoEfectivo });
+      if (montoTarjeta > 0) allocations.push({ metodo_pago: 'tarjeta', monto: montoTarjeta });
+      if (!allocations.length) {
+        normalizedMethod = 'efectivo';
+        montoEfectivo = total;
+        montoTarjeta = 0;
+        allocations = [{ metodo_pago: 'efectivo', monto: total }];
+      }
+    } else {
+      const normalizedSingleMethod = normalizeSalePaymentMethod(normalizedMethod);
+      allocations = [{ metodo_pago: normalizedSingleMethod, monto: total }];
+      if (normalizedSingleMethod === 'efectivo') {
+        montoEfectivo = total;
+      } else if (normalizedSingleMethod === 'tarjeta' || CARD_LIKE_PAYMENT_METHODS.includes(normalizedSingleMethod)) {
+        montoTarjeta = total;
+      }
+    }
+
+    const previousAllocations = await fetchSalePaymentAllocations(connection, saleId, sale);
+    const methodChanged = String(sale.metodo_pago || '').trim().toLowerCase() !== normalizedMethod;
+    const efectivoChanged = Math.abs(Number(sale.monto_efectivo || 0) - montoEfectivo) > 0.0001;
+    const tarjetaChanged = Math.abs(Number(sale.monto_tarjeta || 0) - montoTarjeta) > 0.0001;
+    const allocationsChanged = !areSalePaymentAllocationsEqual(previousAllocations, allocations);
+    const hasChanged = methodChanged || efectivoChanged || tarjetaChanged || allocationsChanged;
+
+    await connection.query('DELETE FROM venta_pagos WHERE venta_id = ?', [saleId]);
+    await insertSalePaymentAllocations(connection, saleId, allocations);
+
+    await connection.query(
+      `UPDATE ventas
+       SET metodo_pago = ?,
+           monto_efectivo = ?,
+           monto_tarjeta = ?,
+           pago_modificado = CASE WHEN ? = 1 THEN 1 ELSE pago_modificado END,
+           pago_modificado_at = CASE WHEN ? = 1 THEN NOW() ELSE pago_modificado_at END,
+           pago_modificado_por = CASE WHEN ? = 1 THEN ? ELSE pago_modificado_por END
+       WHERE id_venta = ?`,
+      [
+        normalizedMethod,
+        montoEfectivo,
+        montoTarjeta,
+        hasChanged ? 1 : 0,
+        hasChanged ? 1 : 0,
+        hasChanged ? 1 : 0,
+        authUserId,
+        saleId,
+      ]
+    );
+
+    await connection.commit();
+    return res.json({
+      message: hasChanged ? 'Forma de pago actualizada' : 'Sin cambios en forma de pago',
+      updated: hasChanged ? 1 : 0,
+    });
+  } catch (error) {
+    if (connection) {
+      try { await connection.rollback(); } catch (_) {}
+    }
+    console.error('Error al editar forma de pago de venta:', error);
+    return res.status(500).json({ message: 'No se pudo editar la forma de pago' });
+  } finally {
+    if (connection) connection.release();
   }
 });
 
@@ -9565,38 +10194,38 @@ app.get('/api/turno/resumen', async (req, res) => {
       salesParams
     );
 
+    const mixedSalesWhere = `${salesWhere} AND ${buildMixedSaleConditionSql('v')}`;
     const [mixedSalesRowsRaw] = await db.query(
       `SELECT
          v.id_venta,
-         v.folio_ticket,
-         v.monto_efectivo,
-         v.monto_tarjeta,
+         DATE_FORMAT(v.fecha, '%Y-%m-%d %H:%i:%s') AS fecha,
+         COALESCE(NULLIF(v.folio_ticket, ''), CAST(v.numero_ticket AS CHAR)) AS numero_ticket,
+         ${buildCashAmountSql('v')} AS efectivo,
+         ${buildCardAmountSql('v')} AS tarjeta,
          v.total
        FROM ventas v
-       WHERE LOWER(v.metodo_pago) = 'mixto'
-         AND v.turno_id = ?
-       ORDER BY v.id_venta ASC
+       WHERE ${mixedSalesWhere}
+       ORDER BY v.fecha ASC, v.id_venta ASC
        LIMIT 1000`,
-      [openShiftId]
+      salesParams
     );
     const mixedSalesRows = (Array.isArray(mixedSalesRowsRaw) ? mixedSalesRowsRaw : []).map((row) => ({
       id_venta: Number(row.id_venta || 0),
-      fecha: '',
-      numero_ticket: String(row.folio_ticket || '').trim(),
-      efectivo: toPositiveAmount(row.monto_efectivo, 0),
-      tarjeta: toPositiveAmount(row.monto_tarjeta, 0),
+      fecha: String(row.fecha || '').trim(),
+      numero_ticket: String(row.numero_ticket || '').trim(),
+      efectivo: toPositiveAmount(row.efectivo, 0),
+      tarjeta: toPositiveAmount(row.tarjeta, 0),
       total: toPositiveAmount(row.total, 0),
     }));
     const [mixedSummaryRows] = await db.query(
       `SELECT
          COUNT(*) AS ventas_mixtas,
-         COALESCE(SUM(monto_efectivo), 0) AS efectivo_mixto,
-         COALESCE(SUM(monto_tarjeta), 0) AS tarjeta_mixto,
-         COALESCE(SUM(total), 0) AS total_mixto
-       FROM ventas
-       WHERE LOWER(metodo_pago) = 'mixto'
-         AND turno_id = ?`,
-      [openShiftId]
+         COALESCE(SUM(${buildCashAmountSql('v')}), 0) AS efectivo_mixto,
+         COALESCE(SUM(${buildCardAmountSql('v')}), 0) AS tarjeta_mixto,
+         COALESCE(SUM(v.total), 0) AS total_mixto
+       FROM ventas v
+       WHERE ${mixedSalesWhere}`,
+      salesParams
     );
     const mixedSummaryRow = Array.isArray(mixedSummaryRows) && mixedSummaryRows[0]
       ? mixedSummaryRows[0]
@@ -9611,38 +10240,6 @@ app.get('/api/turno/resumen', async (req, res) => {
       tarjeta_mixto: toPositiveAmount(mixedSummaryRow.tarjeta_mixto, 0),
       total_mixto: toPositiveAmount(mixedSummaryRow.total_mixto, 0),
     };
-    if (scope === 'session' && mixedSummary.count <= 0) {
-      const [mixedSummaryFallbackRows] = await db.query(
-        `SELECT
-           COUNT(*) AS ventas_mixtas,
-           COALESCE(SUM(v.monto_efectivo), 0) AS efectivo_mixto,
-           COALESCE(SUM(v.monto_tarjeta), 0) AS tarjeta_mixto,
-           COALESCE(SUM(v.total), 0) AS total_mixto
-         FROM ventas v
-         WHERE v.caja_id = ?
-           AND v.usuario_id = ?
-           AND DATE(v.fecha) = CURDATE()
-           AND v.fecha >= ?
-           AND (v.turno_id = ? OR v.turno_id IS NULL)
-           AND LOWER(v.metodo_pago) = 'mixto'`,
-        [cajaId, cajeroId, sessionStart, openShiftId]
-      );
-      const fallbackRow = Array.isArray(mixedSummaryFallbackRows) && mixedSummaryFallbackRows[0]
-        ? mixedSummaryFallbackRows[0]
-        : {};
-      const fallbackCount = toPositiveAmount(fallbackRow.ventas_mixtas, 0);
-      if (fallbackCount > 0) {
-        mixedSummary.count = fallbackCount;
-        mixedSummary.efectivo = toPositiveAmount(fallbackRow.efectivo_mixto, 0);
-        mixedSummary.tarjeta = toPositiveAmount(fallbackRow.tarjeta_mixto, 0);
-        mixedSummary.total = toPositiveAmount(fallbackRow.total_mixto, 0);
-        mixedSummary.ventas_mixtas = mixedSummary.count;
-        mixedSummary.efectivo_mixto = mixedSummary.efectivo;
-        mixedSummary.tarjeta_mixto = mixedSummary.tarjeta;
-        mixedSummary.total_mixto = mixedSummary.total;
-      }
-    }
-
     const [profitRows] = await db.query(
       `SELECT COALESCE(SUM((d.precio_unitario - COALESCE(p.costo, 0)) * d.cantidad), 0) AS ganancia
        FROM detalle_venta d
@@ -9729,14 +10326,9 @@ app.get('/api/turno/resumen', async (req, res) => {
 
     const [cashAndCardRows] = await db.query(
       `SELECT
-         COALESCE(SUM(
-           CASE WHEN vp.metodo_pago = 'efectivo' THEN vp.monto ELSE 0 END
-         ), 0) AS total_efectivo,
-         COALESCE(SUM(
-           CASE WHEN ${buildCardLikeSqlList('vp')} THEN vp.monto ELSE 0 END
-         ), 0) AS total_tarjeta
+         COALESCE(SUM(${buildCashAmountSql('v')}), 0) AS total_efectivo,
+         COALESCE(SUM(${buildCardAmountSql('v')}), 0) AS total_tarjeta
        FROM ventas v
-       LEFT JOIN venta_pagos vp ON vp.venta_id = v.id_venta
        WHERE ${salesWhere}`,
       salesParams
     );
@@ -9864,7 +10456,7 @@ app.post('/api/cash-movements', async (req, res) => {
   const allowedMethods = new Set(['efectivo', 'tarjeta', 'dolares', 'transferencia', 'cheque', 'vale', 'otro']);
 
   if (!cajaId || !cajeroId || !allowedTypes.has(tipoRaw) || monto === null || monto <= 0) {
-    return res.status(400).json({ message: 'Datos invÃ¡lidos para movimiento de caja' });
+    return res.status(400).json({ message: 'Datos invÃƒÂ¡lidos para movimiento de caja' });
   }
   if (tipoRaw === 'salida' && !descripcion) {
     return res.status(400).json({ message: 'La salida requiere descripcion' });
@@ -10741,17 +11333,6 @@ app.post('/api/corte/cerrar', async (req, res) => {
     const shiftId = Number(existing[0].id_corte || 0);
     const shiftStart = existing[0].hora_apertura;
 
-    const [byPayment] = await db.query(
-      `SELECT vp.metodo_pago, COUNT(DISTINCT v.id_venta) AS transacciones, COALESCE(SUM(vp.monto), 0) AS total
-       FROM ventas v
-       INNER JOIN venta_pagos vp ON vp.venta_id = v.id_venta
-       WHERE v.caja_id = ? AND v.usuario_id = ?
-         AND v.fecha >= ?
-         AND (v.turno_id = ? OR v.turno_id IS NULL)
-       GROUP BY vp.metodo_pago`,
-      [cajaId, cajeroId, shiftStart, shiftId]
-    );
-
     const [totals] = await db.query(
       `SELECT COUNT(*) AS transacciones, COALESCE(SUM(total), 0) AS total
        FROM ventas
@@ -10763,17 +11344,21 @@ app.post('/api/corte/cerrar', async (req, res) => {
 
     const [cashAndCardRows] = await db.query(
       `SELECT
-         COALESCE(SUM(
-           CASE WHEN vp.metodo_pago = 'efectivo' THEN vp.monto ELSE 0 END
-         ), 0) AS total_efectivo,
-         COALESCE(SUM(
-           CASE WHEN ${buildCardLikeSqlList('vp')} THEN vp.monto ELSE 0 END
-         ), 0) AS total_tarjeta
+         COALESCE(SUM(${buildCashAmountSql('v')}), 0) AS total_efectivo,
+         COALESCE(SUM(${buildCardAmountSql('v')}), 0) AS total_tarjeta
        FROM ventas v
-       LEFT JOIN venta_pagos vp ON vp.venta_id = v.id_venta
        WHERE v.caja_id = ? AND v.usuario_id = ?
          AND v.fecha >= ?
          AND (v.turno_id = ? OR v.turno_id IS NULL)`,
+      [cajaId, cajeroId, shiftStart, shiftId]
+    );
+    const [mixedTotalRows] = await db.query(
+      `SELECT COALESCE(SUM(v.total), 0) AS total_mixto
+       FROM ventas v
+       WHERE v.caja_id = ? AND v.usuario_id = ?
+         AND v.fecha >= ?
+         AND (v.turno_id = ? OR v.turno_id IS NULL)
+         AND ${buildMixedSaleConditionSql('v')}`,
       [cajaId, cajeroId, shiftStart, shiftId]
     );
 
@@ -10791,18 +11376,10 @@ app.post('/api/corte/cerrar', async (req, res) => {
 
     let totalEfectivo = Number(cashAndCardRows[0]?.total_efectivo || 0);
     let totalTarjeta = Number(cashAndCardRows[0]?.total_tarjeta || 0);
-    let totalMixto = 0;
+    const totalMixto = Number(mixedTotalRows[0]?.total_mixto || 0);
     const entradasDinero = sumMovementAmounts(movementRows, { type: 'entrada', field: 'total' });
     const salidasDinero = sumMovementAmounts(movementRows, { type: 'salida', field: 'total' });
     const abonosEfectivo = sumMovementAmounts(movementRows, { type: 'abono', field: 'total' });
-
-    for (const row of byPayment) {
-      const amount = Number(row.total) || 0;
-      if (row.metodo_pago === 'mixto') {
-        totalMixto = amount;
-        continue;
-      }
-    }
 
     const [cutSettingRows] = await db.query('SELECT cut_mode FROM personalization_settings WHERE id = 1 LIMIT 1');
     const cutMode = cutSettingRows.length > 0 && cutSettingRows[0].cut_mode === 'sin_ajuste'
@@ -10996,7 +11573,7 @@ app.post('/api/auth/verify-admin', async (req, res) => {
   const sectionId = rawSectionId ? rawSectionId.toLowerCase() : '';
 
   if (!usernameInput || !passwordInput) {
-    return res.status(400).json({ message: 'Debes ingresar usuario y contraseña.' });
+    return res.status(400).json({ message: 'Debes ingresar usuario y contraseÃ±a.' });
   }
 
   const sectionPermissionMap = {
@@ -11014,7 +11591,7 @@ app.post('/api/auth/verify-admin', async (req, res) => {
 
   for (const field of requiredPermissions) {
     if (!CASHIER_PERMISSION_FIELDS.includes(field)) {
-      return res.status(400).json({ message: 'Sección inválida para autorización.' });
+      return res.status(400).json({ message: 'SecciÃ³n invÃ¡lida para autorizaciÃ³n.' });
     }
   }
 
@@ -11034,7 +11611,7 @@ app.post('/api/auth/verify-admin', async (req, res) => {
       );
       rows = permissionRows;
     } catch (permissionQueryError) {
-      // Fallback defensivo: permite validar admin aunque la tabla/permisos esté desfasada.
+      // Fallback defensivo: permite validar admin aunque la tabla/permisos estÃ© desfasada.
       usedPermissionFallback = true;
       console.error('Fallback en verify-admin (consulta permisos):', permissionQueryError?.message || permissionQueryError);
       const [basicRows] = await db.query(
@@ -11049,7 +11626,7 @@ app.post('/api/auth/verify-admin', async (req, res) => {
     }
 
     if (!rows.length) {
-      return res.status(401).json({ message: 'Credenciales de administrador inválidas.' });
+      return res.status(401).json({ message: 'Credenciales de administrador invÃ¡lidas.' });
     }
 
     const user = rows[0];
@@ -11065,7 +11642,7 @@ app.post('/api/auth/verify-admin', async (req, res) => {
     }
 
     if (!passwordOk) {
-      return res.status(401).json({ message: 'Credenciales de administrador inválidas.' });
+      return res.status(401).json({ message: 'Credenciales de administrador invÃ¡lidas.' });
     }
 
     const isAdmin = Number(user.es_administrador || 0) === 1;
@@ -11076,10 +11653,10 @@ app.post('/api/auth/verify-admin', async (req, res) => {
       if (requiredPermissions.length) {
         if (usedPermissionFallback) {
           return res.status(403).json({
-            message: 'No fue posible validar permisos por sección. Usa una cuenta administrador para autorizar.',
+            message: 'No fue posible validar permisos por secciÃ³n. Usa una cuenta administrador para autorizar.',
           });
         }
-        return res.status(403).json({ message: 'El usuario no tiene permisos para autorizar esta sección.' });
+        return res.status(403).json({ message: 'El usuario no tiene permisos para autorizar esta secciÃ³n.' });
       }
       return res.status(403).json({ message: 'El usuario ingresado no tiene perfil administrador.' });
     }
@@ -11485,7 +12062,7 @@ app.post('/api/sales', async (req, res) => {
     return res.status(400).json({ error: 'Productos invalidos' });
   }
 
-  const items = producto.map((item) => {
+  let items = producto.map((item) => {
     const id = toInt(item.id_producto);
     const qty = toNumber(item.quantity);
     const unitPrice = toNumber(item.precio_venta);
@@ -11506,6 +12083,30 @@ app.post('/api/sales', async (req, res) => {
   if (items.some((item) => item.isCommon && (!Number.isFinite(item.unitPrice) || item.unitPrice <= 0 || !item.desc))) {
     return res.status(400).json({ error: 'Producto comun invalido' });
   }
+
+  // Unificamos lÃ­neas del mismo producto para que promociones por cantidad
+  // (ej. 2x1) se apliquen aunque el frontend envÃ­e duplicados separados.
+  const mergedItems = [];
+  const mergeIndexByProductId = new Map();
+  items.forEach((item) => {
+    const canMerge = !item.isCommon
+      && !item.isBulk
+      && Number(item.id || 0) > 0
+      && (!Number.isFinite(item.lineSubtotal) || Number(item.lineSubtotal || 0) <= 0);
+    if (!canMerge) {
+      mergedItems.push(item);
+      return;
+    }
+    const productId = Number(item.id || 0);
+    const existingIndex = mergeIndexByProductId.get(productId);
+    if (Number.isInteger(existingIndex) && existingIndex >= 0 && mergedItems[existingIndex]) {
+      mergedItems[existingIndex].qty += Number(item.qty || 0);
+      return;
+    }
+    mergeIndexByProductId.set(productId, mergedItems.length);
+    mergedItems.push({ ...item });
+  });
+  items = mergedItems;
 
   const uniqueIds = [...new Set(items.filter((item) => !item.isCommon).map((item) => item.id))];
   let connection;
@@ -11571,11 +12172,20 @@ app.post('/api/sales', async (req, res) => {
         if (!singlePromotionRulesByProduct.has(productId)) {
           singlePromotionRulesByProduct.set(productId, []);
         }
+        const fallbackSingleRule = parseSinglePromotionPattern(row.promotion_name || '');
+        const minQtyRaw = Number(row.min_qty || 0);
+        const discountRaw = Number(row.discount_percent || 0);
+        const normalizedMinQty = (Number.isFinite(minQtyRaw) && minQtyRaw > 0)
+          ? minQtyRaw
+          : Number(fallbackSingleRule?.minQty || 0);
+        const normalizedDiscount = (Number.isFinite(discountRaw) && discountRaw > 0)
+          ? discountRaw
+          : Number(fallbackSingleRule?.discountPercent || 0);
         singlePromotionRulesByProduct.get(productId).push({
           promotionId,
           promotionName: row.promotion_name || 'Promocion',
-          minQty: Number(row.min_qty || 0),
-          discountPercent: Number(row.discount_percent || 0),
+          minQty: normalizedMinQty,
+          discountPercent: normalizedDiscount,
         });
       });
     }
@@ -11617,7 +12227,10 @@ app.post('/api/sales', async (req, res) => {
           .filter((promo) => promo.minQty > 0 && item.qty >= promo.minQty && promo.discountPercent > 0)
           .sort((a, b) => b.discountPercent - a.discountPercent)[0];
         if (applicable) {
-          const discountedUnit = Math.max(0, toClpAmount(basePrice * (1 - (applicable.discountPercent / 100)), 0));
+          const discountedUnit = Math.max(
+            0,
+            roundPromoAmountToNearestTen(basePrice * (1 - (applicable.discountPercent / 100)), 0)
+          );
           if (discountedUnit >= 0) {
             effectiveUnitPrice = discountedUnit;
             promoLabel = `PROMOCION ${applicable.promotionName} (-${applicable.discountPercent}%)`;
@@ -12440,3 +13053,5 @@ process.on('uncaughtException', (error) => {
     stack: error?.stack || '',
   });
 });
+
+

@@ -413,6 +413,17 @@ let salesCameraScanRaf = null;
 let salesCameraScanActive = false;
 let salesBarcodeDetector = null;
 let selectedCartIndex = -1;
+let salesPromotionRulesByProduct = new Map();
+let salesComboPromotionRules = [];
+let salesPromotionRulesLoadPromise = null;
+let salesPromotionRulesLastSyncAt = 0;
+const SALES_PROMOTION_RULES_TTL_MS = 60 * 1000;
+let salesHistoryRowsCache = [];
+let salesHistorySelectedSaleId = 0;
+let salesHistorySelectedSaleDetail = null;
+let salesHistoryKeyboardNavigationInFlight = false;
+let salesHistoryEditMode = false;
+let salesHistoryOriginalPaymentState = null;
 let isClosingShift = false;
 let scannerRuntimeSettings = {
     scanner_mode: 'keyboard',
@@ -1371,7 +1382,32 @@ function formatCutDateForHeader(dateValue) {
     return `${day}/${monthLabel}/${year}`;
 }
 
+function parseCutDateTimeForHeader(value) {
+    if (value instanceof Date && !Number.isNaN(value.getTime())) {
+        return value;
+    }
+    const raw = String(value || '').trim();
+    if (!raw) return null;
+    const normalized = raw.includes(' ') && !raw.includes('T')
+        ? raw.replace(' ', 'T')
+        : raw;
+    const parsed = new Date(normalized);
+    if (Number.isNaN(parsed.getTime())) {
+        return null;
+    }
+    return parsed;
+}
+
 function formatCutTimeForHeader(timeValue) {
+    const parsedDate = parseCutDateTimeForHeader(timeValue);
+    if (parsedDate) {
+        const hour24 = parsedDate.getHours();
+        const minute = String(parsedDate.getMinutes()).padStart(2, '0');
+        const suffix = hour24 >= 12 ? 'pm' : 'am';
+        const hour12 = ((hour24 + 11) % 12) + 1;
+        return `${hour12}:${minute} ${suffix}`;
+    }
+
     const raw = String(timeValue || '').trim();
     if (!raw) return '--:--';
     const match = raw.match(/(\d{2}):(\d{2})/);
@@ -1428,26 +1464,121 @@ function updateCutSessionContext(context = {}) {
     contextEl.classList.remove('hidden');
 }
 
+function parseCutHistoryIsoDate(value) {
+    const normalized = String(value || '').trim().slice(0, 10);
+    if (/^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
+        return normalized;
+    }
+    return '';
+}
+
 function canViewAllCutHistory() {
-    return hasUserPermission('corte_todos_turnos');
+    return hasUserPermission('corte_todos_turnos') || isSessionAdminSiaUser();
 }
 
 function getCutHistoryDateFilterValue() {
     const input = document.getElementById('cut-history-date-filter');
-    const value = String(input?.value || '').trim();
-    if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+    const value = parseCutHistoryIsoDate(input?.value);
+    if (value) return value;
     return cutCloseContext.currentDate || new Date().toISOString().slice(0, 10);
 }
 
-async function fetchCutHistoryRowsForPopup(dateIso, requestedCashierId = '') {
-    const caja = String(localStorage.getItem('n_caja') || localStorage.getItem('caja') || '').trim();
-    const currentCashierId = String(localStorage.getItem('id_user') || '').trim();
-    if (!caja) return [];
+function getCutHistoryRangeEnabledValue() {
+    return Boolean(document.getElementById('cut-history-range-enabled')?.checked);
+}
 
-    const query = new URLSearchParams({ desde: dateIso, hasta: dateIso, caja });
-    const useAll = canViewAllCutHistory();
-    const cashierId = useAll ? String(requestedCashierId || '').trim() : currentCashierId;
-    if (cashierId) query.set('cajero', cashierId);
+function getCutHistoryPeriodFilters() {
+    const singleInput = document.getElementById('cut-history-date-filter');
+    const fromInput = document.getElementById('cut-history-date-from-filter');
+    const toInput = document.getElementById('cut-history-date-to-filter');
+    const fallbackDate = cutCloseContext.currentDate || new Date().toISOString().slice(0, 10);
+    const singleDate = parseCutHistoryIsoDate(singleInput?.value) || fallbackDate;
+    const rangeEnabled = getCutHistoryRangeEnabledValue();
+
+    if (!rangeEnabled) {
+        return {
+            desde: singleDate,
+            hasta: singleDate,
+            rangeEnabled: false,
+        };
+    }
+
+    let desde = parseCutHistoryIsoDate(fromInput?.value) || singleDate;
+    let hasta = parseCutHistoryIsoDate(toInput?.value) || desde;
+    if (desde > hasta) {
+        const temp = desde;
+        desde = hasta;
+        hasta = temp;
+        if (fromInput) fromInput.value = desde;
+        if (toInput) toInput.value = hasta;
+    }
+
+    return {
+        desde,
+        hasta,
+        rangeEnabled: true,
+    };
+}
+
+function buildCutHistoryPeriodLabel(period = {}) {
+    const desde = parseCutHistoryIsoDate(period.desde);
+    const hasta = parseCutHistoryIsoDate(period.hasta);
+    if (!desde || !hasta) return '--/--/----';
+    if (desde === hasta) return formatCutDateForHeader(desde);
+    return `${formatCutDateForHeader(desde)} al ${formatCutDateForHeader(hasta)}`;
+}
+
+function syncCutHistoryDateModeUI() {
+    const singleRow = document.getElementById('cut-history-single-date-row');
+    const fromRow = document.getElementById('cut-history-range-from-row');
+    const toRow = document.getElementById('cut-history-range-to-row');
+    const singleInput = document.getElementById('cut-history-date-filter');
+    const fromInput = document.getElementById('cut-history-date-from-filter');
+    const toInput = document.getElementById('cut-history-date-to-filter');
+    const rangeEnabled = getCutHistoryRangeEnabledValue();
+    const defaultDate = getCutHistoryDateFilterValue();
+
+    if (rangeEnabled) {
+        if (singleRow) singleRow.classList.add('hidden');
+        if (fromRow) fromRow.classList.remove('hidden');
+        if (toRow) toRow.classList.remove('hidden');
+        if (fromInput && !parseCutHistoryIsoDate(fromInput.value)) {
+            fromInput.value = defaultDate;
+        }
+        if (toInput && !parseCutHistoryIsoDate(toInput.value)) {
+            toInput.value = parseCutHistoryIsoDate(fromInput?.value) || defaultDate;
+        }
+    } else {
+        if (singleRow) singleRow.classList.remove('hidden');
+        if (fromRow) fromRow.classList.add('hidden');
+        if (toRow) toRow.classList.add('hidden');
+        const fromDate = parseCutHistoryIsoDate(fromInput?.value);
+        if (singleInput && fromDate) {
+            singleInput.value = fromDate;
+        }
+    }
+}
+
+function getCutHistoryBoxFilterValue() {
+    const select = document.getElementById('cut-history-box-filter');
+    return String(select?.value || '').trim();
+}
+
+function getCutHistoryCashierFilterValue() {
+    const select = document.getElementById('cut-history-cashier-filter');
+    return String(select?.value || '').trim();
+}
+
+async function fetchCutHistoryRowsForPopup(desdeIso, hastaIso, requestedBox = '', requestedCashier = '') {
+    const query = new URLSearchParams({ desde: desdeIso, hasta: hastaIso });
+    const boxId = String(requestedBox || '').trim();
+    const cashierId = String(requestedCashier || '').trim();
+    if (boxId) {
+        query.set('caja', boxId);
+    }
+    if (cashierId) {
+        query.set('cajero', cashierId);
+    }
 
     const response = await fetch(API_URL + `api/corte/historial?${query.toString()}`, {
         headers: withAuthHeaders(),
@@ -1459,33 +1590,79 @@ async function fetchCutHistoryRowsForPopup(dateIso, requestedCashierId = '') {
     return data;
 }
 
-async function loadCutHistoryCashierFilterOptions(dateIso) {
+async function loadCutHistoryBoxFilterOptions() {
+    const boxFilter = document.getElementById('cut-history-box-filter');
+    if (!boxFilter) return;
+
+    const previous = String(boxFilter.value || '').trim();
+    boxFilter.innerHTML = '<option value="">Todas</option>';
+    const availableBoxes = new Set();
+
+    try {
+        const response = await fetch(API_URL + 'api/getCajas', {
+            headers: withAuthHeaders(),
+        });
+        const payload = await response.json().catch(() => []);
+        const rows = Array.isArray(payload) ? payload : [];
+        rows.forEach((row) => {
+            const id = String(row?.n_caja || row?.caja_id || '').trim();
+            if (!id || availableBoxes.has(id)) return;
+            availableBoxes.add(id);
+            const option = document.createElement('option');
+            option.value = id;
+            option.textContent = row?.nombre_caja ? `${row.nombre_caja} (${id})` : `Caja ${id}`;
+            boxFilter.appendChild(option);
+        });
+    } catch (_) {
+        // Conserva al menos la opcion "Todas" y la caja local en fallback.
+    }
+
+    const localBox = String(localStorage.getItem('n_caja') || localStorage.getItem('caja') || '').trim();
+    if (localBox && !availableBoxes.has(localBox)) {
+        const option = document.createElement('option');
+        option.value = localBox;
+        option.textContent = `Caja ${localBox}`;
+        boxFilter.appendChild(option);
+        availableBoxes.add(localBox);
+    }
+
+    if (previous && availableBoxes.has(previous)) {
+        boxFilter.value = previous;
+    }
+}
+
+async function loadCutHistoryCashierFilterOptions(period = null, requestedBox = '') {
+    const cashierRow = document.getElementById('cut-history-cashier-row');
     const cashierFilter = document.getElementById('cut-history-cashier-filter');
     if (!cashierFilter) return;
-    const wrapper = cashierFilter.closest('.form-row');
-    const allowAll = canViewAllCutHistory();
 
-    if (!allowAll) {
-        if (wrapper) wrapper.style.display = 'none';
-        cashierFilter.innerHTML = '<option value="">Mi turno</option>';
+    const allowAllCashiers = canViewAllCutHistory();
+    if (!allowAllCashiers) {
+        if (cashierRow) cashierRow.classList.add('hidden');
+        cashierFilter.innerHTML = '<option value="">Todos</option>';
         return;
     }
 
-    if (wrapper) wrapper.style.display = '';
-    const rows = await fetchCutHistoryRowsForPopup(dateIso, '');
-    const map = new Map();
-    rows.forEach((row) => {
-        const id = String(row?.usuario_id || '').trim();
-        if (!id) return;
-        if (!map.has(id)) {
-            const name = String(row?.cajero_nombre || '').trim() || `Usuario ${id}`;
-            map.set(id, name);
-        }
-    });
-
+    if (cashierRow) cashierRow.classList.remove('hidden');
+    const currentPeriod = period && period.desde && period.hasta ? period : getCutHistoryPeriodFilters();
+    const currentBox = String(requestedBox || getCutHistoryBoxFilterValue()).trim();
     const previous = String(cashierFilter.value || '').trim();
     cashierFilter.innerHTML = '<option value="">Todos</option>';
-    Array.from(map.entries())
+
+    const cashierMap = new Map();
+    try {
+        const rows = await fetchCutHistoryRowsForPopup(currentPeriod.desde, currentPeriod.hasta, currentBox, '');
+        rows.forEach((row) => {
+            const id = String(row?.usuario_id || '').trim();
+            if (!id || cashierMap.has(id)) return;
+            const name = String(row?.cajero_nombre || '').trim() || `Usuario ${id}`;
+            cashierMap.set(id, name);
+        });
+    } catch (_) {
+        // Si falla esta carga, mantenemos al menos "Todos" para no bloquear busqueda.
+    }
+
+    Array.from(cashierMap.entries())
         .sort((a, b) => String(a[1]).localeCompare(String(b[1]), 'es'))
         .forEach(([id, name]) => {
             const option = document.createElement('option');
@@ -1493,8 +1670,11 @@ async function loadCutHistoryCashierFilterOptions(dateIso) {
             option.textContent = `${name} (${id})`;
             cashierFilter.appendChild(option);
         });
-    if (previous && map.has(previous)) {
+
+    if (previous && cashierMap.has(previous)) {
         cashierFilter.value = previous;
+    } else {
+        cashierFilter.value = '';
     }
 }
 
@@ -1680,19 +1860,22 @@ function renderCutHistoryPopupRows(rows) {
 
 async function reloadCutHistoryPopupData() {
     const msg = document.getElementById('cut-history-msg');
+    const boxFilter = document.getElementById('cut-history-box-filter');
     const cashierFilter = document.getElementById('cut-history-cashier-filter');
-    const dateIso = getCutHistoryDateFilterValue();
-    const cashierId = String(cashierFilter?.value || '').trim();
+    const period = getCutHistoryPeriodFilters();
+    const boxId = String(boxFilter?.value || '').trim();
+    const cashierId = canViewAllCutHistory() ? String(cashierFilter?.value || '').trim() : '';
+    const periodLabel = buildCutHistoryPeriodLabel(period);
 
     if (msg) msg.textContent = 'Cargando cortes...';
     try {
-        const rows = await fetchCutHistoryRowsForPopup(dateIso, cashierId);
+        const rows = await fetchCutHistoryRowsForPopup(period.desde, period.hasta, boxId, cashierId);
         cutHistoryContext.rows = rows;
         renderCutHistoryPopupRows(rows);
         if (msg) {
             msg.textContent = rows.length
-                ? `Se encontraron ${rows.length} corte(s) para ${formatCutDateForHeader(dateIso)}.`
-                : `Sin resultados para ${formatCutDateForHeader(dateIso)}.`;
+                ? `Se encontraron ${rows.length} corte(s) para ${periodLabel}.`
+                : `Sin resultados para ${periodLabel}.`;
         }
     } catch (error) {
         cutHistoryContext.rows = [];
@@ -1713,11 +1896,44 @@ function ensureCutHistoryPopupBindings() {
     window.__cutHistoryPopupInit = true;
 
     const dateFilter = document.getElementById('cut-history-date-filter');
+    const dateFromFilter = document.getElementById('cut-history-date-from-filter');
+    const dateToFilter = document.getElementById('cut-history-date-to-filter');
+    const rangeToggle = document.getElementById('cut-history-range-enabled');
+    const boxFilter = document.getElementById('cut-history-box-filter');
     const cashierFilter = document.getElementById('cut-history-cashier-filter');
+    const refreshPopupByFilters = async () => {
+        const period = getCutHistoryPeriodFilters();
+        const boxId = getCutHistoryBoxFilterValue();
+        await loadCutHistoryCashierFilterOptions(period, boxId);
+        await reloadCutHistoryPopupData();
+    };
     if (dateFilter) {
         dateFilter.addEventListener('change', async () => {
-            const dateIso = getCutHistoryDateFilterValue();
-            await loadCutHistoryCashierFilterOptions(dateIso);
+            if (getCutHistoryRangeEnabledValue()) return;
+            await refreshPopupByFilters();
+        });
+    }
+    if (dateFromFilter) {
+        dateFromFilter.addEventListener('change', async () => {
+            if (!getCutHistoryRangeEnabledValue()) return;
+            await refreshPopupByFilters();
+        });
+    }
+    if (dateToFilter) {
+        dateToFilter.addEventListener('change', async () => {
+            if (!getCutHistoryRangeEnabledValue()) return;
+            await refreshPopupByFilters();
+        });
+    }
+    if (rangeToggle) {
+        rangeToggle.addEventListener('change', async () => {
+            syncCutHistoryDateModeUI();
+            await refreshPopupByFilters();
+        });
+    }
+    if (boxFilter) {
+        boxFilter.addEventListener('change', async () => {
+            await loadCutHistoryCashierFilterOptions(getCutHistoryPeriodFilters(), getCutHistoryBoxFilterValue());
             await reloadCutHistoryPopupData();
         });
     }
@@ -1737,6 +1953,9 @@ function ensureCutHistoryPopupBindings() {
 async function openCutHistoryPopup(mode = 'cashier') {
     const overlay = document.getElementById('cut-history-popup');
     const dateFilter = document.getElementById('cut-history-date-filter');
+    const dateFromFilter = document.getElementById('cut-history-date-from-filter');
+    const dateToFilter = document.getElementById('cut-history-date-to-filter');
+    const rangeToggle = document.getElementById('cut-history-range-enabled');
     const msg = document.getElementById('cut-history-msg');
     if (!overlay || !dateFilter) return;
 
@@ -1745,13 +1964,26 @@ async function openCutHistoryPopup(mode = 'cashier') {
 
     const defaultDate = cutCloseContext.currentDate || new Date().toISOString().slice(0, 10);
     dateFilter.value = defaultDate;
+    if (dateFromFilter) dateFromFilter.value = defaultDate;
+    if (dateToFilter) dateToFilter.value = defaultDate;
+    if (rangeToggle) rangeToggle.checked = false;
+    syncCutHistoryDateModeUI();
 
     overlay.classList.remove('hidden');
     overlay.style.display = 'flex';
     if (msg) msg.textContent = 'Cargando cortes...';
 
     try {
-        await loadCutHistoryCashierFilterOptions(defaultDate);
+        await loadCutHistoryBoxFilterOptions();
+        const currentBox = getCutHistoryBoxFilterValue();
+        if (!currentBox) {
+            const localBox = String(localStorage.getItem('n_caja') || localStorage.getItem('caja') || '').trim();
+            const boxFilter = document.getElementById('cut-history-box-filter');
+            if (boxFilter && localBox && boxFilter.querySelector(`option[value="${localBox}"]`)) {
+                boxFilter.value = localBox;
+            }
+        }
+        await loadCutHistoryCashierFilterOptions(getCutHistoryPeriodFilters(), getCutHistoryBoxFilterValue());
         await reloadCutHistoryPopupData();
     } catch (error) {
         cutHistoryContext.rows = [];
@@ -4032,20 +4264,374 @@ function roundClpAmount(value) {
     return Math.round(numeric);
 }
 
-function getCartItemSubtotalAmount(item) {
-    const manualSubtotal = Number(item?.line_subtotal);
-    if (Number.isFinite(manualSubtotal) && manualSubtotal > 0) {
-        return roundClpAmount(manualSubtotal);
-    }
-    const unitPrice = Number(item?.precio_venta || 0);
-    const quantity = Number(item?.quantity || 0);
-    return roundClpAmount(unitPrice * quantity);
+function roundPromotionalUnitToNearestTen(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return 0;
+    // Regla negocio: 1-4 baja, 5-9 sube en la decena.
+    const roundedInteger = Math.round(numeric);
+    return Math.round(roundedInteger / 10) * 10;
 }
 
-function getCartTotalAmount() {
-    return cart.reduce((sum, item) => {
-        return sum + getCartItemSubtotalAmount(item);
-    }, 0);
+function normalizePromotionProductIds(entries = []) {
+    return [...new Set(
+        (Array.isArray(entries) ? entries : [])
+            .map((entry) => {
+                if (entry && typeof entry === 'object') {
+                    return Number(entry.product_id || entry.id_producto || entry.id || 0);
+                }
+                return Number(entry);
+            })
+            .filter((id) => Number.isInteger(id) && id > 0)
+    )];
+}
+
+function buildSalesSinglePromotionRuleMap(promotions = []) {
+    const map = new Map();
+    (Array.isArray(promotions) ? promotions : []).forEach((promo) => {
+        const promoType = String(promo?.promo_type || 'single').toLowerCase();
+        if (promoType !== 'single') return;
+        if (Number(promo?.is_active ?? 1) === 0) return;
+
+        const fallbackRule = parseSinglePromotionPattern(promo?.nombre || '');
+        const minQtyRaw = Number(promo?.min_qty || 0);
+        const discountRaw = Number(promo?.discount_percent || 0);
+        const minQty = (Number.isFinite(minQtyRaw) && minQtyRaw > 0)
+            ? minQtyRaw
+            : Number(fallbackRule?.minQty || 0);
+        const discountPercent = (Number.isFinite(discountRaw) && discountRaw > 0)
+            ? discountRaw
+            : Number(fallbackRule?.discountPercent || 0);
+        if (!Number.isFinite(minQty) || minQty < 2) return;
+        if (!Number.isFinite(discountPercent) || discountPercent <= 0 || discountPercent > 100) return;
+
+        const productIds = normalizePromotionProductIds(promo?.productos);
+        if (!productIds.length) return;
+
+        const promoLabel = normalizeText(promo?.nombre || `Promocion ${Number(promo?.id || 0) || ''}`);
+        productIds.forEach((productId) => {
+            if (!map.has(productId)) {
+                map.set(productId, []);
+            }
+            map.get(productId).push({
+                id: Number(promo?.id || 0),
+                label: promoLabel || 'Promocion',
+                minQty,
+                discountPercent,
+            });
+        });
+    });
+
+    map.forEach((rules, productId) => {
+        map.set(productId, rules.sort((a, b) => {
+            const byDiscount = Number(b.discountPercent || 0) - Number(a.discountPercent || 0);
+            if (byDiscount !== 0) return byDiscount;
+            return Number(b.minQty || 0) - Number(a.minQty || 0);
+        }));
+    });
+    return map;
+}
+
+function buildSalesComboPromotionRules(promotions = []) {
+    return (Array.isArray(promotions) ? promotions : [])
+        .filter((promo) => String(promo?.promo_type || 'single').toLowerCase() === 'combo')
+        .filter((promo) => Number(promo?.is_active ?? 1) !== 0)
+        .map((promo) => {
+            const comboPrice = Number(promo?.combo_price || 0);
+            const productIds = normalizePromotionProductIds(promo?.productos);
+            if (!Number.isFinite(comboPrice) || comboPrice <= 0 || productIds.length < 2) {
+                return null;
+            }
+            return {
+                id: Number(promo?.id || 0),
+                label: normalizeText(promo?.nombre || `Combo ${Number(promo?.id || 0) || ''}`) || 'Combo',
+                comboPrice: roundClpAmount(comboPrice),
+                productIds,
+            };
+        })
+        .filter(Boolean)
+        .sort((a, b) => Number(a.id || 0) - Number(b.id || 0));
+}
+
+async function loadSalesPromotionRules(options = {}) {
+    const forceReload = Boolean(options.forceReload);
+    const now = Date.now();
+    const hasFreshCache = !forceReload
+        && salesPromotionRulesLastSyncAt > 0
+        && (now - salesPromotionRulesLastSyncAt) < SALES_PROMOTION_RULES_TTL_MS;
+    if (hasFreshCache) {
+        return salesPromotionRulesByProduct;
+    }
+    if (!forceReload && salesPromotionRulesLoadPromise) {
+        return salesPromotionRulesLoadPromise;
+    }
+
+    salesPromotionRulesLoadPromise = (async () => {
+        try {
+            const response = await fetch(API_URL + 'api/promociones', {
+                headers: withAuthHeaders(),
+            });
+            if (response.ok) {
+                const rows = await response.json().catch(() => []);
+                const promotions = Array.isArray(rows) ? rows : [];
+                salesPromotionRulesByProduct = buildSalesSinglePromotionRuleMap(promotions);
+                salesComboPromotionRules = buildSalesComboPromotionRules(promotions);
+            }
+        } catch (_) {
+            // Silencioso: mantenemos cache actual.
+        } finally {
+            salesPromotionRulesLastSyncAt = Date.now();
+            salesPromotionRulesLoadPromise = null;
+        }
+        return salesPromotionRulesByProduct;
+    })();
+
+    return salesPromotionRulesLoadPromise;
+}
+
+function invalidateSalesPromotionRulesCache() {
+    salesPromotionRulesByProduct = new Map();
+    salesComboPromotionRules = [];
+    salesPromotionRulesLastSyncAt = 0;
+    salesPromotionRulesLoadPromise = null;
+}
+
+function resolveCartItemSinglePromotionRule(item) {
+    const productId = Number(item?.id_producto || 0);
+    if (!Number.isInteger(productId) || productId <= 0) return null;
+    if (isBulkSaleProduct(item)) return null;
+
+    const quantity = Number(item?.quantity || 0);
+    if (!Number.isFinite(quantity) || quantity <= 0) return null;
+
+    const rules = salesPromotionRulesByProduct.get(productId) || [];
+    if (!Array.isArray(rules) || !rules.length) return null;
+
+    return rules.find((rule) => (
+        Number.isFinite(Number(rule?.minQty || 0))
+        && Number(rule.minQty) > 0
+        && quantity >= Number(rule.minQty)
+        && Number.isFinite(Number(rule?.discountPercent || 0))
+        && Number(rule.discountPercent) > 0
+    )) || null;
+}
+
+function getCartPricingSnapshot(items = cart) {
+    const sourceItems = Array.isArray(items) ? items : [];
+    const lines = sourceItems.map((item, index) => {
+        const quantity = Number(item?.quantity || 0);
+        const unitPrice = Number(item?.precio_venta || 0);
+        const baseSubtotal = Math.max(0, roundClpAmount(unitPrice * quantity));
+        const manualSubtotalRaw = Number(item?.line_subtotal);
+        const hasManualSubtotal = Number.isFinite(manualSubtotalRaw) && manualSubtotalRaw > 0;
+        const manualSubtotal = hasManualSubtotal ? Math.max(0, roundClpAmount(manualSubtotalRaw)) : 0;
+        const productId = Number(item?.id_producto || 0);
+        const isCommon = Boolean(item?.is_common) || !Number.isInteger(productId) || productId <= 0;
+        const isBulk = isBulkSaleProduct(item);
+        return {
+            index,
+            item,
+            productId,
+            quantity,
+            unitPrice,
+            isCommon,
+            isBulk,
+            hasManualSubtotal,
+            baseSubtotal: hasManualSubtotal ? manualSubtotal : baseSubtotal,
+            effectiveUnitPrice: Math.max(0, roundClpAmount(unitPrice)),
+            subtotal: hasManualSubtotal ? manualSubtotal : baseSubtotal,
+            singleDiscountAmount: 0,
+            comboDiscountAmount: 0,
+            savings: 0,
+            hasPromotion: false,
+            discountPercent: 0,
+            discountPercentApprox: 0,
+            promotionLabels: [],
+            appliedPromotionLabel: '',
+        };
+    });
+
+    lines.forEach((line) => {
+        if (line.hasManualSubtotal || line.isCommon || line.isBulk) return;
+        if (!Number.isFinite(line.quantity) || line.quantity <= 0) return;
+        const rule = resolveCartItemSinglePromotionRule(line.item);
+        if (!rule) return;
+
+        const discountPercent = Number(rule.discountPercent || 0);
+        const discountedUnitRaw = line.unitPrice * (1 - (discountPercent / 100));
+        const effectiveUnitPrice = Math.max(0, roundPromotionalUnitToNearestTen(discountedUnitRaw));
+        const subtotalWithSinglePromo = Math.max(0, roundClpAmount(effectiveUnitPrice * line.quantity));
+        const singleSavings = Math.max(0, line.baseSubtotal - subtotalWithSinglePromo);
+        if (singleSavings <= 0) return;
+
+        line.effectiveUnitPrice = effectiveUnitPrice;
+        line.subtotal = subtotalWithSinglePromo;
+        line.singleDiscountAmount = singleSavings;
+        line.discountPercent = discountPercent;
+        line.promotionLabels.push(`PROMO ${String(rule.label || 'Promocion')} (-${formatPromotionNumberInputValue(discountPercent, '0')}%)`);
+    });
+
+    if (Array.isArray(salesComboPromotionRules) && salesComboPromotionRules.length > 0) {
+        const lineByProductId = new Map();
+        const availableUnits = new Map();
+
+        lines.forEach((line) => {
+            if (line.isCommon || line.hasManualSubtotal) return;
+            if (!Number.isInteger(line.productId) || line.productId <= 0) return;
+            lineByProductId.set(line.productId, line);
+            availableUnits.set(line.productId, Math.max(0, Math.floor(Number(line.quantity || 0))));
+        });
+
+        salesComboPromotionRules.forEach((combo) => {
+            const requiredIds = (Array.isArray(combo.productIds) ? combo.productIds : [])
+                .filter((id) => lineByProductId.has(id));
+            if (requiredIds.length < 2 || requiredIds.length !== Number(combo.productIds?.length || 0)) return;
+
+            const bundleCount = Math.min(...requiredIds.map((id) => Number(availableUnits.get(id) || 0)));
+            if (!Number.isFinite(bundleCount) || bundleCount < 1) return;
+
+            const bundleBasePrice = requiredIds.reduce((sum, id) => {
+                const line = lineByProductId.get(id);
+                return sum + Number(line?.effectiveUnitPrice || 0);
+            }, 0);
+            const discountPerBundle = bundleBasePrice - Number(combo.comboPrice || 0);
+            if (!Number.isFinite(discountPerBundle) || discountPerBundle <= 0) return;
+
+            const totalComboDiscount = Math.max(0, roundClpAmount(discountPerBundle * bundleCount));
+            if (totalComboDiscount <= 0) return;
+
+            requiredIds.forEach((id) => {
+                const currentQty = Number(availableUnits.get(id) || 0);
+                availableUnits.set(id, Math.max(0, currentQty - bundleCount));
+            });
+
+            const discountPerProduct = requiredIds.length > 0 ? Math.floor(totalComboDiscount / requiredIds.length) : 0;
+            let discountRemainder = Math.max(0, totalComboDiscount - (discountPerProduct * requiredIds.length));
+            requiredIds.forEach((id) => {
+                const line = lineByProductId.get(id);
+                if (!line) return;
+                const addDiscount = discountPerProduct + (discountRemainder > 0 ? 1 : 0);
+                if (discountRemainder > 0) discountRemainder -= 1;
+                line.comboDiscountAmount = Math.max(0, roundClpAmount(Number(line.comboDiscountAmount || 0) + addDiscount));
+                const comboLabel = `COMBO ${String(combo.label || 'Combo')}`;
+                if (!line.promotionLabels.includes(comboLabel)) {
+                    line.promotionLabels.push(comboLabel);
+                }
+            });
+        });
+    }
+
+    lines.forEach((line) => {
+        if (line.comboDiscountAmount > 0) {
+            line.subtotal = Math.max(0, roundClpAmount(Number(line.subtotal || 0) - Number(line.comboDiscountAmount || 0)));
+        }
+        line.savings = Math.max(0, Number(line.baseSubtotal || 0) - Number(line.subtotal || 0));
+        line.hasPromotion = line.savings > 0;
+        line.discountPercentApprox = Number(line.baseSubtotal || 0) > 0
+            ? Math.round((line.savings / Number(line.baseSubtotal || 1)) * 100)
+            : 0;
+        if (!line.discountPercent && line.discountPercentApprox > 0) {
+            line.discountPercent = line.discountPercentApprox;
+        }
+        line.appliedPromotionLabel = line.promotionLabels.join(' + ');
+    });
+
+    const totalSubtotal = lines.reduce((sum, line) => sum + Number(line.subtotal || 0), 0);
+    const totalSavings = lines.reduce((sum, line) => sum + Number(line.savings || 0), 0);
+    return {
+        lines,
+        totalSubtotal: Math.max(0, roundClpAmount(totalSubtotal)),
+        totalSavings: Math.max(0, roundClpAmount(totalSavings)),
+    };
+}
+
+function getCartItemAmountBreakdown(item) {
+    const indexInLiveCart = Array.isArray(cart) ? cart.indexOf(item) : -1;
+    if (indexInLiveCart >= 0) {
+        const snapshot = getCartPricingSnapshot(cart);
+        const line = snapshot.lines[indexInLiveCart];
+        if (line) {
+            return {
+                subtotal: Number(line.subtotal || 0),
+                baseSubtotal: Number(line.baseSubtotal || 0),
+                savings: Number(line.savings || 0),
+                hasPromotion: Boolean(line.hasPromotion),
+                effectiveUnitPrice: Number(line.effectiveUnitPrice || 0),
+                discountPercent: Number(line.discountPercent || 0),
+                discountPercentApprox: Number(line.discountPercentApprox || 0),
+                appliedPromotionLabel: String(line.appliedPromotionLabel || ''),
+            };
+        }
+    }
+
+    const manualSubtotal = Number(item?.line_subtotal);
+    if (Number.isFinite(manualSubtotal) && manualSubtotal > 0) {
+        const subtotalManual = roundClpAmount(manualSubtotal);
+        return {
+            subtotal: subtotalManual,
+            baseSubtotal: subtotalManual,
+            savings: 0,
+            hasPromotion: false,
+            effectiveUnitPrice: Number(item?.precio_venta || 0),
+            discountPercent: 0,
+            discountPercentApprox: 0,
+            appliedPromotionLabel: '',
+        };
+    }
+
+    const unitPrice = Number(item?.precio_venta || 0);
+    const quantity = Number(item?.quantity || 0);
+    const baseSubtotal = roundClpAmount(unitPrice * quantity);
+    const promoRule = resolveCartItemSinglePromotionRule(item);
+    if (!promoRule) {
+        return {
+            subtotal: baseSubtotal,
+            baseSubtotal,
+            savings: 0,
+            hasPromotion: false,
+            effectiveUnitPrice: roundClpAmount(unitPrice),
+            discountPercent: 0,
+            discountPercentApprox: 0,
+            appliedPromotionLabel: '',
+        };
+    }
+
+    const discountPercent = Number(promoRule.discountPercent || 0);
+    const discountedUnitRaw = unitPrice * (1 - (discountPercent / 100));
+    const effectiveUnitPrice = Math.max(0, roundPromotionalUnitToNearestTen(discountedUnitRaw));
+    const subtotalWithPromo = Math.max(0, roundClpAmount(effectiveUnitPrice * quantity));
+    const savings = Math.max(0, baseSubtotal - subtotalWithPromo);
+    const hasPromotion = savings > 0;
+    const discountPercentApprox = baseSubtotal > 0
+        ? Math.round((savings / baseSubtotal) * 100)
+        : 0;
+    const normalizedDiscountPercent = hasPromotion
+        ? (discountPercent > 0 ? discountPercent : discountPercentApprox)
+        : 0;
+    const promoLabel = normalizeText(promoRule.label || 'Promocion') || 'Promocion';
+    return {
+        subtotal: hasPromotion ? subtotalWithPromo : baseSubtotal,
+        baseSubtotal,
+        savings: hasPromotion ? savings : 0,
+        hasPromotion,
+        effectiveUnitPrice: hasPromotion ? effectiveUnitPrice : roundClpAmount(unitPrice),
+        discountPercent: hasPromotion ? normalizedDiscountPercent : 0,
+        discountPercentApprox: hasPromotion ? discountPercentApprox : 0,
+        appliedPromotionLabel: hasPromotion
+            ? `PROMO ${promoLabel} (-${formatPromotionNumberInputValue(normalizedDiscountPercent, '0')}%)`
+            : '',
+    };
+}
+
+function getCartItemSubtotalAmount(item) {
+    return Number(getCartItemAmountBreakdown(item).subtotal || 0);
+}
+
+function getCartTotalSavingsAmount(items = cart) {
+    return getCartPricingSnapshot(items).totalSavings;
+}
+
+function getCartTotalAmount(items = cart) {
+    return getCartPricingSnapshot(items).totalSubtotal;
 }
 
 function updateSalesSessionStrip() {
@@ -5562,22 +6148,57 @@ function updateCartUI() {
     if (selectedCartIndex >= cart.length) {
         selectedCartIndex = -1;
     }
+    if (cart.length > 0 && salesPromotionRulesByProduct.size === 0 && salesPromotionRulesLastSyncAt === 0 && !salesPromotionRulesLoadPromise) {
+        loadSalesPromotionRules()
+            .then(() => {
+                updateCartUI();
+            })
+            .catch(() => {});
+    }
 
+    const pricingSnapshot = getCartPricingSnapshot(cart);
     cart.forEach((item, index) => {
         const row = document.createElement('tr');
         const unitPrice = Number(item.precio_venta || 0);
         const quantity = Number(item.quantity || 0);
         const isBulk = isBulkSaleProduct(item);
+        const pricingLine = pricingSnapshot.lines[index];
+        const pricing = pricingLine
+            ? {
+                subtotal: Number(pricingLine.subtotal || 0),
+                baseSubtotal: Number(pricingLine.baseSubtotal || 0),
+                savings: Number(pricingLine.savings || 0),
+                hasPromotion: Boolean(pricingLine.hasPromotion),
+                effectiveUnitPrice: Number(pricingLine.effectiveUnitPrice || 0),
+                discountPercent: Number(pricingLine.discountPercent || 0),
+                discountPercentApprox: Number(pricingLine.discountPercentApprox || 0),
+                appliedPromotionLabel: String(pricingLine.appliedPromotionLabel || ''),
+            }
+            : getCartItemAmountBreakdown(item);
+        const hasPromo = pricing.hasPromotion && pricing.savings > 0;
         const quantityLabel = isBulk ? formatGramQuantityFromKg(quantity) : quantity.toFixed(0);
         const unitPriceLabel = isBulk ? `$${unitPrice.toFixed(0)} /kg` : `$${unitPrice.toFixed(0)}`;
-        const lineAmount = getCartItemSubtotalAmount(item);
+        const unitPricePromoLabel = hasPromo && !isBulk
+            ? `<div style="font-size:11px; color:#1a7f37;">Promo: $${Number(pricing.effectiveUnitPrice || 0).toFixed(0)}</div>`
+            : '';
+        const lineAmount = pricing.subtotal;
         const lineAmountLabel = `$${lineAmount.toFixed(0)}`;
+        const approxDiscountPercent = Math.max(0, Number(pricing.discountPercentApprox || 0));
+        const discountColumnLabel = hasPromo
+            ? `$${Number(pricing.savings || 0).toFixed(0)} (${approxDiscountPercent.toFixed(0)}%)`
+            : '$0 (0%)';
+        const promoInfo = hasPromo
+            ? `<div style="font-size:11px; color:#1a7f37;">${escapeHtml(pricing.appliedPromotionLabel || 'PROMOCION')}</div>`
+            : '';
+        const descriptionLabel = escapeHtml(item.descripcion || '');
+        const codeLabel = escapeHtml(item.codigo_barras || 'COMUN');
 
         row.innerHTML = `
-            <td>${item.codigo_barras || 'COMUN'}</td>
-            <td>${item.descripcion}</td>
-            <td style="text-align: center;">${unitPriceLabel}</td>
+            <td>${codeLabel}</td>
+            <td><div>${descriptionLabel}</div>${promoInfo}</td>
+            <td style="text-align: center;">${unitPriceLabel}${unitPricePromoLabel}</td>
             <td style="text-align: center;">${quantityLabel}</td>
+            <td style="text-align: right;">${discountColumnLabel}</td>
             <td style="text-align: right;">${lineAmountLabel}</td>
         `;
         row.style.cursor = 'pointer';
@@ -5611,10 +6232,21 @@ function updateCartUI() {
     }
 
     // Actualizar el total
-    const totalAmount = getCartTotalAmount();
+    const totalAmount = Number(pricingSnapshot.totalSubtotal || 0);
+    const totalSavingsAmount = Number(pricingSnapshot.totalSavings || 0);
+    const totalSavingsEl = document.getElementById('total-savings');
 
     document.getElementById('total-amount').textContent = "$ "+totalAmount.toFixed(0);
     document.getElementById('montoAPagar').textContent = "$ "+totalAmount.toFixed(0);
+    if (totalSavingsEl) {
+        if (totalSavingsAmount > 0) {
+            totalSavingsEl.textContent = `Ahorro promociones: $${totalSavingsAmount.toFixed(0)}`;
+            totalSavingsEl.classList.remove('hidden');
+        } else {
+            totalSavingsEl.textContent = '';
+            totalSavingsEl.classList.add('hidden');
+        }
+    }
     const cambioEfectivo = document.getElementById('cambioEfectivo');
     const cambioMixto = document.getElementById('cambioMixto');
     if (cambioEfectivo) cambioEfectivo.value = totalAmount > 0 ? "$ "+totalAmount.toFixed(0) : '';
@@ -5936,6 +6568,7 @@ function setupSystemFunctionKeyShortcuts() {
         }
         const target = event.target;
         const tag = String(target?.tagName || '').toLowerCase();
+        const isBarcodeInput = String(target?.id || '') === 'barcode';
         const isTypingContext = Boolean(
             target?.isContentEditable ||
             tag === 'input' ||
@@ -5979,7 +6612,7 @@ function setupSystemFunctionKeyShortcuts() {
             if (typeof openPendingTicketsPopup === 'function') openPendingTicketsPopup();
             return;
         }
-        if (isTypingContext) return;
+        if (isTypingContext && !isBarcodeInput) return;
 
         if (key === 'f10') {
             event.preventDefault();
@@ -6001,7 +6634,11 @@ function setupSystemFunctionKeyShortcuts() {
             if (typeof openPriceCheckPopup === 'function') openPriceCheckPopup();
             return;
         }
-        if (key === 'delete') {
+        const isDeleteKey = key === 'delete'
+            || key === 'del'
+            || key === 'supr'
+            || String(event.code || '').toLowerCase() === 'delete';
+        if (isDeleteKey) {
             event.preventDefault();
             if (typeof removeSelectedCartItem === 'function') removeSelectedCartItem();
         }
@@ -6555,9 +7192,11 @@ function closePriceCheckPopup() {
 async function fetchSalesSessionHistory(limit = 400) {
     const caja = String(localStorage.getItem('n_caja') || localStorage.getItem('caja') || '').trim();
     const cajero = String(localStorage.getItem('id_user') || '').trim();
+    const turno = String(localStorage.getItem('turno_id_actual') || '').trim();
     const params = new URLSearchParams();
     if (caja) params.set('caja', caja);
     if (cajero) params.set('cajero', cajero);
+    if (turno) params.set('turno', turno);
     const parsedLimit = Number(limit);
     if (Number.isFinite(parsedLimit) && parsedLimit > 0) {
         params.set('limit', String(Math.floor(parsedLimit)));
@@ -6572,11 +7211,57 @@ async function fetchSalesSessionHistory(limit = 400) {
     return data;
 }
 
+function getSalesSessionIdentity() {
+    const caja = String(localStorage.getItem('n_caja') || localStorage.getItem('caja') || '').trim();
+    const cajero = String(localStorage.getItem('id_user') || '').trim();
+    const turno = String(localStorage.getItem('turno_id_actual') || '').trim();
+    return { caja, cajero, turno };
+}
+
+async function fetchSalesHistorySaleDetail(saleId) {
+    const parsedSaleId = Number(saleId || 0);
+    if (!Number.isFinite(parsedSaleId) || parsedSaleId <= 0) {
+        throw new Error('Venta invalida para consultar detalle.');
+    }
+    const { caja, cajero } = getSalesSessionIdentity();
+    const params = new URLSearchParams();
+    if (caja) params.set('caja', caja);
+    if (cajero) params.set('cajero', cajero);
+    const response = await fetch(API_URL + `api/sales/${encodeURIComponent(parsedSaleId)}/detail?${params.toString()}`, {
+        headers: withAuthHeaders(),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        throw new Error(data.message || 'No se pudo cargar el detalle de la venta.');
+    }
+    return data;
+}
+
+async function updateSalesHistorySalePayment(saleId, payload = {}) {
+    const parsedSaleId = Number(saleId || 0);
+    if (!Number.isFinite(parsedSaleId) || parsedSaleId <= 0) {
+        throw new Error('Venta invalida para editar pago.');
+    }
+    const response = await fetch(API_URL + `api/sales/${encodeURIComponent(parsedSaleId)}/payment`, {
+        method: 'PUT',
+        headers: withAuthHeaders({
+            'Content-Type': 'application/json',
+        }),
+        body: JSON.stringify(payload || {}),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        throw new Error(data.message || 'No se pudo editar la forma de pago.');
+    }
+    return data;
+}
+
 function getSalesLastTicketStorageKey() {
     const caja = String(localStorage.getItem('n_caja') || localStorage.getItem('caja') || '').trim();
     const cajero = String(localStorage.getItem('id_user') || '').trim();
+    const turno = String(localStorage.getItem('turno_id_actual') || '').trim() || 'sin_turno';
     if (!caja || !cajero) return null;
-    return `sales_last_ticket_${caja}_${cajero}`;
+    return `sales_last_ticket_${caja}_${cajero}_${turno}`;
 }
 
 function normalizeSalesPaymentMethodLabel(methodRaw = '') {
@@ -6659,7 +7344,17 @@ async function refreshLastSalesTicketInfoCard() {
     try {
         const data = await fetchSalesSessionHistory(1);
         const rows = Array.isArray(data?.ventas) ? data.ventas : [];
-        if (!rows.length) return;
+        if (!rows.length) {
+            const key = getSalesLastTicketStorageKey();
+            if (key) {
+                try {
+                    localStorage.removeItem(key);
+                } catch (_) {
+                }
+            }
+            setLastSalesTicketInfoCard(null);
+            return;
+        }
         const row = rows[0];
         const mergedInfo = {
             id_venta: Number(row.id_venta || 0),
@@ -6722,53 +7417,666 @@ async function reprintLastSaleTicketOrInvoice() {
 
 function closeSalesSessionHistoryPopup() {
     const popup = document.getElementById('salesHistoryPopUp');
+    const editFeedback = document.getElementById('sales-history-edit-feedback');
     if (!popup) return;
     popup.classList.add('hidden');
     popup.style.display = '';
+    salesHistoryRowsCache = [];
+    salesHistorySelectedSaleId = 0;
+    salesHistorySelectedSaleDetail = null;
+    salesHistoryKeyboardNavigationInFlight = false;
+    salesHistoryEditMode = false;
+    salesHistoryOriginalPaymentState = null;
+    if (editFeedback) {
+        editFeedback.textContent = '';
+        editFeedback.classList.add('hidden');
+    }
     focusBarcodeInputForNextScan();
+}
+
+function setSalesHistoryEditFeedback(message = '', type = 'info') {
+    const feedbackEl = document.getElementById('sales-history-edit-feedback');
+    if (!feedbackEl) return;
+    const normalized = String(message || '').trim();
+    feedbackEl.classList.remove('feedback-ok', 'feedback-error', 'feedback-warning');
+    if (!normalized) {
+        feedbackEl.textContent = '';
+        feedbackEl.classList.add('hidden');
+        return;
+    }
+    feedbackEl.textContent = normalized;
+    if (type === 'ok' || type === 'success') {
+        feedbackEl.classList.add('feedback-ok');
+    } else if (type === 'error') {
+        feedbackEl.classList.add('feedback-error');
+    } else if (type === 'warning') {
+        feedbackEl.classList.add('feedback-warning');
+    }
+    feedbackEl.classList.remove('hidden');
+}
+
+function normalizeSalesHistoryPaymentMethodValue(value) {
+    const method = String(value || '').trim().toLowerCase();
+    return method || 'efectivo';
+}
+
+function buildSalesHistoryPaymentStateFromDetail(detail = {}) {
+    const sale = detail?.sale || {};
+    const payments = Array.isArray(detail?.payment_breakdown) ? detail.payment_breakdown : [];
+    const total = Math.max(0, Number(sale?.total || 0));
+    const cardByBreakdown = payments
+        .filter((entry) => normalizeSalesHistoryPaymentMethodValue(entry?.metodo_pago) === 'tarjeta')
+        .reduce((sum, entry) => sum + Number(entry?.monto || 0), 0);
+    const cashByBreakdown = payments
+        .filter((entry) => normalizeSalesHistoryPaymentMethodValue(entry?.metodo_pago) === 'efectivo')
+        .reduce((sum, entry) => sum + Number(entry?.monto || 0), 0);
+
+    const cardAmount = Math.max(0, Math.round(cardByBreakdown > 0 ? cardByBreakdown : Number(sale?.monto_tarjeta || 0)));
+    const cashAmount = Math.max(0, Math.round(cashByBreakdown > 0 ? cashByBreakdown : Number(sale?.monto_efectivo || 0)));
+
+    return {
+        method: normalizeSalesHistoryPaymentMethodValue(sale?.metodo_pago),
+        cardAmount,
+        cashAmount,
+        totalAmount: Math.round(total),
+    };
+}
+
+function readSalesHistoryPaymentInputsState() {
+    const methodSelect = document.getElementById('sales-history-payment-method');
+    const cardInput = document.getElementById('sales-history-payment-card');
+    const cashInput = document.getElementById('sales-history-payment-cash');
+    return {
+        method: normalizeSalesHistoryPaymentMethodValue(methodSelect?.value),
+        cardAmount: Math.max(0, Math.round(parseMoneyInputValue(cardInput?.value))),
+        cashAmount: Math.max(0, Math.round(parseMoneyInputValue(cashInput?.value))),
+    };
+}
+
+function restoreSalesHistoryPaymentInputsFromState(state = null) {
+    if (!state || typeof state !== 'object') return;
+    const methodSelect = document.getElementById('sales-history-payment-method');
+    const cardInput = document.getElementById('sales-history-payment-card');
+    const cashInput = document.getElementById('sales-history-payment-cash');
+
+    if (methodSelect) {
+        const nextMethod = normalizeSalesHistoryPaymentMethodValue(state.method);
+        if (methodSelect.querySelector(`option[value="${nextMethod}"]`)) {
+            methodSelect.value = nextMethod;
+        }
+    }
+    if (cardInput) cardInput.value = Number(state.cardAmount || 0) > 0 ? String(Math.round(Number(state.cardAmount || 0))) : '';
+    if (cashInput) cashInput.value = Number(state.cashAmount || 0) > 0 ? String(Math.round(Number(state.cashAmount || 0))) : '';
+}
+
+function isSalesHistoryPaymentStateChanged(currentState = null, originalState = null) {
+    if (!currentState || !originalState) return false;
+    const methodCurrent = normalizeSalesHistoryPaymentMethodValue(currentState.method);
+    const methodOriginal = normalizeSalesHistoryPaymentMethodValue(originalState.method);
+    if (methodCurrent !== methodOriginal) return true;
+    if (methodCurrent !== 'mixto') return false;
+    const cardCurrent = Math.max(0, Math.round(Number(currentState.cardAmount || 0)));
+    const cashCurrent = Math.max(0, Math.round(Number(currentState.cashAmount || 0)));
+    const cardOriginal = Math.max(0, Math.round(Number(originalState.cardAmount || 0)));
+    const cashOriginal = Math.max(0, Math.round(Number(originalState.cashAmount || 0)));
+    return cardCurrent !== cardOriginal || cashCurrent !== cashOriginal;
+}
+
+function validateSalesHistoryPaymentState(state = null, totalAmount = 0, showFeedback = false) {
+    const normalizedState = state && typeof state === 'object' ? state : readSalesHistoryPaymentInputsState();
+    const total = Math.max(0, Math.round(Number(totalAmount || 0)));
+    const method = normalizeSalesHistoryPaymentMethodValue(normalizedState.method);
+    if (!method) {
+        if (showFeedback) setSalesHistoryEditFeedback('Selecciona un método de pago válido.', 'warning');
+        return { ok: false };
+    }
+    if (method !== 'mixto') {
+        return { ok: true };
+    }
+
+    const cardAmount = Math.max(0, Math.round(Number(normalizedState.cardAmount || 0)));
+    const cashAmount = Math.max(0, Math.round(Number(normalizedState.cashAmount || 0)));
+    if (cardAmount > total) {
+        if (showFeedback) setSalesHistoryEditFeedback('Pago mixto inválido: la tarjeta no puede superar el total de la venta.', 'warning');
+        return { ok: false };
+    }
+    if (cardAmount + cashAmount < total) {
+        if (showFeedback) setSalesHistoryEditFeedback('Pago mixto inválido: efectivo + tarjeta no puede ser inferior al total.', 'warning');
+        return { ok: false };
+    }
+    return { ok: true };
+}
+
+function updateSalesHistoryEditControlsState() {
+    const viewActions = document.getElementById('sales-history-view-actions');
+    const editActions = document.getElementById('sales-history-edit-actions');
+    const editBox = document.getElementById('sales-history-edit-box');
+    const methodSelect = document.getElementById('sales-history-payment-method');
+    const cardInput = document.getElementById('sales-history-payment-card');
+    const cashInput = document.getElementById('sales-history-payment-cash');
+    const saveBtn = document.getElementById('sales-history-save-payment-btn');
+    const cancelBtn = document.getElementById('sales-history-cancel-edit-btn');
+    const editBtn = document.getElementById('sales-history-enter-edit-btn');
+    const reprintBtn = document.getElementById('sales-history-reprint-btn');
+
+    const hasSaleSelected = Number(salesHistorySelectedSaleId || 0) > 0 && !!salesHistorySelectedSaleDetail;
+    const isEditMode = Boolean(salesHistoryEditMode && hasSaleSelected);
+
+    if (viewActions) viewActions.classList.toggle('hidden', !hasSaleSelected || isEditMode);
+    if (editActions) editActions.classList.toggle('hidden', !hasSaleSelected || !isEditMode);
+    if (editBox) editBox.classList.toggle('hidden', !hasSaleSelected || !isEditMode);
+
+    [methodSelect, cardInput, cashInput].forEach((control) => {
+        if (!control) return;
+        control.disabled = !isEditMode;
+    });
+
+    if (editBtn) editBtn.disabled = !hasSaleSelected;
+    if (reprintBtn) reprintBtn.disabled = !hasSaleSelected || isEditMode;
+    if (cancelBtn) cancelBtn.disabled = !isEditMode;
+
+    if (saveBtn) {
+        if (!isEditMode || !salesHistoryOriginalPaymentState) {
+            saveBtn.disabled = true;
+        } else {
+            const currentState = readSalesHistoryPaymentInputsState();
+            const hasChanges = isSalesHistoryPaymentStateChanged(currentState, salesHistoryOriginalPaymentState);
+            const validation = validateSalesHistoryPaymentState(currentState, salesHistoryOriginalPaymentState.totalAmount, false);
+            saveBtn.disabled = !hasChanges || !validation.ok;
+        }
+    }
+}
+
+function setSalesHistoryEditMode(enabled, options = {}) {
+    const shouldEnable = Boolean(enabled);
+    const restoreInputs = options?.restoreInputs !== false;
+    const keepFeedback = options?.keepFeedback === true;
+
+    if (!shouldEnable && restoreInputs && salesHistoryOriginalPaymentState) {
+        restoreSalesHistoryPaymentInputsFromState(salesHistoryOriginalPaymentState);
+    }
+
+    salesHistoryEditMode = shouldEnable && Number(salesHistorySelectedSaleId || 0) > 0 && !!salesHistorySelectedSaleDetail;
+    handleSalesHistoryPaymentMethodChange();
+    updateSalesHistoryEditControlsState();
+
+    if (!keepFeedback) {
+        setSalesHistoryEditFeedback('');
+    }
+}
+
+function enterSalesHistoryEditMode() {
+    if (!salesHistorySelectedSaleDetail || Number(salesHistorySelectedSaleId || 0) <= 0) {
+        setSalesHistoryEditFeedback('Selecciona una venta para editar.', 'warning');
+        return;
+    }
+    setSalesHistoryEditMode(true, { restoreInputs: false });
+}
+
+function cancelSalesHistoryEditMode() {
+    setSalesHistoryEditMode(false, { restoreInputs: true, keepFeedback: false });
+}
+
+async function reprintSalesHistorySelectedSale() {
+    const saleId = Number(salesHistorySelectedSaleId || salesHistorySelectedSaleDetail?.sale?.id_venta || 0);
+    if (!Number.isFinite(saleId) || saleId <= 0) {
+        setSalesHistoryEditFeedback('Selecciona una venta para reimprimir.', 'warning');
+        return;
+    }
+    const reprintBtn = document.getElementById('sales-history-reprint-btn');
+    try {
+        if (reprintBtn) reprintBtn.disabled = true;
+        await printSaleTicket(saleId);
+        const ticketLabel = normalizeText(
+            salesHistorySelectedSaleDetail?.sale?.folio_ticket
+            || salesHistorySelectedSaleDetail?.sale?.numero_ticket
+            || String(saleId)
+        );
+        setSalesHistoryEditFeedback(`Reimpresión enviada para venta #${ticketLabel}.`, 'ok');
+    } catch (error) {
+        console.error('Error al reimprimir venta seleccionada:', error);
+        setSalesHistoryEditFeedback(error.message || 'No se pudo reimprimir la venta seleccionada.', 'error');
+    } finally {
+        if (reprintBtn) reprintBtn.disabled = false;
+        updateSalesHistoryEditControlsState();
+    }
+}
+
+function setupSalesHistoryEditInputWatchers() {
+    const methodSelect = document.getElementById('sales-history-payment-method');
+    const cardInput = document.getElementById('sales-history-payment-card');
+    const cashInput = document.getElementById('sales-history-payment-cash');
+
+    if (methodSelect && methodSelect.dataset.salesHistoryWatchBound !== '1') {
+        methodSelect.addEventListener('change', () => {
+            updateSalesHistoryEditControlsState();
+        });
+        methodSelect.dataset.salesHistoryWatchBound = '1';
+    }
+    [cardInput, cashInput].forEach((input) => {
+        if (!input || input.dataset.salesHistoryWatchBound === '1') return;
+        input.addEventListener('input', () => {
+            updateSalesHistoryEditControlsState();
+        });
+        input.dataset.salesHistoryWatchBound = '1';
+    });
+}
+
+function splitSalesHistoryDateTimeParts(value) {
+    const raw = normalizeText(value);
+    if (!raw) {
+        return {
+            dateLabel: '-',
+            timeLabel: '--:--',
+        };
+    }
+
+    const isoMatch = raw.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T]+(\d{2}):(\d{2}))?/);
+    if (isoMatch) {
+        return {
+            dateLabel: `${isoMatch[3]}/${isoMatch[2]}/${isoMatch[1]}`,
+            timeLabel: isoMatch[4] ? `${isoMatch[4]}:${isoMatch[5]}` : '--:--',
+        };
+    }
+
+    const parsed = new Date(raw.replace(' ', 'T'));
+    if (!Number.isNaN(parsed.getTime())) {
+        const day = String(parsed.getDate()).padStart(2, '0');
+        const month = String(parsed.getMonth() + 1).padStart(2, '0');
+        const year = parsed.getFullYear();
+        const hour = String(parsed.getHours()).padStart(2, '0');
+        const minute = String(parsed.getMinutes()).padStart(2, '0');
+        return {
+            dateLabel: `${day}/${month}/${year}`,
+            timeLabel: `${hour}:${minute}`,
+        };
+    }
+
+    const looseParts = raw.split(/\s+/);
+    if (looseParts.length >= 2) {
+        return {
+            dateLabel: looseParts[0],
+            timeLabel: looseParts[1].slice(0, 5),
+        };
+    }
+
+    return {
+        dateLabel: raw,
+        timeLabel: '--:--',
+    };
+}
+
+function isSalesHistoryPopupVisible() {
+    const popup = document.getElementById('salesHistoryPopUp');
+    if (!popup || popup.classList.contains('hidden')) return false;
+    const computed = window.getComputedStyle(popup);
+    if (!computed) return false;
+    return computed.display !== 'none' && computed.visibility !== 'hidden';
+}
+
+function getSalesHistoryVisibleSaleIds() {
+    return Array.from(document.querySelectorAll('#sales-history-body tr[data-sale-id]'))
+        .map((rowEl) => Number(rowEl?.dataset?.saleId || 0))
+        .filter((saleId) => Number.isFinite(saleId) && saleId > 0);
+}
+
+function scrollSalesHistoryRowIntoView(saleId) {
+    const parsedSaleId = Number(saleId || 0);
+    if (!Number.isFinite(parsedSaleId) || parsedSaleId <= 0) return;
+    const rowEl = document.querySelector(`#sales-history-body tr[data-sale-id="${parsedSaleId}"]`);
+    if (!rowEl || typeof rowEl.scrollIntoView !== 'function') return;
+    rowEl.scrollIntoView({ block: 'nearest' });
+}
+
+async function moveSalesHistorySelectionByStep(step = 0) {
+    const direction = Number(step);
+    if (!Number.isFinite(direction) || direction === 0) return;
+    const saleIds = getSalesHistoryVisibleSaleIds();
+    if (!saleIds.length) return;
+
+    const currentId = Number(salesHistorySelectedSaleId || 0);
+    const currentIndex = saleIds.indexOf(currentId);
+    const baseIndex = currentIndex >= 0 ? currentIndex : 0;
+    const nextIndex = Math.max(0, Math.min(
+        saleIds.length - 1,
+        baseIndex + (direction > 0 ? 1 : -1)
+    ));
+    const nextSaleId = Number(saleIds[nextIndex] || 0);
+    if (!Number.isFinite(nextSaleId) || nextSaleId <= 0) return;
+
+    scrollSalesHistoryRowIntoView(nextSaleId);
+    if (nextSaleId === currentId) return;
+    await selectSalesHistorySale(nextSaleId);
+    scrollSalesHistoryRowIntoView(nextSaleId);
+}
+
+function setupSalesHistoryKeyboardNavigation() {
+    document.addEventListener('keydown', async (event) => {
+        if (!isSalesHistoryPopupVisible()) return;
+        if (document.getElementById('mm-alert-overlay')?.classList.contains('show')) return;
+        if (salesHistoryEditMode) return;
+
+        const key = String(event.key || '').toLowerCase();
+        if (key !== 'arrowdown' && key !== 'arrowup') return;
+
+        const target = event.target;
+        const tag = String(target?.tagName || '').toLowerCase();
+        const isTypingContext = Boolean(
+            target?.isContentEditable ||
+            tag === 'input' ||
+            tag === 'textarea' ||
+            tag === 'select'
+        );
+        if (isTypingContext) return;
+        if (salesHistoryKeyboardNavigationInFlight) return;
+
+        event.preventDefault();
+        try {
+            salesHistoryKeyboardNavigationInFlight = true;
+            await moveSalesHistorySelectionByStep(key === 'arrowdown' ? 1 : -1);
+        } catch (error) {
+            setSalesHistoryEditFeedback(error?.message || 'No se pudo navegar el historial de ventas.', 'error');
+        } finally {
+            salesHistoryKeyboardNavigationInFlight = false;
+        }
+    });
+}
+
+function renderSalesHistoryRows(rows = []) {
+    const body = document.getElementById('sales-history-body');
+    if (!body) return;
+    const list = Array.isArray(rows) ? rows : [];
+    if (!list.length) {
+        body.innerHTML = '<tr><td colspan="4" style="text-align:center;">No hay ventas para mostrar.</td></tr>';
+        return;
+    }
+
+    body.innerHTML = list.map((row) => {
+        const saleId = Number(row?.id_venta || 0);
+        const total = Number(row?.total || 0);
+        const dateParts = splitSalesHistoryDateTimeParts(row?.fecha || '');
+        const rowSelectedClass = saleId === salesHistorySelectedSaleId ? 'sales-history-row-selected' : '';
+        const ticketLabel = normalizeText(row?.folio_ticket || row?.numero_ticket || String(saleId || '-')) || '-';
+        return `
+            <tr data-sale-id="${saleId}" class="${rowSelectedClass}">
+                <td>
+                    <div class="sales-history-date-cell">
+                        <span class="sales-history-date-main">${escapeHtml(dateParts.dateLabel)}</span>
+                        <span class="sales-history-date-time">${escapeHtml(dateParts.timeLabel)}</span>
+                    </div>
+                </td>
+                <td style="text-align:center;">${escapeHtml(ticketLabel)}</td>
+                <td>${escapeHtml(normalizeText(normalizeSalesPaymentMethodLabel(row?.metodo_pago || '-')))}</td>
+                <td style="text-align:right;">$${total.toFixed(0)}</td>
+            </tr>
+        `;
+    }).join('');
+
+    body.querySelectorAll('tr[data-sale-id]').forEach((rowEl) => {
+        rowEl.addEventListener('click', () => {
+            const saleId = Number(rowEl.dataset.saleId || 0);
+            if (!saleId) return;
+            selectSalesHistorySale(saleId).catch((error) => {
+                setSalesHistoryEditFeedback(error.message || 'No se pudo cargar el detalle de la venta.', 'error');
+            });
+        });
+    });
+}
+
+function handleSalesHistoryPaymentMethodChange() {
+    const methodSelect = document.getElementById('sales-history-payment-method');
+    const mixedFields = document.getElementById('sales-history-mixed-fields');
+    const method = String(methodSelect?.value || '').trim().toLowerCase();
+    if (!mixedFields) return;
+    if (method === 'mixto' && salesHistoryEditMode) {
+        mixedFields.classList.remove('hidden');
+    } else {
+        mixedFields.classList.add('hidden');
+    }
+    updateSalesHistoryEditControlsState();
+}
+
+function renderSalesHistorySaleDetail(detail = {}) {
+    const emptyBox = document.getElementById('sales-history-detail-empty');
+    const detailCard = document.getElementById('sales-history-detail-card');
+    if (!emptyBox || !detailCard) return;
+
+    const sale = detail?.sale || {};
+    const items = Array.isArray(detail?.items) ? detail.items : [];
+    const payments = Array.isArray(detail?.payment_breakdown) ? detail.payment_breakdown : [];
+
+    const ribbon = document.getElementById('sales-history-modified-ribbon');
+    const datetimeEl = document.getElementById('sales-history-detail-datetime');
+    const ticketEl = document.getElementById('sales-history-detail-ticket');
+    const cajaEl = document.getElementById('sales-history-detail-caja');
+    const cajeroEl = document.getElementById('sales-history-detail-cajero');
+    const methodEl = document.getElementById('sales-history-detail-method');
+    const totalEl = document.getElementById('sales-history-detail-total');
+    const productsBody = document.getElementById('sales-history-detail-products-body');
+    const paymentsWrap = document.getElementById('sales-history-detail-payments');
+    const methodSelect = document.getElementById('sales-history-payment-method');
+    const cardInput = document.getElementById('sales-history-payment-card');
+    const cashInput = document.getElementById('sales-history-payment-cash');
+
+    const isModified = Number(sale?.pago_modificado || 0) === 1;
+    if (ribbon) ribbon.classList.toggle('hidden', !isModified);
+
+    if (datetimeEl) datetimeEl.textContent = normalizeText(sale?.fecha || '-');
+    if (ticketEl) ticketEl.textContent = normalizeText(sale?.folio_ticket || sale?.numero_ticket || String(sale?.id_venta || '-'));
+    if (cajaEl) cajaEl.textContent = String(sale?.caja_id || '-');
+    if (cajeroEl) cajeroEl.textContent = normalizeText(sale?.cajero_nombre || '-');
+    if (methodEl) methodEl.textContent = normalizeSalesPaymentMethodLabel(sale?.metodo_pago || '-');
+    if (totalEl) totalEl.textContent = formatSalesTicketMoney(sale?.total || 0);
+
+    if (productsBody) {
+        if (!items.length) {
+            productsBody.innerHTML = '<tr><td colspan="4" style="text-align:center;">Sin productos.</td></tr>';
+        } else {
+            productsBody.innerHTML = items.map((item) => {
+                const qty = Number(item?.cantidad || 0);
+                const unitPrice = Number(item?.precio_unitario || 0);
+                const subtotal = Number(item?.subtotal || 0);
+                return `
+                    <tr>
+                        <td>${escapeHtml(normalizeText(item?.descripcion || 'Producto'))}</td>
+                        <td style="text-align:center;">${qty.toFixed(2).replace(/\.00$/, '')}</td>
+                        <td style="text-align:right;">$${unitPrice.toFixed(0)}</td>
+                        <td style="text-align:right;">$${subtotal.toFixed(0)}</td>
+                    </tr>
+                `;
+            }).join('');
+        }
+    }
+
+    if (paymentsWrap) {
+        if (!payments.length) {
+            paymentsWrap.innerHTML = '<p class="sales-history-payment-item">Sin desglose de pago.</p>';
+        } else {
+            const modifiedMeta = isModified
+                ? `<p class="sales-history-payment-item"><span>Actualizado</span><strong>${escapeHtml(normalizeText(sale?.pago_modificado_at || ''))}</strong></p>`
+                : '';
+            paymentsWrap.innerHTML = `
+                ${payments.map((entry) => `
+                    <p class="sales-history-payment-item">
+                        <span>${escapeHtml(normalizeSalesPaymentMethodLabel(entry?.metodo_pago || ''))}</span>
+                        <strong>${escapeHtml(formatSalesTicketMoney(entry?.monto || 0))}</strong>
+                    </p>
+                `).join('')}
+                ${modifiedMeta}
+            `;
+        }
+    }
+
+    if (methodSelect) {
+        const saleMethod = String(sale?.metodo_pago || 'efectivo').trim().toLowerCase();
+        if (methodSelect.querySelector(`option[value="${saleMethod}"]`)) {
+            methodSelect.value = saleMethod;
+        } else {
+            methodSelect.value = 'efectivo';
+        }
+    }
+
+    const cardAmount = payments
+        .filter((entry) => String(entry?.metodo_pago || '').trim().toLowerCase() === 'tarjeta')
+        .reduce((sum, entry) => sum + Number(entry?.monto || 0), 0);
+    const cashAmount = payments
+        .filter((entry) => String(entry?.metodo_pago || '').trim().toLowerCase() === 'efectivo')
+        .reduce((sum, entry) => sum + Number(entry?.monto || 0), 0);
+    if (cardInput) cardInput.value = cardAmount > 0 ? String(Math.round(cardAmount)) : '';
+    if (cashInput) cashInput.value = cashAmount > 0 ? String(Math.round(cashAmount)) : '';
+
+    salesHistoryOriginalPaymentState = buildSalesHistoryPaymentStateFromDetail({
+        sale,
+        payment_breakdown: payments,
+    });
+    restoreSalesHistoryPaymentInputsFromState(salesHistoryOriginalPaymentState);
+    setSalesHistoryEditMode(false, { restoreInputs: true, keepFeedback: true });
+
+    emptyBox.classList.add('hidden');
+    detailCard.classList.remove('hidden');
+    setSalesHistoryEditFeedback('');
+}
+
+async function selectSalesHistorySale(saleId) {
+    const parsedSaleId = Number(saleId || 0);
+    if (!Number.isFinite(parsedSaleId) || parsedSaleId <= 0) return;
+    salesHistorySelectedSaleId = parsedSaleId;
+    salesHistorySelectedSaleDetail = null;
+    salesHistoryOriginalPaymentState = null;
+    setSalesHistoryEditMode(false, { restoreInputs: false, keepFeedback: true });
+
+    document.querySelectorAll('#sales-history-body tr[data-sale-id]').forEach((rowEl) => {
+        const rowSaleId = Number(rowEl.dataset.saleId || 0);
+        rowEl.classList.toggle('sales-history-row-selected', rowSaleId === parsedSaleId);
+    });
+
+    const emptyBox = document.getElementById('sales-history-detail-empty');
+    const detailCard = document.getElementById('sales-history-detail-card');
+    if (emptyBox) {
+        emptyBox.textContent = 'Cargando detalle de venta...';
+        emptyBox.classList.remove('hidden');
+    }
+    if (detailCard) detailCard.classList.add('hidden');
+
+    const detail = await fetchSalesHistorySaleDetail(parsedSaleId);
+    if (salesHistorySelectedSaleId !== parsedSaleId) return;
+    salesHistorySelectedSaleDetail = detail;
+    renderSalesHistorySaleDetail(detail);
 }
 
 async function openSalesSessionHistoryPopup() {
     const popup = document.getElementById('salesHistoryPopUp');
     const body = document.getElementById('sales-history-body');
     const summary = document.getElementById('sales-history-summary');
+    const emptyBox = document.getElementById('sales-history-detail-empty');
+    const detailCard = document.getElementById('sales-history-detail-card');
     if (!popup || !body || !summary) return;
 
     popup.classList.remove('hidden');
     popup.style.display = 'flex';
+    salesHistoryRowsCache = [];
+    salesHistorySelectedSaleId = 0;
+    salesHistorySelectedSaleDetail = null;
+    salesHistoryKeyboardNavigationInFlight = false;
+    salesHistoryEditMode = false;
+    salesHistoryOriginalPaymentState = null;
     summary.textContent = 'Cargando ventas...';
-    body.innerHTML = '<tr><td colspan="6" style="text-align:center;">Cargando...</td></tr>';
+    body.innerHTML = '<tr><td colspan="4" style="text-align:center;">Cargando...</td></tr>';
+    if (emptyBox) {
+        emptyBox.textContent = 'Selecciona una venta para ver el detalle y editar su forma de pago.';
+        emptyBox.classList.remove('hidden');
+    }
+    if (detailCard) detailCard.classList.add('hidden');
+    setSalesHistoryEditFeedback('');
+    updateSalesHistoryEditControlsState();
 
     try {
         const data = await fetchSalesSessionHistory(500);
         const rows = Array.isArray(data?.ventas) ? data.ventas : [];
-        const isAdmin = Number(data?.is_admin || 0) === 1;
-        summary.textContent = isAdmin
-            ? `Administrador: mostrando ${rows.length} ventas de todas las cajas (más reciente primero).`
-            : `Mostrando ${rows.length} ventas de tu sesión actual (más reciente primero).`;
-
-        if (!rows.length) {
-            body.innerHTML = '<tr><td colspan="6" style="text-align:center;">No hay ventas para mostrar.</td></tr>';
-            return;
+        const caja = String(data?.caja_id || localStorage.getItem('n_caja') || localStorage.getItem('caja') || '-').trim() || '-';
+        const cajero = String(data?.usuario_id || localStorage.getItem('id_user') || '-').trim() || '-';
+        const turno = Number(data?.turno_id || localStorage.getItem('turno_id_actual') || 0);
+        salesHistoryRowsCache = rows;
+        summary.textContent = rows.length
+            ? `Mostrando ${rows.length} venta(s) de la caja ${caja}, cajero ${cajero}, turno #${turno || '-'}.`
+            : `Sin ventas en caja ${caja}, cajero ${cajero}, turno #${turno || '-'}.`;
+        renderSalesHistoryRows(rows);
+        if (rows.length) {
+            try {
+                await selectSalesHistorySale(Number(rows[0]?.id_venta || 0));
+            } catch (detailError) {
+                console.error('Error al cargar detalle inicial de venta:', detailError);
+                setSalesHistoryEditFeedback(detailError?.message || 'No se pudo cargar el detalle inicial de la venta.', 'error');
+            }
         }
-
-        body.innerHTML = rows.map((row) => {
-            const total = Number(row.total || 0);
-            return `
-                <tr>
-                    <td>${escapeHtml(normalizeText(row.fecha || '-'))}</td>
-                    <td>${escapeHtml(normalizeText(row.folio_ticket || row.numero_ticket || String(row.id_venta || '-')))}</td>
-                    <td style="text-align:center;">${escapeHtml(String(row.caja_id ?? '-'))}</td>
-                    <td>${escapeHtml(normalizeText(row.cajero_nombre || '-'))}</td>
-                    <td>${escapeHtml(normalizeText(normalizeSalesPaymentMethodLabel(row.metodo_pago || '-')))}</td>
-                    <td style="text-align:right;">${total.toFixed(0)}</td>
-                </tr>
-            `;
-        }).join('');
     } catch (error) {
         console.error('Error al abrir historial de ventas:', error);
         summary.textContent = 'No se pudo cargar el historial de ventas.';
-        body.innerHTML = '<tr><td colspan="6" style="text-align:center;">Error al cargar ventas.</td></tr>';
+        body.innerHTML = '<tr><td colspan="4" style="text-align:center;">Error al cargar ventas.</td></tr>';
+        if (emptyBox) {
+            emptyBox.textContent = 'No se pudo cargar el detalle de ventas.';
+            emptyBox.classList.remove('hidden');
+        }
+    }
+}
+
+async function saveSalesHistoryPaymentUpdate() {
+    const saleId = Number(salesHistorySelectedSaleId || 0);
+    if (!Number.isFinite(saleId) || saleId <= 0) {
+        setSalesHistoryEditFeedback('Selecciona una venta para editar su forma de pago.', 'warning');
+        return;
+    }
+    if (!salesHistoryEditMode) {
+        setSalesHistoryEditFeedback('Pulsa "Editar" para habilitar cambios en la forma de pago.', 'warning');
+        return;
+    }
+
+    const saveBtn = document.getElementById('sales-history-save-payment-btn');
+    const cancelBtn = document.getElementById('sales-history-cancel-edit-btn');
+    const editState = readSalesHistoryPaymentInputsState();
+    const method = normalizeSalesHistoryPaymentMethodValue(editState.method);
+    const totalAmount = Number(salesHistoryOriginalPaymentState?.totalAmount || salesHistorySelectedSaleDetail?.sale?.total || 0);
+
+    const validation = validateSalesHistoryPaymentState(editState, totalAmount, true);
+    if (!validation.ok) {
+        updateSalesHistoryEditControlsState();
+        return;
+    }
+    if (!isSalesHistoryPaymentStateChanged(editState, salesHistoryOriginalPaymentState)) {
+        setSalesHistoryEditFeedback('No hay cambios para guardar.', 'warning');
+        updateSalesHistoryEditControlsState();
+        return;
+    }
+
+    const { caja, cajero } = getSalesSessionIdentity();
+    const payload = {
+        metodo_pago: method,
+        caja: caja ? Number(caja) : null,
+        cajero: cajero ? Number(cajero) : null,
+    };
+    if (method === 'mixto') {
+        payload.monto_tarjeta = editState.cardAmount;
+        payload.monto_efectivo = editState.cashAmount;
+    }
+
+    try {
+        if (saveBtn) saveBtn.disabled = true;
+        if (cancelBtn) cancelBtn.disabled = true;
+        setSalesHistoryEditFeedback('Guardando cambios...', 'info');
+        const updateResponse = await updateSalesHistorySalePayment(saleId, payload);
+        const data = await fetchSalesSessionHistory(500);
+        salesHistoryRowsCache = Array.isArray(data?.ventas) ? data.ventas : [];
+        renderSalesHistoryRows(salesHistoryRowsCache);
+        await selectSalesHistorySale(saleId);
+        setSalesHistoryEditFeedback(updateResponse?.message || 'Forma de pago actualizada.', 'ok');
+        refreshLastSalesTicketInfoCard().catch(() => {});
+    } catch (error) {
+        console.error('Error guardando forma de pago:', error);
+        setSalesHistoryEditFeedback(error.message || 'No se pudo guardar la forma de pago.', 'error');
+    } finally {
+        if (saveBtn) saveBtn.disabled = false;
+        if (cancelBtn) cancelBtn.disabled = false;
+        updateSalesHistoryEditControlsState();
     }
 }
 
@@ -9997,6 +11305,8 @@ let selectedProductForDelete = null;
 let selectedCatalogProductCode = '';
 let catalogRowsCache = [];
 let selectedPromotionProductIds = new Set();
+let promotionRowsCache = [];
+let promotionEditingId = null;
 let promotionProductsCatalogCache = null;
 let promotionProductsLoadPromise = null;
 let promotionProductsSelectHydrated = false;
@@ -10475,7 +11785,122 @@ function clearPromotionSelection() {
     renderPromotionSelectedProducts();
 }
 
-function onPromotionTypeChange() {
+function parseSinglePromotionPattern(name = '') {
+    const raw = String(name || '').trim();
+    if (!raw) return null;
+    const match = raw.match(/(\d+)\s*x\s*(\d+)/i);
+    if (!match) return null;
+    const buyQty = Number(match[1] || 0);
+    const payQty = Number(match[2] || 0);
+    if (!Number.isFinite(buyQty) || !Number.isFinite(payQty) || buyQty < 2 || payQty < 1 || payQty >= buyQty) {
+        return null;
+    }
+    const discountPercent = Math.round(((1 - (payQty / buyQty)) * 100) * 100) / 100;
+    if (!Number.isFinite(discountPercent) || discountPercent <= 0 || discountPercent >= 100) {
+        return null;
+    }
+    return {
+        minQty: Math.trunc(buyQty),
+        discountPercent,
+        payQty: Math.trunc(payQty),
+    };
+}
+
+function formatPromotionNumberInputValue(value, fallback = '') {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return String(fallback);
+    return String(Number(numeric.toFixed(2))).replace(/\.0+$/, '').replace(/(\.\d*[1-9])0+$/, '$1');
+}
+
+function setPromotionFormMode(isEditing = false) {
+    const title = document.getElementById('promo-form-title');
+    const saveBtn = document.getElementById('promo-save-btn');
+    const cancelBtn = document.getElementById('promo-cancel-edit-btn');
+    if (title) title.textContent = isEditing ? 'Editar promoción' : 'Crear promoción';
+    if (saveBtn) saveBtn.textContent = isEditing ? 'Guardar cambios' : 'Guardar promoción';
+    if (cancelBtn) cancelBtn.classList.toggle('hidden', !isEditing);
+}
+
+function clearPromotionForm(options = {}) {
+    const keepSelection = Boolean(options.keepSelection);
+    promotionEditingId = null;
+    const nameInput = document.getElementById('promo-name');
+    const typeInput = document.getElementById('promo-type');
+    const minQtyInput = document.getElementById('promo-min-qty');
+    const discountInput = document.getElementById('promo-discount');
+    const comboPriceInput = document.getElementById('promo-combo-price');
+
+    if (nameInput) nameInput.value = '';
+    if (typeInput) typeInput.value = 'single';
+    if (minQtyInput) minQtyInput.value = '2';
+    if (discountInput) discountInput.value = '10';
+    if (comboPriceInput) comboPriceInput.value = '';
+    onPromotionTypeChange();
+    if (!keepSelection) clearPromotionSelection();
+    setPromotionFormMode(false);
+
+    if (nameInput) {
+        setTimeout(() => {
+            try {
+                nameInput.focus();
+                nameInput.select?.();
+            } catch (_) {
+            }
+        }, 0);
+    }
+}
+
+function cancelPromotionEdit() {
+    clearPromotionForm();
+}
+
+async function startPromotionEdit(promotionId) {
+    const id = Number(promotionId || 0);
+    if (!id) return;
+    const promotion = (Array.isArray(promotionRowsCache) ? promotionRowsCache : [])
+        .find((row) => Number(row?.id || 0) === id);
+    if (!promotion) {
+        alert('No se encontró la promoción seleccionada para editar.');
+        return;
+    }
+
+    try {
+        await loadPromotionProductsSelect();
+    } catch (_) {
+        // continuamos igualmente para no bloquear la edición
+    }
+
+    const promoType = String(promotion.promo_type || 'single').toLowerCase() === 'combo' ? 'combo' : 'single';
+    const minQty = Math.max(promoType === 'combo' ? 1 : 2, Number(promotion.min_qty || 0) || (promoType === 'combo' ? 1 : 2));
+    const discountPercent = Number(promotion.discount_percent || 0);
+    const comboPrice = Number(promotion.combo_price || 0);
+    const productIds = (Array.isArray(promotion.productos) ? promotion.productos : [])
+        .map((item) => Number(item?.product_id || 0))
+        .filter((value) => Number.isInteger(value) && value > 0);
+
+    const nameInput = document.getElementById('promo-name');
+    const typeInput = document.getElementById('promo-type');
+    const minQtyInput = document.getElementById('promo-min-qty');
+    const discountInput = document.getElementById('promo-discount');
+    const comboPriceInput = document.getElementById('promo-combo-price');
+
+    if (nameInput) nameInput.value = normalizeText(promotion.nombre);
+    if (typeInput) typeInput.value = promoType;
+    onPromotionTypeChange({ preserveValues: true });
+    if (minQtyInput) minQtyInput.value = String(minQty);
+    if (discountInput) discountInput.value = formatPromotionNumberInputValue(discountPercent, '0');
+    if (comboPriceInput) comboPriceInput.value = promoType === 'combo'
+        ? formatPromotionNumberInputValue(comboPrice, '')
+        : '';
+
+    selectedPromotionProductIds = new Set(productIds);
+    renderPromotionSelectedProducts();
+    promotionEditingId = id;
+    setPromotionFormMode(true);
+}
+
+function onPromotionTypeChange(options = {}) {
+    const preserveValues = Boolean(options.preserveValues);
     const type = String(document.getElementById('promo-type')?.value || 'single');
     const discountInput = document.getElementById('promo-discount');
     const discountRow = discountInput ? discountInput.closest('.form-row') : null;
@@ -10486,15 +11911,19 @@ function onPromotionTypeChange() {
         if (discountRow) discountRow.classList.add('hidden');
         if (comboPriceRow) comboPriceRow.classList.remove('hidden');
         if (minQtyInput) {
-            minQtyInput.value = '1';
             minQtyInput.min = '1';
+            if (!preserveValues || Number(minQtyInput.value || 0) < 1) {
+                minQtyInput.value = '1';
+            }
         }
     } else {
         if (discountRow) discountRow.classList.remove('hidden');
         if (comboPriceRow) comboPriceRow.classList.add('hidden');
         if (minQtyInput) {
-            minQtyInput.value = '2';
             minQtyInput.min = '2';
+            if (!preserveValues || Number(minQtyInput.value || 0) < 2) {
+                minQtyInput.value = '2';
+            }
         }
     }
 }
@@ -10536,12 +11965,18 @@ async function loadPromotions() {
         });
         const rows = await response.json().catch(() => []);
         const promotions = Array.isArray(rows) ? rows : [];
+        promotionRowsCache = promotions;
+        if (promotionEditingId > 0 && !promotions.some((row) => Number(row?.id || 0) === Number(promotionEditingId))) {
+            clearPromotionForm();
+        }
         if (!promotions.length) {
             wrap.textContent = 'Sin promociones.';
             return;
         }
         wrap.innerHTML = promotions.map((promo) => {
             const items = Array.isArray(promo.productos) ? promo.productos : [];
+            const promoId = Number(promo.id || 0);
+            const editingThisPromotion = Number(promotionEditingId || 0) === promoId;
             const names = items.map((it) => normalizeText(it.descripcion)).filter(Boolean).join(', ');
             const isCombo = String(promo.promo_type || 'single') === 'combo';
             const typeText = isCombo
@@ -10552,10 +11987,22 @@ async function loadPromotions() {
                     <strong>${escapeHtml(promo.nombre)}</strong>
                     <div>Tipo: ${escapeHtml(typeText)} | Mínimo: ${Number(promo.min_qty || 2)}</div>
                     <div>Productos: ${escapeHtml(names || 'Sin productos')}</div>
+                    <div style="margin-top:8px; display:flex; gap:8px; align-items:center;">
+                        <button class="btn" type="button" data-edit-promo-id="${promoId}" ${editingThisPromotion ? 'disabled' : ''}>${editingThisPromotion ? 'Editando' : 'Editar'}</button>
+                    </div>
                 </div>
             `;
         }).join('');
+        wrap.querySelectorAll('button[data-edit-promo-id]').forEach((btn) => {
+            btn.addEventListener('click', () => {
+                const id = Number(btn.dataset.editPromoId || 0);
+                if (id > 0) {
+                    startPromotionEdit(id);
+                }
+            });
+        });
     } catch (_) {
+        promotionRowsCache = [];
         wrap.textContent = 'No se pudieron cargar las promociones.';
     }
 }
@@ -11111,17 +12558,30 @@ async function createDepartment() {
 async function createPromotion() {
     const name = normalizeText(document.getElementById('promo-name').value);
     const promoType = String(document.getElementById('promo-type')?.value || 'single');
-    const minQty = toIntOrNull(document.getElementById('promo-min-qty').value);
-    const discount = toIntOrNull(document.getElementById('promo-discount').value);
+    let minQty = toIntOrNull(document.getElementById('promo-min-qty').value);
+    let discount = toDecimalOrNull(document.getElementById('promo-discount').value, 2);
     const comboPrice = toIntOrNull(document.getElementById('promo-combo-price')?.value);
     const productIds = Array.from(selectedPromotionProductIds).filter((id) => Number(id) > 0);
+    const inferredSingleRule = parseSinglePromotionPattern(name);
+    const editingPromotionId = Number(promotionEditingId || 0);
+    const isEditing = editingPromotionId > 0;
 
     if (!name || !productIds.length) {
         alert('Completa nombre y selecciona productos.');
         return;
     }
     if (promoType === 'single') {
-        if (!minQty || minQty < 2 || !discount || discount < 1 || discount > 100) {
+        // Si el nombre viene como "2x1", "3x2", etc., usamos esa regla
+        // cuando el formulario está en valores por defecto.
+        if (inferredSingleRule && minQty === 2 && Number(discount || 0) === 10) {
+            minQty = inferredSingleRule.minQty;
+            discount = inferredSingleRule.discountPercent;
+            const minQtyInput = document.getElementById('promo-min-qty');
+            const discountInput = document.getElementById('promo-discount');
+            if (minQtyInput) minQtyInput.value = String(minQty);
+            if (discountInput) discountInput.value = formatPromotionNumberInputValue(discount, '10');
+        }
+        if (!minQty || minQty < 2 || discount === null || discount <= 0 || discount > 100) {
             alert('Para promoción por cantidad indica mínimo (>=2) y descuento válido.');
             return;
         }
@@ -11139,8 +12599,8 @@ async function createPromotion() {
         return;
     }
     try {
-        const response = await fetch(API_URL + 'api/promociones', {
-            method: 'POST',
+        const response = await fetch(API_URL + (isEditing ? `api/promociones/${editingPromotionId}` : 'api/promociones'), {
+            method: isEditing ? 'PUT' : 'POST',
             headers: withAuthHeaders({
                 'Content-Type': 'application/json',
             }),
@@ -11155,20 +12615,24 @@ async function createPromotion() {
         });
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {
+            if (isEditing && response.status === 404 && !data.message && !data.error) {
+                alert('El servidor activo no tiene cargada la ruta de edición de promociones. Reinicia el servicio minimarket-node.');
+                return;
+            }
             alert(data.message || data.error || 'No se pudo guardar la promoción.');
             return;
         }
-        document.getElementById('promo-name').value = '';
-        const promoTypeInput = document.getElementById('promo-type');
-        if (promoTypeInput) promoTypeInput.value = 'single';
-        document.getElementById('promo-min-qty').value = '2';
-        document.getElementById('promo-discount').value = '10';
-        const comboPriceInput = document.getElementById('promo-combo-price');
-        if (comboPriceInput) comboPriceInput.value = '';
-        onPromotionTypeChange();
-        clearPromotionSelection();
+        clearPromotionForm();
         await loadPromotions();
-        alert('Promoción guardada.');
+        invalidateSalesPromotionRulesCache();
+        loadSalesPromotionRules({ forceReload: true })
+            .then(() => {
+                if (Array.isArray(cart) && cart.length > 0) {
+                    updateCartUI();
+                }
+            })
+            .catch(() => {});
+        alert(isEditing ? 'Promoción actualizada.' : 'Promoción guardada.');
     } catch (error) {
         console.error('Error createPromotion:', error);
         alert('No se pudo guardar la promoción.');
@@ -12634,6 +14098,7 @@ function setupPromotionSelectorUI() {
     if (!select) return;
     select.addEventListener('change', addSelectedPromotionProduct);
     onPromotionTypeChange();
+    setPromotionFormMode(false);
     renderPromotionSelectedProducts();
 }
 
@@ -12682,6 +14147,8 @@ document.addEventListener('DOMContentLoaded', () => {
     setupPromotionSelectorUI();
     setupCartQuantityKeyboardShortcuts();
     setupSystemFunctionKeyShortcuts();
+    setupSalesHistoryKeyboardNavigation();
+    setupSalesHistoryEditInputWatchers();
     setupSalesScannerStickyFocus();
     setupProductPriceAutoCalc();
     setupProductDescriptionTitleCase();
@@ -12690,6 +14157,13 @@ document.addEventListener('DOMContentLoaded', () => {
     applyDefaultProfitToProductForms();
     restoreCartState();
     updateCartUI();
+    loadSalesPromotionRules()
+        .then(() => {
+            if (Array.isArray(cart) && cart.length > 0) {
+                updateCartUI();
+            }
+        })
+        .catch(() => {});
     updateSalesSessionStrip();
     refreshLastSalesTicketInfoCard().catch(() => {});
     setupSalesMobileCameraPermissionHook();

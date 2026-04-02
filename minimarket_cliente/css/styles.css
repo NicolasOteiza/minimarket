@@ -322,5 +322,16 @@ td {
     /* Permite que el texto se ajuste si es muy largo */
 }
 
+/* Alternancia suave de filas para mejorar lectura de tablas */
+table:not(.ventas-quick-actions):not(.no-zebra) > tbody > tr:nth-child(odd) > td,
+table:not(.ventas-quick-actions):not(.no-zebra) > tbody > tr:nth-child(odd) > th {
+    background-color: #ffffff;
+}
+
+table:not(.ventas-quick-actions):not(.no-zebra) > tbody > tr:nth-child(even) > td,
+table:not(.ventas-quick-actions):not(.no-zebra) > tbody > tr:nth-child(even) > th {
+    background-color: #f6faff;
+}
+
 
 /*termino de home style*/

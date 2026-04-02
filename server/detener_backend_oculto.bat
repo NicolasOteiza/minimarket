@@ -1,20 +1,51 @@
 @echo off
-setlocal
+setlocal EnableExtensions EnableDelayedExpansion
+
+echo ==========================================
+echo  Detener backend oculto (puerto 3001)
+echo ==========================================
+echo.
 
 set "FOUND=0"
+set "REMAINING=0"
+set "EXIT_CODE=0"
+set "SEEN_PIDS=;"
 
 for /f "tokens=5" %%P in ('netstat -ano ^| findstr /R /C:":3001 .*LISTENING"') do (
-  set "FOUND=1"
-  taskkill /PID %%P /F >nul 2>&1
+  if "!SEEN_PIDS:;%%P;=!"=="!SEEN_PIDS!" (
+    set "SEEN_PIDS=!SEEN_PIDS!%%P;"
+    set "FOUND=1"
+    echo Intentando detener PID %%P...
+    taskkill /PID %%P /F >nul 2>&1
+    if errorlevel 1 (
+      echo [ERROR] No se pudo detener PID %%P.
+      set "EXIT_CODE=1"
+    ) else (
+      echo [OK] PID %%P detenido.
+    )
+  )
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'node.exe' -and $_.CommandLine -like '*\\server.js*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
+set "SEEN_PIDS=;"
+for /f "tokens=5" %%P in ('netstat -ano ^| findstr /R /C:":3001 .*LISTENING"') do (
+  if "!SEEN_PIDS:;%%P;=!"=="!SEEN_PIDS!" (
+    set "SEEN_PIDS=!SEEN_PIDS!%%P;"
+    set "REMAINING=1"
+    echo [INFO] El puerto 3001 sigue activo con PID %%P.
+  )
+)
 
+echo.
 if "%FOUND%"=="0" (
-  echo No hay proceso escuchando en el puerto 3001.
+  echo [INFO] No habia backend ejecutandose.
+) else if "%REMAINING%"=="0" (
+  echo [OK] Backend detenido correctamente.
 ) else (
-  echo Procesos del backend detenidos.
+  echo [ERROR] No se pudo detener completamente el backend.
+  set "EXIT_CODE=1"
 )
 
-exit /b 0
+echo.
+echo Presiona una tecla para cerrar...
+pause >nul
+exit /b %EXIT_CODE%

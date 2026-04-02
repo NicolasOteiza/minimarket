@@ -148,6 +148,19 @@
         #cut-view .cut-list.cut-list-tight {
             margin-top: 4px;
         }
+        #cut-view #cut-mixed-ticket-list {
+            margin-top: 2px;
+            padding-left: 14px;
+            font-size: 0.83rem;
+        }
+        #cut-view #cut-mixed-ticket-list li {
+            margin: 0 0 2px 0;
+            line-height: 1.2;
+        }
+        #cut-view #cut-mixed-ticket-total {
+            margin-top: 4px;
+            font-size: 0.86rem;
+        }
         #cut-view .cut-card-cashier {
             display: flex;
             flex-direction: column;
@@ -164,38 +177,64 @@
         #cut-view .cut-card-cashier .cut-kpi-main {
             font-size: 1.72rem;
         }
-        #cut-view .cut-summary-row {
-            display: grid;
-            grid-template-columns: minmax(0, 1fr) minmax(270px, 340px);
-            gap: 10px;
-            align-items: start;
+        #cut-view .cut-summary-layout {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
         }
         #cut-view .cut-summary-main #cut-summary {
-            margin-bottom: 8px;
+            margin: 0;
             font-size: 1.06rem;
         }
-        #cut-view .cut-summary-main #cut-breakdown {
-            margin-top: 0;
-            margin-bottom: 0;
+        #cut-view .cut-summary-reference {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            color: #0f172a;
             font-size: 1.02rem;
             line-height: 1.45;
+            border: 1px solid rgba(148, 163, 184, 0.35);
+            border-radius: 10px;
+            padding: 10px 12px;
+            background: rgba(248, 250, 252, 0.65);
         }
-        #cut-view .cut-summary-side {
-            padding: 0;
+        #cut-view .cut-summary-reference .cut-ref-row {
+            display: grid;
+            gap: 14px;
+            align-items: center;
         }
-        #cut-view .cut-summary-side .cut-subtitle {
-            margin: 0 0 6px 0;
-            font-size: 0.92rem;
+        #cut-view .cut-summary-reference .cut-ref-row + .cut-ref-row {
+            border-top: 1px solid rgba(148, 163, 184, 0.24);
+            padding-top: 6px;
         }
-        #cut-view .cut-summary-side .cut-list {
-            margin-top: 0;
-            margin-bottom: 0;
-            font-size: 1.02rem;
-            line-height: 1.45;
+        #cut-view .cut-summary-reference .cut-ref-row.cut-ref-two {
+            grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
         }
-        #cut-view .cut-summary-side .cut-kpi-total {
-            margin-top: 6px;
-            text-align: left;
+        #cut-view .cut-summary-reference .cut-ref-row.cut-ref-two .cut-ref-cell + .cut-ref-cell {
+            border-left: 1px solid rgba(148, 163, 184, 0.2);
+            padding-left: 10px;
+        }
+        #cut-view .cut-summary-reference .cut-ref-row.cut-ref-one {
+            grid-template-columns: 1fr;
+        }
+        #cut-view .cut-summary-reference .cut-ref-cell {
+            color: #1e293b;
+            font-weight: 500;
+            padding: 1px 0;
+        }
+        #cut-view .cut-summary-reference .cut-ref-label {
+            color: #0f172a;
+            font-weight: 800;
+            letter-spacing: 0.4px;
+            text-transform: uppercase;
+            padding-top: 2px;
+        }
+        #cut-view .cut-summary-reference .cut-ref-row.cut-ref-total .cut-ref-cell {
+            color: #0f172a;
+            font-weight: 700;
+        }
+        #cut-view .cut-summary-legacy {
+            display: none !important;
         }
         #cut-view .cut-card-close {
             padding: 12px 12px 14px;
@@ -472,12 +511,24 @@
             #cut-view .cut-row-2 {
                 grid-template-columns: 1fr;
             }
-            #cut-view .cut-summary-row {
+            #cut-view .cut-summary-reference .cut-ref-row.cut-ref-two {
                 grid-template-columns: 1fr;
+                gap: 4px;
+            }
+            #cut-view .cut-summary-reference .cut-ref-row.cut-ref-two .cut-ref-cell + .cut-ref-cell {
+                border-left: 0;
+                padding-left: 0;
+                border-top: 1px solid rgba(148, 163, 184, 0.2);
+                padding-top: 4px;
             }
             #cut-history-popup .cut-history-controls,
             #cut-rebuild-popup .cut-rebuild-controls {
                 grid-template-columns: 1fr 1fr;
+            }
+            #cut-history-popup .cut-history-actions-bottom {
+                grid-column: 1 / -1;
+                grid-row: auto;
+                justify-content: flex-end;
             }
             #cut-rebuild-popup .cut-rebuild-actions {
                 grid-column: 1 / -1;
@@ -575,8 +626,9 @@
         }
         #cut-history-popup .cut-history-controls {
             display: grid;
-            grid-template-columns: 180px 180px auto auto;
-            gap: 8px;
+            grid-template-columns: 190px 190px 160px 190px auto;
+            column-gap: 6px;
+            row-gap: 8px;
             padding: 12px 14px 0;
             align-items: end;
         }
@@ -592,10 +644,55 @@
             background: #fff;
             color: #0f172a;
         }
+        #cut-history-popup .cut-history-range-toggle {
+            display: flex;
+            align-items: center;
+            padding-bottom: 7px;
+        }
+        #cut-history-popup .cut-history-range-toggle label {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            font-weight: 600;
+            color: #0f172a;
+            cursor: pointer;
+            margin: 0;
+        }
+        #cut-history-popup .cut-history-range-toggle input[type="checkbox"] {
+            width: 15px;
+            height: 15px;
+            accent-color: #0ea5e9;
+            cursor: pointer;
+        }
         #cut-history-popup .cut-history-actions {
             display: flex;
-            gap: 8px;
+            gap: 6px;
+            justify-content: flex-start;
+        }
+        #cut-history-popup .cut-history-actions-bottom {
+            grid-column: 5;
+            grid-row: 2;
             justify-content: flex-end;
+        }
+        #cut-history-popup .cut-history-actions .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            min-height: 35px;
+            padding: 7px 12px;
+            border-radius: 8px;
+            font-weight: 700;
+        }
+        #cut-history-popup .cut-history-actions .btn i {
+            font-size: 0.82rem;
+        }
+        #cut-history-popup .cut-history-actions .cut-history-search-btn {
+            background: #0ea5e9;
+            border-color: #0ea5e9;
+            color: #fff;
+        }
+        #cut-history-popup .cut-history-actions .cut-history-search-btn:hover {
+            filter: brightness(0.95);
         }
         #cut-history-popup .cut-history-table-wrap {
             padding: 12px 14px 14px;
@@ -809,15 +906,32 @@
             <div class="cut-grid">
                 <section class="cut-card cut-card-cashier">
                     <h3 class="cut-title">Resumen del turno actual</h3>
-                    <div class="cut-summary-row">
+                    <div class="cut-summary-layout">
                         <div class="cut-summary-main">
                             <p id="cut-summary" class="cut-muted">Sin datos cargados.</p>
-                            <ul id="cut-breakdown" class="cut-list cut-list-compact"></ul>
-                        </div>
-                        <div class="cut-summary-side">
-                            <p class="cut-subtitle">Ventas mixtas</p>
-                            <ul id="cut-mixed-summary-list" class="cut-list cut-list-compact"></ul>
-                            <div id="cut-mixed-summary-total" class="cut-kpi-total"></div>
+                            <div class="cut-summary-reference" aria-label="Distribucion resumen turno">
+                                <div class="cut-ref-row cut-ref-two">
+                                    <div id="cut-ref-cash-main" class="cut-ref-cell">Efectivo: $0 (0 venta(s))</div>
+                                    <div id="cut-ref-card-main" class="cut-ref-cell">Tarjeta: $0 (0 venta(s))</div>
+                                </div>
+                                <div class="cut-ref-row cut-ref-one">
+                                    <div id="cut-ref-mixed-main" class="cut-ref-cell">Mixto: $0 (0 venta(s))</div>
+                                </div>
+                                <div class="cut-ref-row cut-ref-two">
+                                    <div id="cut-ref-mixed-cash" class="cut-ref-cell">Efectivo: $0</div>
+                                    <div id="cut-ref-mixed-card" class="cut-ref-cell">Tarjeta: $0</div>
+                                </div>
+                                <div class="cut-ref-row cut-ref-one cut-ref-label">
+                                    <div>TOTAL</div>
+                                </div>
+                                <div class="cut-ref-row cut-ref-two cut-ref-total">
+                                    <div id="cut-ref-cash-total" class="cut-ref-cell">Efectivo: $0 (0 venta(s))</div>
+                                    <div id="cut-ref-card-total" class="cut-ref-cell">Tarjeta: $0 (0 venta(s))</div>
+                                </div>
+                            </div>
+                            <ul id="cut-breakdown" class="cut-list cut-list-compact cut-summary-legacy"></ul>
+                            <ul id="cut-mixed-summary-list" class="cut-list cut-list-compact cut-summary-legacy"></ul>
+                            <div id="cut-mixed-summary-total" class="cut-kpi-total cut-summary-legacy"></div>
                         </div>
                     </div>
 
@@ -1116,21 +1230,40 @@
             <button type="button" class="btn" onclick="closeCutHistoryPopup()" style="min-width:auto; padding:6px 10px;">X</button>
         </div>
         <div class="cut-history-controls">
-            <div class="form-row">
-                <label for="cut-history-date-filter">Fecha</label>
+            <div class="form-row" id="cut-history-single-date-row">
+                <label for="cut-history-date-filter">Fecha día</label>
                 <input id="cut-history-date-filter" type="date">
             </div>
+            <div class="form-row hidden" id="cut-history-range-from-row">
+                <label for="cut-history-date-from-filter">Fecha inicio</label>
+                <input id="cut-history-date-from-filter" type="date">
+            </div>
+            <div class="form-row hidden" id="cut-history-range-to-row">
+                <label for="cut-history-date-to-filter">Fecha término</label>
+                <input id="cut-history-date-to-filter" type="date">
+            </div>
+            <div class="form-row cut-history-range-toggle">
+                <label for="cut-history-range-enabled">
+                    <input id="cut-history-range-enabled" type="checkbox">
+                    Buscar por rango
+                </label>
+            </div>
             <div class="form-row">
+                <label for="cut-history-box-filter">Caja</label>
+                <select id="cut-history-box-filter">
+                    <option value="">Todas</option>
+                </select>
+            </div>
+            <div class="form-row hidden" id="cut-history-cashier-row">
                 <label for="cut-history-cashier-filter">Cajero</label>
                 <select id="cut-history-cashier-filter">
                     <option value="">Todos</option>
                 </select>
             </div>
-            <div class="cut-history-actions">
-                <button type="button" class="btn cut-btn-ghost" onclick="reloadCutHistoryPopupData()">Buscar</button>
-            </div>
-            <div class="cut-history-actions">
-                <button type="button" class="btn cut-btn-ghost" onclick="closeCutHistoryPopup()">Cerrar</button>
+            <div class="cut-history-actions cut-history-actions-bottom">
+                <button type="button" class="btn cut-history-search-btn" onclick="reloadCutHistoryPopupData()">
+                    <i class="fas fa-search" aria-hidden="true"></i>Buscar
+                </button>
             </div>
         </div>
         <p id="cut-history-msg" class="cut-history-msg">Selecciona un corte para verlo en pantalla.</p>
